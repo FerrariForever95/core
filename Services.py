@@ -3023,7 +3023,7 @@ class PackageManager:
 
     def _current_user(self):
         try:
-            return self.um.__username__()
+            return self.um.current_user()
         except Exception as e:
             self.logger.debug("Could not resolve current user: {}".format(e), source=self.source)
             return None
