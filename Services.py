@@ -2123,10 +2123,6 @@ class downloadhelper:
                 pass
 
 
-# =============================================================================
-# Git -- lightweight GitHub raw-content download + Contents API upload
-# =============================================================================
-
 class Git:
     def __init__(self, base_raw=None, default_branch="main"):
         self.logger = Logger()
@@ -2142,7 +2138,7 @@ class Git:
             user, repo, branch, filename = self._parse_github_url(url)
         except ValueError as e:
             self.logger.error(str(e), source=self.source)
-            print("Download failed:", e)
+            print("Download failed: invalid GitHub URL.")
             return False
         return self.download(user, repo, filename, branch=branch, save_dir=save_dir)
 
@@ -2153,37 +2149,39 @@ class Git:
                 parsed_user, parsed_repo, parsed_branch, filename = self._parse_github_url(filename)
             except ValueError as e:
                 self.logger.error(str(e), source=self.source)
-                print("Download failed:", e)
+                print("Download failed: invalid GitHub URL.")
                 return False
             user = user or parsed_user
             repo = repo or parsed_repo
             branch = branch or parsed_branch
 
         if not user or not repo:
-            msg = "Download failed: 'user' and 'repo' are required (or pass a full GitHub URL)."
-            self.logger.error(msg, source=self.source)
-            print(msg)
+            self.logger.error("Download failed: 'user' and 'repo' are required.", source=self.source)
+            print("Download failed: missing repository information.")
             return False
 
         branch = branch or self.default_branch
         filename = filename.lstrip("/")
         if not filename:
             self.logger.error("Download failed: empty file path.", source=self.source)
+            print("Download failed: no file specified.")
             return False
 
         original_filename = filename
         url = self._build_url(user, repo, self._encode_path(filename), branch)
-        print("[GIT] URL:", url)
 
         target_dir = self._resolve_download_dir(save_dir if save_dir is not None else self.default_download_dir)
         fname = original_filename.split("/")[-1]
         full_path = "{}/{}".format(target_dir.rstrip("/") or "", fname)
         if not full_path.startswith("/"):
             full_path = "/" + full_path
-        print("[GIT] Save path:", full_path)
+
+        print("Cloning '{}' from {}/{}...".format(fname, user, repo))
+        self.logger.debug("Downloading {} -> {}".format(url, full_path), source=self.source)
 
         http = self._get_http()
         if http is None:
+            print("Download failed: no HTTP client available.")
             return False
 
         # raw.githubusercontent.com returns 404 (not 401) for a bad auth
@@ -2194,7 +2192,7 @@ class Git:
             resp = http.get(url, headers=headers)
         except Exception as e:
             self.logger.error("HTTP request failed for URL {}: {!r}".format(url, e), source=self.source)
-            print("Download failed: HTTP error:", repr(e))
+            print("Download failed: connection error.")
             return False
 
         try:
@@ -2209,19 +2207,21 @@ class Git:
                 pass
             auth_headers = dict(headers)
             auth_headers["Authorization"] = "token {}".format(self.token)
-            print("[GIT] Unauthenticated request 404'd, retrying with token (private repo?)")
+            self.logger.debug("Unauthenticated request 404'd, retrying with token", source=self.source)
             try:
                 resp = http.get(url, headers=auth_headers)
                 status = resp.status_code
             except Exception as e:
                 self.logger.error("HTTP retry-with-auth failed for URL {}: {!r}".format(url, e), source=self.source)
-                print("Download failed: HTTP error on auth retry:", repr(e))
+                print("Download failed: connection error.")
                 return False
 
-        print("[GIT] HTTP status:", status)
         if status != 200:
             self.logger.error("HTTP {} while downloading {} from {}".format(status, filename, url), source=self.source)
-            print("Download failed: HTTP", status)
+            if status == 404:
+                print("Download failed: file not found.")
+            else:
+                print("Download failed: server returned an error.")
             try:
                 resp.close()
             except Exception:
@@ -2237,6 +2237,7 @@ class Git:
                     data = data.encode()
             except Exception as e:
                 self.logger.error("Failed to read HTTP response body: {}".format(e), source=self.source)
+                print("Download failed: could not read response.")
                 try:
                     resp.close()
                 except Exception:
@@ -2248,6 +2249,7 @@ class Git:
                 f.write(data)
         except Exception as e:
             self.logger.error("Failed to write file '{}': {}".format(full_path, e), source=self.source)
+            print("Download failed: could not save file.")
             try:
                 resp.close()
             except Exception:
@@ -2260,7 +2262,7 @@ class Git:
             pass
 
         self.logger.debug("Download completed. Saved as '{}'".format(full_path), source=self.source)
-        print("File saved as:", full_path)
+        print("Downloaded '{}' successfully.".format(fname))
         return True
 
     def _get_http(self):
@@ -2339,6 +2341,7 @@ class Git:
         token = self.token
         if not token:
             self.logger.error("Upload failed: no GitHub token configured (zeno.gitsecret).", source=self.source)
+            print("Upload failed: no GitHub token configured.")
             return False
 
         branch = branch or self.default_branch
@@ -2349,17 +2352,22 @@ class Git:
                 data = f.read()
         except Exception as e:
             self.logger.error("Git upload: cannot read local file '{}': {}".format(local_path, e), source=self.source)
+            print("Upload failed: could not read local file.")
             return False
 
         try:
             b64 = ubinascii.b2a_base64(data).decode().strip()
         except Exception as e:
             self.logger.error("Git upload: base64 encode failed: {}".format(e), source=self.source)
+            print("Upload failed: could not encode file.")
             return False
+
+        print("Uploading '{}' to {}/{}...".format(repo_path, user, repo))
 
         api_url = "https://api.github.com/repos/{}/{}/contents/{}".format(user, repo, self._encode_path(repo_path))
         http = self._get_http()
         if http is None:
+            print("Upload failed: no HTTP client available.")
             return False
 
         headers = {"Authorization": "token {}".format(token), "User-Agent": "ZenoMicroPC", "Accept": "application/vnd.github+json"}
@@ -2386,6 +2394,7 @@ class Git:
             r = http.put(api_url, headers=headers, json=body)
         except Exception as e:
             self.logger.error("Git upload: PUT request failed: {}".format(e), source=self.source)
+            print("Upload failed: connection error.")
             return False
 
         try:
@@ -2399,6 +2408,7 @@ class Git:
             except Exception:
                 err_txt = "no body"
             self.logger.error("Git upload: HTTP {} from GitHub: {}".format(status, err_txt), source=self.source)
+            print("Upload failed: server returned an error.")
             try:
                 r.close()
             except Exception:
@@ -2411,10 +2421,8 @@ class Git:
             pass
 
         self.logger.debug("Git upload completed: {} -> {}/{} ({})".format(local_path, user, repo, repo_path), source=self.source)
-        print("Upload successful:", repo_path)
+        print("Uploaded '{}' successfully.".format(repo_path))
         return True
-
-
 # =============================================================================
 # BluetoothManager
 # =============================================================================
