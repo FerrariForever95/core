@@ -2910,7 +2910,13 @@ class PackageManager:
             return issues
         finally:
             self._cleanup_pkgtable_cache()
-
+    def check(self,module):
+        installed = self._load_pkglist()
+        entry=self._find_package(installed,module)
+        if entry is None:
+            return False
+        else:
+            return True
     def _begin_op(self):
         self._op_depth += 1
 
