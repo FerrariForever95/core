@@ -948,6 +948,8 @@ BUILTIN_HELP = {
     "factory":     "factory               Factory reset  (SUPER)",
     "super":       "super                 Elevate to Super Mode",
     "unsuper":     "unsuper               Exit Super Mode",
+    "passwd":      "passwd                Change your account password",
+    "chusername":  "chusername            Change your account username",
     "userdebug":   "userdebug             Show current user debug",
     "whoisroot":   "whoisroot             Check if current user is rooted",
     "modules":     "modules               List available modules",
@@ -979,7 +981,7 @@ def _shell_help():
     for k in ("env", "export", "alias", "unalias", "history", "clear"):
         print(" ", BUILTIN_HELP[k])
     print("\nZeno-specific")
-    for k in ("super", "unsuper", "userdebug", "whoisroot", "modules",
+    for k in ("super", "unsuper", "passwd", "chusername", "userdebug", "whoisroot", "modules",
               "enter", "leave", "sysrun", "pkgrun", "service", "services",
               "reload", "reloadmodule", "mountzfs", "bootlog", "log",
               "shutdown", "reboot", "factory"):
@@ -1040,7 +1042,51 @@ def _cmd_unsuper():
     else:
         print("Authentication failed. Remaining in Super Mode.")
 
+def _cmd_passwd():
+    if _um is None:
+        print("Password change is unavailable (usermanager service is missing).")
+        return
+    try:
+        old_pwd = input(f"Current password for {zeno.user}: ")
+        new_pwd = input("New password: ")
+        confirm_pwd = input("Confirm new password: ")
+    except KeyboardInterrupt:
+        print()
+        return
+    if new_pwd != confirm_pwd:
+        print("New passwords do not match. Aborted.")
+        return
+    if not new_pwd:
+        print("Password cannot be empty. Aborted.")
+        return
+    ok = _um.change_password(zeno.user, old_pwd, new_pwd)
+    if ok:
+        logger.debug(f"Password changed for {zeno.user}", source="ZenCMD")
+    else:
+        logger.warning(f"Failed password-change attempt by {zeno.user}", source="ZenCMD")
 
+
+def _cmd_chusername():
+    if _um is None:
+        print("Username change is unavailable (usermanager service is missing).")
+        return
+    try:
+        pwd = input(f"Current password for {zeno.user}: ")
+        new_user = input("New username: ").strip()
+    except KeyboardInterrupt:
+        print()
+        return
+    if not new_user:
+        print("Username cannot be empty. Aborted.")
+        return
+    ok = _um.change_username(zeno.user, pwd, new_user)
+    if ok:
+        print("Note: zeno.py still declares the old username -- update the "
+              "'user' field in zeno.py too, or this change will be reverted "
+              "automatically the next time the account record is read.")
+        logger.debug(f"Username change requested: {zeno.user} -> {new_user}", source="ZenCMD")
+    else:
+        logger.warning(f"Failed username-change attempt by {zeno.user}", source="ZenCMD")
 # =================================================
 # BUILT-IN IMPLEMENTATIONS  (filesystem ones all go through _fm)
 # =================================================
@@ -1900,6 +1946,14 @@ def _execute(raw):
     if verb == "unsuper":
         _cmd_unsuper()
         return
+ 
+    if verb == "passwd":
+        _cmd_passwd()
+        return
+
+    if verb == "chusername":
+        _cmd_chusername()
+        return
 
     # ---- <module> help  (e.g. "pkg help") ----
     if verb in MODULES and args and args[0].lower() == "help":
@@ -2059,3 +2113,4 @@ while True:
     except Exception as e:
         print("[ZenCMD] Error:", e)
         logger.error(str(e), source="ZenCMD")
+
