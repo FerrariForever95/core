@@ -301,6 +301,11 @@ class usermanager:
 
         usermanager._session_root = False
         return True
+    def current_user(self):
+        """Public accessor -- safe for external callers (PackageManager,
+        etc). Does not require system privilege."""
+        with SystemPrivilege(_SYSTEM_TOKEN, "current_user"):
+            return self.__username__()
 # =============================================================================
 # FileManager -- VFS facade. Apps must never touch .vfs files or `os`
 # directly; everything goes through here.
