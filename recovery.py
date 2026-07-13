@@ -71,6 +71,7 @@ wifi_password="{wifi_password}"
         self._creds = {}          # kept only in RAM until recovery completes
         self._pkgtable = None
         self._results = {"installed": [], "updated_flagged": [], "failed": []}
+        self.zeno_regenerated = False   # True only if run() wrote a brand-new zeno.py
 
     def help(self):
         print("  recover               Rebuild core OS components from pkgtable.json")
@@ -130,6 +131,7 @@ wifi_password="{wifi_password}"
                 print("[recover] Skipping zeno.py generation -- one or more core packages failed.")
             else:
                 self._write_zeno_py(self._creds)
+                self.zeno_regenerated = True
                 print("[recover] Generated new zeno.py.")
             # credentials only ever lived in self._creds / locals -- drop them now
             self._creds = {}
@@ -1749,6 +1751,13 @@ def _cmd_recover(args):
     print("[recover] Re-importing core modules...")
     if _load_services():
         print("[recover] Core modules re-imported -- ZenCMD is back to a normal boot state.")
+        if rec.zeno_regenerated and usermanager is not None and _um is not None:
+            try:
+                token = getattr(Services, "_SYSTEM_TOKEN", None)
+                _um.rebuild(token)
+                print("[recover] userinfo.json rebuilt from the newly generated zeno.py.")
+            except Exception as e:
+                print("[recover] Warning: could not rebuild userinfo.json:", e)
     else:
         print("[recover] Recovery finished, but Services still failed to import. "
               "A manual reboot may be required.")
