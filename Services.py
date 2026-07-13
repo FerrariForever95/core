@@ -127,11 +127,6 @@ class SystemPrivilege:
     def active(cls):
         return cls._active_depth > 0
 
-
-# =============================================================================
-# usermanager -- user identity + root elevation
-# =============================================================================
-
 class usermanager:
     # Class-level, shared by every usermanager() instance in the process.
     # Always False on interpreter start -- normal mode by default on
@@ -145,7 +140,16 @@ class usermanager:
     def _checkpath(self, path):
         return zfs.exists(path)
 
+    def _require_system(self):
+        # Internal-only gate. Anything below this line may only be
+        # entered from inside a SystemPrivilege(_SYSTEM_TOKEN, ...)
+        # block -- i.e. from trusted code in this same class, not from
+        # apps, modules, or the shell.
+        if not SystemPrivilege.active():
+            raise PermissionError("access denied")
+
     def __read__(self):
+        self._require_system()
         if not self._checkpath("OS"):
             zfs.mkdir("OS")
         if not self._checkpath("OS/users"):
@@ -160,52 +164,73 @@ class usermanager:
             zfs.delete(self.path)
             return self.__read__()
         try:
-            return json.loads(data)
+            parsed = json.loads(data)
         except Exception:
             zfs.delete(self.path)
             return self.__read__()
 
+        # zeno.py is the source of truth for identity. If the stored
+        # record belongs to a different user than the one zeno.py
+        # currently declares, resync the record instead of silently
+        # comparing against stale credentials.
+        if parsed.get("user") != zeno.user:
+            parsed = {"user": zeno.user, "password": zeno.password, "root": False}
+            self.d.write(self.path, json.dumps(parsed))
+
+        return parsed
+
     def _write(self, key, value):
+        self._require_system()
         a = self.__read__()
         a[key] = value
         if self._checkpath(self.path):
             self.d.write(self.path, json.dumps(a))
 
     def __username__(self):
+        self._require_system()
         return self.__read__()["user"]
 
     def __password__(self):
+        self._require_system()
         return self.__read__()["password"]
 
     def userinfo(self):
-        return self.__read__()
+        with SystemPrivilege(_SYSTEM_TOKEN, "userinfo"):
+            info = dict(self.__read__())
+        info.pop("password", None)
+        return info
 
     def removeuser(self, name):
-        user = self.__username__()
-        data = self.__read__()
-        if name == user and data["root"] is True:
-            print(f"{user} is deleted and default user name will be created")
-            zfs.delete(self.path)
-            self.__read__()
-        else:
-            print("user does't exists or not root")
+        with SystemPrivilege(_SYSTEM_TOKEN, "removeuser"):
+            user = self.__username__()
+            data = self.__read__()
+            if name == user and data["root"] is True:
+                print(f"{user} is deleted and default user name will be created")
+                zfs.delete(self.path)
+                self.__read__()
+            else:
+                print("user does't exists or not root")
 
     def is_session_root(self):
         """The only thing permission checks should ever call."""
         return usermanager._session_root or SystemPrivilege.active()
 
     def elevate(self, user, password):
-        if user == self.__username__() and str(password) == str(self.__password__()):
-            if not self.__read__().get("root", False):
+        with SystemPrivilege(_SYSTEM_TOKEN, "elevate"):
+            ok = (user == self.__username__() and str(password) == str(self.__password__()))
+            if ok and not self.__read__().get("root", False):
                 self._write("root", True)
                 print(f"{user} promoted to administrator")
+        if ok:
             usermanager._session_root = True
             print("elevated user (this session)")
         else:
             print("user or password is wrong")
 
     def delevate(self, user, password):
-        if user == self.__username__() and str(password) == str(self.__password__()):
+        with SystemPrivilege(_SYSTEM_TOKEN, "delevate"):
+            ok = (user == self.__username__() and str(password) == str(self.__password__()))
+        if ok:
             usermanager._session_root = False
             print("delevated user")
         else:
@@ -214,10 +239,42 @@ class usermanager:
     def isrooted(self, user):
         """True only if elevated THIS session -- not just an admin
         account on paper."""
-        if user == self.__username__():
+        with SystemPrivilege(_SYSTEM_TOKEN, "isrooted"):
+            current = self.__username__()
+        if user == current:
             return self.is_session_root()
+        return False
 
+    # ---------------- self-service identity changes ----------------
 
+    def change_password(self, user, old_password, new_password):
+        """Change the account password. Requires the current password
+        (not just root) -- same as delevate/elevate."""
+        with SystemPrivilege(_SYSTEM_TOKEN, "change_password"):
+            ok = (user == self.__username__() and str(old_password) == str(self.__password__()))
+            if ok:
+                self._write("password", new_password)
+        if ok:
+            print("password changed")
+            return True
+        print("user or password is wrong")
+        return False
+
+    def change_username(self, user, password, new_username):
+        """Change the stored username. Requires the current password.
+        Note: this only updates userinfo.json -- if zeno.py's `user`
+        field doesn't match afterward, __read__() will resync the
+        record back to zeno.user on next access, undoing this. Update
+        zeno.py's `user` value too if you want the change to persist."""
+        with SystemPrivilege(_SYSTEM_TOKEN, "change_username"):
+            ok = (user == self.__username__() and str(password) == str(self.__password__()))
+            if ok:
+                self._write("user", new_username)
+        if ok:
+            print(f"username changed to {new_username}")
+            return True
+        print("user or password is wrong")
+        return False
 # =============================================================================
 # FileManager -- VFS facade. Apps must never touch .vfs files or `os`
 # directly; everything goes through here.
@@ -3653,4 +3710,5 @@ class Scheduler:
 
     def stop(self):
         self.running = False
+
 
