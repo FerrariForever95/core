@@ -18,14 +18,84 @@ import zeno
 import zfs
 from machine import Pin, SPI, I2C, PWM, SoftSPI, RTC
 from firmware import DS3231
-from firmware import SDCard
+from dev import SDCard
 
 SD_SCK, SD_MOSI, SD_MISO, SD_CS = 40, 6, 5, 7
 LOGS_DIR = "/LOGS"
 
 if not zfs.info()["mounted"]:
     zfs.mount()
+class CPU:
+    def __init__(self, model="ESP32-S3N16R8"):
+        self.model = model
+        self.usage_pct = 0
+        print(self.model)
 
+    # -------------------------------------------------
+    # SCHEDULER TAP (DO NOT BLOCK)
+    # -------------------------------------------------
+    def report_frame(self, busy_us, idle_us):
+        total = busy_us + idle_us
+        if total <= 0:
+            return
+
+        # integer math, cheap
+        self.usage_pct = (busy_us * 100) // total
+
+    def usage(self):
+        return self.usage_pct
+
+    # -------------------------------------------------
+    # POWER / RESET CONTROL (AUTHORITY)
+    # -------------------------------------------------
+    def reboot(self):
+        time.sleep_ms(50)
+        machine.reset()
+
+    def shutdown(self):
+        time.sleep_ms(100)
+        machine.deepsleep()
+
+    def sleep_ms(self, ms):
+        machine.lightsleep(ms)
+
+    # -------------------------------------------------
+    # CLOCK / FREQUENCY
+    # -------------------------------------------------
+    def set_freq(self, hz):
+        machine.freq(hz)
+
+    def get_freq(self):
+        return machine.freq()
+
+    # -------------------------------------------------
+    # RESET / WAKE INFO
+    # -------------------------------------------------
+    def reset_cause(self):
+        return machine.reset_cause()
+
+    def wake_reason(self):
+        return machine.wake_reason()
+
+    # -------------------------------------------------
+    # EMERGENCY
+    # -------------------------------------------------
+    def panic(self, reason=None):
+        try:
+            print("[CPU PANIC]", reason)
+        except:
+            pass
+        time.sleep_ms(50)
+        machine.reset()
+
+    # -------------------------------------------------
+    # CHIP HEALTH (OPTIONAL)
+    # -------------------------------------------------
+    def chip_temp(self):
+        try:
+            return esp.raw_temperature()
+        except:
+            return None
 
 # =============================================================================
 # Low-level ZFS text wrapper
@@ -1216,13 +1286,13 @@ class Process:
 class Scheduler:
     """Zeno OS process scheduler. One instance lives at zeno.sched."""
 
-    def __init__(self, cpu, current_user_fn):
-        self.cpu = cpu
+    def __init__(self):
+        self.cpu = CPU()
         # callable returning the currently logged in username, so
         # spawn()/kill() can stamp/verify ownership -- same idea as
         # Services.usermanager, injected rather than imported here to
         # avoid a circular import.
-        self._current_user_fn = current_user_fn
+        self._current_user_fn = "root"
 
         self.table = {}          # pid -> Process
         self.running = False
@@ -1441,7 +1511,7 @@ class Scheduler:
         """Only meaningful when called from inside a running task."""
         return self._active_pid
 
-    def ps(self):
+    def list(self):
         print("{:<5} {:<8} {:<8} {:<16} {:<9} {:<4} {:<8} {}".format(
             "PID", "TYPE", "OWNER", "NAME", "STATE", "NI", "MODE", "AVG_US"
         ))
@@ -3203,74 +3273,4 @@ class PackageManager:
     def _error(self, message):
         self.logger.error(message, source=self.source)
         print("[PKG] Error:", message)
-class CPU:
-    def __init__(self, model="ESP32-S3N16R8"):
-        self.model = model
-        self.usage_pct = 0
-        print(self.model)
 
-    # -------------------------------------------------
-    # SCHEDULER TAP (DO NOT BLOCK)
-    # -------------------------------------------------
-    def report_frame(self, busy_us, idle_us):
-        total = busy_us + idle_us
-        if total <= 0:
-            return
-
-        # integer math, cheap
-        self.usage_pct = (busy_us * 100) // total
-
-    def usage(self):
-        return self.usage_pct
-
-    # -------------------------------------------------
-    # POWER / RESET CONTROL (AUTHORITY)
-    # -------------------------------------------------
-    def reboot(self):
-        time.sleep_ms(50)
-        machine.reset()
-
-    def shutdown(self):
-        time.sleep_ms(100)
-        machine.deepsleep()
-
-    def sleep_ms(self, ms):
-        machine.lightsleep(ms)
-
-    # -------------------------------------------------
-    # CLOCK / FREQUENCY
-    # -------------------------------------------------
-    def set_freq(self, hz):
-        machine.freq(hz)
-
-    def get_freq(self):
-        return machine.freq()
-
-    # -------------------------------------------------
-    # RESET / WAKE INFO
-    # -------------------------------------------------
-    def reset_cause(self):
-        return machine.reset_cause()
-
-    def wake_reason(self):
-        return machine.wake_reason()
-
-    # -------------------------------------------------
-    # EMERGENCY
-    # -------------------------------------------------
-    def panic(self, reason=None):
-        try:
-            print("[CPU PANIC]", reason)
-        except:
-            pass
-        time.sleep_ms(50)
-        machine.reset()
-
-    # -------------------------------------------------
-    # CHIP HEALTH (OPTIONAL)
-    # -------------------------------------------------
-    def chip_temp(self):
-        try:
-            return esp.raw_temperature()
-        except:
-            return None
