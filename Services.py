@@ -20,7 +20,7 @@ from machine import Pin, SPI, I2C, PWM, SoftSPI, RTC
 from firmware import DS3231
 from firmware import SDCard
 
-SD_SCK, SD_MOSI, SD_MISO, SD_CS = 12, 11, 13, 10
+SD_SCK, SD_MOSI, SD_MISO, SD_CS = 40, 6, 5, 7
 LOGS_DIR = "/LOGS"
 
 if not zfs.info()["mounted"]:
@@ -937,18 +937,24 @@ class Logger:
             print("[Logger] Failed to clear logs:", e)
             self.error(f"Failed to clear logs: {e}", source="LOGGER")
 # =============================================================================
-# Disk -- SD card operations
+# Disk (Mount, Unmount, Check, and Info Only)
 # =============================================================================
 
 class Disk:
-    def __init__(self, mount_point="/SYSTEM32"):
+    def __init__(self, logger, mount_point="/SYSTEM32"):
+        """
+        Initializes the Disk controller strictly for hardware mounting, checking, and info.
+        
+        Args:
+            logger: An instance of your custom Logger class.
+            mount_point (str): Mount path for the SD card system.
+        """
+        self.log = logger
         self.mount_point = mount_point
         self.spi = SPI(1, baudrate=20_000_000, polarity=0, phase=0,
                         sck=Pin(SD_SCK, Pin.OUT), mosi=Pin(SD_MOSI, Pin.OUT), miso=Pin(SD_MISO, Pin.OUT))
         self.sd = None
-        self.target_path = None
         self.cs = Pin(SD_CS, Pin.OUT)
-        self.log = Logger()
 
     def check(self, retries=5, delay=0.2):
         for i in range(retries):
@@ -977,41 +983,13 @@ class Disk:
             return True
         return False
 
-    def listfiles(self, target_path="/SYSTEM32"):
+    def unmount(self):
         try:
-            files = os.listdir(target_path)
-            if not files:
-                self.log.warning("No files in {}".format(target_path), source="DISK")
-                return []
-            self.log.debug("Files in {}: {}".format(target_path, files), source="DISK")
-            for f in files:
-                print(" -", f)
-            return files
-        except OSError as e:
-            self.log.error("Error accessing '{}': {}".format(target_path, e), source="DISK")
-            return []
-
-    def mkdir(self, path):
-        try:
-            path = path.rstrip("/") or "/"
-            os.mkdir(path)
-            self.log.debug("Directory created: {}".format(path), source="DISK")
+            os.umount(self.mount_point)
+            self.log.debug("SD card unmounted from '{}'".format(self.mount_point), source="DISK")
             return True
-        except OSError as e:
-            if len(e.args) > 0 and e.args[0] == 17:
-                self.log.warning("Directory already exists: {}".format(path), source="DISK")
-            else:
-                self.log.error("Failed to create directory '{}': {}".format(path, e), source="DISK")
-            return False
-
-    def rmdir(self, path):
-        try:
-            path = path.rstrip("/") or "/"
-            os.rmdir(path)
-            self.log.debug("Directory deleted: {}".format(path), source="DISK")
-            return True
-        except OSError as e:
-            self.log.error("Failed to delete directory '{}': {}".format(path, e), source="DISK")
+        except Exception as e:
+            self.log.error("Failed to unmount '{}': {}".format(self.mount_point, e), source="DISK")
             return False
 
     def info(self, path=None):
@@ -1024,56 +1002,13 @@ class Disk:
             def convert(v):
                 return "{:.2f} GB".format(v / 1024**3) if v >= 1024**3 else "{:.2f} MB".format(v / 1024**2)
 
-            print("Path       :", path)
+            print("Path        :", path)
             print("Volume Name:", path.split("/")[-1])
             print("Total Size :", convert(total_bytes))
             print("Free Space :", convert(free_bytes))
             self.log.debug("Disk info for '{}': total={}, free={}".format(path, convert(total_bytes), convert(free_bytes)), source="DISK")
         except Exception as e:
             self.log.error("Cannot access '{}': {}".format(path, e), source="DISK")
-
-    def delete(self, p):
-        try:
-            os.remove(p)
-            self.log.debug("File deleted: {}".format(p), source="DISK")
-            return True
-        except OSError as e:
-            self.log.error("Could not delete file '{}': {}".format(p, e), source="DISK")
-            return False
-
-    def del_folder(self, p):
-        try:
-            entries = os.listdir(p)
-        except OSError as e:
-            self.log.error("Could not list folder '{}': {}".format(p, e), source="DISK")
-            return False
-
-        for entry in entries:
-            full_path = p.rstrip("/") + "/" + entry
-            try:
-                is_dir = bool(os.stat(full_path)[0] & 0x4000)
-            except OSError as e:
-                self.log.error("Could not stat '{}': {}".format(full_path, e), source="DISK")
-                continue
-            if is_dir:
-                if not self.del_folder(full_path):
-                    continue
-            else:
-                try:
-                    os.remove(full_path)
-                    self.log.debug("Deleted file in folder: {}".format(full_path), source="DISK")
-                except OSError as e:
-                    self.log.error("Could not delete file '{}': {}".format(full_path, e), source="DISK")
-
-        try:
-            os.rmdir(p)
-            self.log.debug("Folder deleted: {}".format(p), source="DISK")
-            return True
-        except OSError as e:
-            self.log.error("Could not delete folder '{}': {}".format(p, e), source="DISK")
-            return False
-
-
 # =============================================================================
 # BootConfig
 # =============================================================================
