@@ -470,6 +470,7 @@ def _load_services():
     usermanager      = _svc("usermanager")
     FileManager      = _svc("FileManager")
     PackageManager   = _svc("PackageManager")
+    Scheduler        = _svc("Scheduler")
 
     try:
         zeno = _fresh_import("zeno")
@@ -500,6 +501,7 @@ def _load_services():
         "bootmgr":      BootConfig,
         "bluetoothmgr": BluetoothManager,
         "pkg":          PackageManager,
+        "ps":           Scheduler,
     }
     MODULES = {k: v for k, v in all_modules.items() if v is not None}
 
@@ -2115,4 +2117,5 @@ while True:
     except Exception as e:
         print("[ZenCMD] Error:", e)
         logger.error(str(e), source="ZenCMD")
+
 
