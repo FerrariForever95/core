@@ -869,7 +869,7 @@ class Logger:
         self.boot = boot
         self.log_file_user = log_file_user
         self._create_file(self.log_file_user)
-        self._boot_marker = f"[BOOT_START_{self._time_str()}]"
+        self._boot_marker = "[BOOT_START]"
 
         if self.boot:
             self._write(self._boot_marker)
@@ -884,13 +884,6 @@ class Logger:
             print("[Logger] File creation failed:", e)
             return False
 
-    def _time_str(self):
-        try:
-            t = self.rtc.datetime()
-            return "{:04}-{:02}-{:02} {:02}:{:02}:{:02}".format(*t[:3], *t[4:7])
-        except Exception:
-            return "0000-00-00 00:00:00"
-
     def _write(self, text):
         if debug_log_enabled:
             print(text)
@@ -901,7 +894,7 @@ class Logger:
             pass
 
     def log(self, level, message, source="GENERAL"):
-        self._write(f"[{self._time_str()}] [SRC:{source}] [{self.LEVELS.get(level, 'UNKNOWN')}] {message}")
+        self._write(f"[SRC:{source}] [{self.LEVELS.get(level, 'UNKNOWN')}] {message}")
 
     def error(self, message, source="GENERAL"):
         self.log(0, message, source)
@@ -927,7 +920,7 @@ class Logger:
         logs = data.strip().split("\n")
         last_boot_index = 0
         for i, line in enumerate(logs):
-            if line.startswith("[BOOT_START_"):
+            if line.startswith("[BOOT_START]"):
                 last_boot_index = i
         logs = logs[last_boot_index:]
         if lines:
@@ -943,8 +936,6 @@ class Logger:
         except Exception as e:
             print("[Logger] Failed to clear logs:", e)
             self.error(f"Failed to clear logs: {e}", source="LOGGER")
-
-
 # =============================================================================
 # Disk -- SD card operations
 # =============================================================================
@@ -2749,9 +2740,6 @@ class PackageManager:
     DEFAULT_REPO = "Zeno-Micro-PC"
     PKGLIST_PATH = "/pkglist.json"
     PKGTABLE_CACHE_PATH = "/pkgtable_cache.json"
-    # extensions treated as precompiled bytecode rather than plain source --
-    # these must be transferred/read as raw bytes, never as text
-    BYTECODE_EXTENSIONS = (".mpy",)
 
     def __init__(self, git=None, repo_user=None, repo_name=None):
         self.logger = Logger()
@@ -2761,7 +2749,11 @@ class PackageManager:
         self.um = usermanager()
         self.repo_user = repo_user or self.DEFAULT_USER
         self.repo_name = repo_name or self.DEFAULT_REPO
+        # nested install() calls (deps, module providers) share one
+        # pkgtable.json download; only the outermost call deletes it
         self._op_depth = 0
+        # in-memory copy of the pkgtable for the duration of one
+        # outermost operation, so nested calls don't re-download it
         self._pkgtable_cache = None
 
     def install(self, name, force=False):
@@ -2777,7 +2769,7 @@ class PackageManager:
 
             entry = self._find_package(pkgtable, name)
             if entry is None:
-                self._error("Package '{}' not found in the package catalog".format(name))
+                self._error("Package '{}' not found in pkgtable.json".format(name))
                 return False
 
             installed = self._load_pkglist()
@@ -2797,7 +2789,7 @@ class PackageManager:
             missing = self._check_modules(required_modules)
             if missing:
                 if not self._resolve_missing_modules(missing, pkgtable, installed):
-                    self._error("Cannot install '{}': missing required module(s) with no available package in the catalog: {}".format(name, ", ".join(missing)))
+                    self._error("Cannot install '{}': missing required module(s) with no available package in pkgtable.json: {}".format(name, ", ".join(missing)))
                     return False
                 installed = self._load_pkglist()
                 still_missing = self._check_modules(required_modules)
@@ -2816,6 +2808,8 @@ class PackageManager:
 
             self.fm.refresh_tree(entry["install_path"])
 
+            # a force-install that moved filename/install_path leaves an
+            # orphaned old file behind -- clean it up
             if prior_record:
                 old_path = self._full_path(prior_record.get("install_path"), prior_record.get("filename"))
                 new_path = self._full_path(entry.get("install_path"), entry.get("file", "").split("/")[-1])
@@ -2844,12 +2838,19 @@ class PackageManager:
 
             record = installed[name]
 
+            # core OS components (ZenCMD, FileManager, PackageManager, Network,
+            # BootConfig, etc.) must never be removed through the normal
+            # uninstall path -- only the future Recovery module should touch them
             if record.get("core", False):
                 self._error("Package '{}' is a core OS component and cannot be uninstalled.".format(name))
                 return False
 
             install_dir = record.get("install_path")
 
+            # refuse to recursively delete anything that isn't a real,
+            # specific package subdirectory -- protects against wiping
+            # out '/' (or the whole tree) when install_path is missing,
+            # empty, or points at the filesystem root
             if not self._is_safe_install_dir(install_dir):
                 self._error("Refusing to uninstall '{}': install_path '{}' is missing or unsafe to remove.".format(name, install_dir))
                 return False
@@ -2875,6 +2876,8 @@ class PackageManager:
             self._error("Package '{}' is not installed, cannot reinstall.".format(name))
             return False
 
+        # wrap the whole uninstall+install sequence as a single operation so
+        # they share one pkgtable.json download/cache and only clean it up once
         self._begin_op()
         try:
             return self.uninstall(name) and self.install(name, force=True)
@@ -2908,29 +2911,15 @@ class PackageManager:
 
         record = installed[name]
         full_path = self._full_path(record.get("install_path"), record.get("filename"))
-        is_bytecode = self._is_bytecode_filename(record.get("filename"))
-
         try:
-            if is_bytecode:
-                # precompiled packages are read as raw bytes, not decoded text
-                with open(full_path, "rb") as f:
-                    payload = f.read()
-            else:
-                with open(full_path) as f:
-                    payload = f.read()
+            with open(full_path) as f:
+                code = f.read()
         except OSError as e:
             self._error("Cannot read '{}' for package '{}': {}".format(full_path, name, e))
             return False
 
         try:
-            if is_bytecode:
-                # payload is already a compiled code object serialized with
-                # marshal (the same mechanism CPython uses for .pyc bodies) --
-                # no source compilation step is needed or possible here
-                code_obj = marshal.loads(payload)
-                exec(code_obj, {"__name__": "__main__", "argv": list(args)})
-            else:
-                exec(compile(payload, full_path, "exec"), {"__name__": "__main__", "argv": list(args)})
+            exec(compile(code, full_path, "exec"), {"__name__": "__main__", "argv": list(args)})
         except Exception as e:
             self._error("Package '{}' raised an error while running: {}".format(name, e))
             return False
@@ -2951,7 +2940,6 @@ class PackageManager:
             print("  Filename      : {}".format(record.get("filename")))
             print("  Dependencies  : {}".format(record.get("dependencies")))
             print("  Core          : {}".format(record.get("core", False)))
-            print("  Bytecode pkg  : {}".format(self._is_bytecode_filename(record.get("filename"))))
         else:
             print("  Installed     : no")
 
@@ -3009,15 +2997,13 @@ class PackageManager:
             return issues
         finally:
             self._cleanup_pkgtable_cache()
-
-    def check(self, module):
+    def check(self,module):
         installed = self._load_pkglist()
-        entry = self._find_package(installed, module)
+        entry=self._find_package(installed,module)
         if entry is None:
             return False
         else:
             return True
-
     def _begin_op(self):
         self._op_depth += 1
 
@@ -3058,27 +3044,20 @@ class PackageManager:
         return False
 
     def _fetch_pkgtable(self):
+        # reuse the in-memory copy for the duration of one outermost
+        # operation (install w/ nested deps, reinstall, update, ...)
+        # instead of re-downloading pkgtable.json for every nested call
         if self._pkgtable_cache is not None:
             return self._pkgtable_cache
 
-        print("[PKG] Reading package list from the catalog source...")
         ok = self.git.download(self.repo_user, self.repo_name, "pkgtable.json", save_dir="/")
         if not ok:
-            self._error("Could not download the package catalog from {}/{}".format(self.repo_user, self.repo_name))
+            self._error("Could not download pkgtable.json from {}/{}".format(self.repo_user, self.repo_name))
             return None
         data = self._load_json("/pkgtable.json")
         if data is None:
-            self._error("Downloaded the package catalog but it could not be parsed as JSON")
+            self._error("Downloaded pkgtable.json but it could not be parsed as JSON")
             return None
-
-        # normalize each entry once up front so downstream code (download,
-        # install-record creation, run) can just ask "is this bytecode?"
-        # without re-deriving it from the filename every time
-        if isinstance(data, dict):
-            for pkg_name, entry in data.items():
-                if isinstance(entry, dict):
-                    entry["_is_bytecode"] = self._is_bytecode_filename(entry.get("file"))
-
         self._pkgtable_cache = data
         return data
 
@@ -3125,27 +3104,17 @@ class PackageManager:
             "repository": entry.get("repository"), "branch": entry.get("branch") or self.git.default_branch,
             "install_path": entry.get("install_path"), "filename": entry.get("file", "").split("/")[-1],
             "dependencies": entry.get("dependencies", []),
+            # essential-OS-component flag, kept only for the future Recovery
+            # module; defaults to False for backward compatibility with
+            # older pkgtable.json files that don't have it yet
             "core": bool(entry.get("core", False)),
-            # remembered so a later run() doesn't need the catalog again to
-            # know whether this package's file is precompiled bytecode
-            "bytecode": bool(entry.get("_is_bytecode", self._is_bytecode_filename(entry.get("file")))),
         }
-
-    def _is_bytecode_filename(self, filename):
-        if not filename:
-            return False
-        lowered = str(filename).lower()
-        return lowered.endswith(self.BYTECODE_EXTENSIONS)
 
     def _download_package(self, entry):
         # each catalog entry carries its own author/repository/branch --
-        # independent of the repo used for the catalog file itself.
-        # bytecode packages are transferred as raw binary so the compiled
-        # payload isn't corrupted by text-mode/newline translation
-        is_bytecode = self._is_bytecode_filename(entry.get("file"))
+        # independent of the repo used for pkgtable.json itself
         return self.git.download(entry.get("author"), entry.get("repository"), entry.get("file"),
-                                  branch=entry.get("branch"), save_dir=entry.get("install_path"),
-                                  binary=is_bytecode)
+                                  branch=entry.get("branch"), save_dir=entry.get("install_path"))
 
     def _ensure_dependency(self, dep, pkgtable, installed):
         dep_name = dep.get("name")
@@ -3212,6 +3181,9 @@ class PackageManager:
         return path[:idx] if idx > 0 else "/"
 
     def _is_safe_install_dir(self, path):
+        # a package's install_path must be a real, specific subdirectory --
+        # never missing/empty, and never the filesystem root itself, since
+        # that gets handed straight to a recursive delete
         if not path:
             return False
         normalized = path.rstrip("/")
@@ -3223,6 +3195,9 @@ class PackageManager:
         if not path:
             return False
 
+        # defense in depth: even if a caller forgets to pre-check with
+        # _is_safe_install_dir, never let this recurse over '/' or an
+        # otherwise unsafe path
         normalized = path.rstrip("/")
         if normalized in ("", "/", ".", ".."):
             self.logger.warning("Refusing to recursively remove unsafe path '{}'".format(path), source=self.source)
