@@ -936,14 +936,11 @@ class Logger:
         except Exception as e:
             print("[Logger] Failed to clear logs:", e)
             self.error(f"Failed to clear logs: {e}", source="LOGGER")
-# =============================================================================
-# Disk (Mount, Unmount, Check, and Info Only)
-# =============================================================================
 
 class Disk:
-    def __init__(self, logger, mount_point="/MemDisk"):
+    def __init__(self, logger, mount_point="/SYSTEM32"):
         """
-        Initializes the Disk controller strictly for hardware mounting, checking, and info.
+        Initializes the Disk controller for hardware mounting, checking, info, and formatting.
         
         Args:
             logger: An instance of your custom Logger class.
@@ -992,6 +989,29 @@ class Disk:
             self.log.error("Failed to unmount '{}': {}".format(self.mount_point, e), source="DISK")
             return False
 
+    def format(self, filesystem=os.VfsFat):
+        """
+        Formats the storage device attached to the SD card.
+        Requires the SD card to be initialized/present.
+        """
+        if not self.sd:
+            self.log.error("Cannot format: SD card object not initialized", source="DISK")
+            return False
+        try:
+            # Ensure it is unmounted before formatting if needed, or format the block device directly
+            try:
+                os.umount(self.mount_point)
+            except Exception:
+                pass
+            
+            filesystem.mkfs(self.sd)
+            os.mount(self.sd, self.mount_point)
+            self.log.debug("Disk formatted successfully and re-mounted at '{}'".format(self.mount_point), source="DISK")
+            return True
+        except Exception as e:
+            self.log.error("Failed to format disk at '{}': {}".format(self.mount_point, e), source="DISK")
+            return False
+
     def info(self, path=None):
         path = path or self.mount_point
         try:
@@ -1009,9 +1029,6 @@ class Disk:
             self.log.debug("Disk info for '{}': total={}, free={}".format(path, convert(total_bytes), convert(free_bytes)), source="DISK")
         except Exception as e:
             self.log.error("Cannot access '{}': {}".format(path, e), source="DISK")
-# =============================================================================
-# BootConfig
-# =============================================================================
 
 class BootConfig:
     def __init__(self):
