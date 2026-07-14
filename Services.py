@@ -941,7 +941,7 @@ class Logger:
 # =============================================================================
 
 class Disk:
-    def __init__(self, logger, mount_point="/SYSTEM32"):
+    def __init__(self, logger, mount_point="/MemDisk"):
         """
         Initializes the Disk controller strictly for hardware mounting, checking, and info.
         
