@@ -3203,3 +3203,74 @@ class PackageManager:
     def _error(self, message):
         self.logger.error(message, source=self.source)
         print("[PKG] Error:", message)
+        class CPU:
+    def __init__(self, model="ESP32-S3N16R8"):
+        self.model = model
+        self.usage_pct = 0
+        print(self.model)
+
+    # -------------------------------------------------
+    # SCHEDULER TAP (DO NOT BLOCK)
+    # -------------------------------------------------
+    def report_frame(self, busy_us, idle_us):
+        total = busy_us + idle_us
+        if total <= 0:
+            return
+
+        # integer math, cheap
+        self.usage_pct = (busy_us * 100) // total
+
+    def usage(self):
+        return self.usage_pct
+
+    # -------------------------------------------------
+    # POWER / RESET CONTROL (AUTHORITY)
+    # -------------------------------------------------
+    def reboot(self):
+        time.sleep_ms(50)
+        machine.reset()
+
+    def shutdown(self):
+        time.sleep_ms(100)
+        machine.deepsleep()
+
+    def sleep_ms(self, ms):
+        machine.lightsleep(ms)
+
+    # -------------------------------------------------
+    # CLOCK / FREQUENCY
+    # -------------------------------------------------
+    def set_freq(self, hz):
+        machine.freq(hz)
+
+    def get_freq(self):
+        return machine.freq()
+
+    # -------------------------------------------------
+    # RESET / WAKE INFO
+    # -------------------------------------------------
+    def reset_cause(self):
+        return machine.reset_cause()
+
+    def wake_reason(self):
+        return machine.wake_reason()
+
+    # -------------------------------------------------
+    # EMERGENCY
+    # -------------------------------------------------
+    def panic(self, reason=None):
+        try:
+            print("[CPU PANIC]", reason)
+        except:
+            pass
+        time.sleep_ms(50)
+        machine.reset()
+
+    # -------------------------------------------------
+    # CHIP HEALTH (OPTIONAL)
+    # -------------------------------------------------
+    def chip_temp(self):
+        try:
+            return esp.raw_temperature()
+        except:
+            return None
