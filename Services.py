@@ -938,7 +938,7 @@ class Logger:
             self.error(f"Failed to clear logs: {e}", source="LOGGER")
 
 class Disk:
-    def __init__(self, logger, mount_point="/SYSTEM32"):
+    def __init__(self, mount_point="/MemDisk"):
         """
         Initializes the Disk controller for hardware mounting, checking, info, and formatting.
         
@@ -946,7 +946,7 @@ class Disk:
             logger: An instance of your custom Logger class.
             mount_point (str): Mount path for the SD card system.
         """
-        self.log = logger
+        self.log = zeno.log
         self.mount_point = mount_point
         self.spi = SPI(1, baudrate=20_000_000, polarity=0, phase=0,
                         sck=Pin(SD_SCK, Pin.OUT), mosi=Pin(SD_MOSI, Pin.OUT), miso=Pin(SD_MISO, Pin.OUT))
