@@ -1151,6 +1151,8 @@ class BootConfig:
         print()
 
 
+
+
 debug_log_enabled = False
 bootcfg = BootConfig()
 cfg = getattr(bootcfg, "config", {}) or {}
@@ -1176,12 +1178,12 @@ except ImportError:
 
 PERSIST_PATH = "/LOGS/proc_state.json"
 
-#   1xxx  KERNEL   -- boot/UI/core system processes, owner=root
-#   2xxx  USER     -- ordinary cooperative apps (loop/periodic/once)
-#   3xxx  THREAD   -- real _thread-backed concurrent tasks
-#   4xxx  DAEMON   -- root-owned background housekeeping (guardian, etc)
-#   5xxx  NETWORK  -- networking / IO-bound tasks
-#   9xxx  RESERVED -- explicitly requested critical/system pids only
+#   1xxx  KERNEL    -- boot/UI/core system processes, owner=root
+#   2xxx  USER      -- ordinary cooperative apps (loop/periodic/once)
+#   3xxx  THREAD    -- real _thread-backed concurrent tasks
+#   4xxx  DAEMON    -- root-owned background housekeeping (guardian, etc)
+#   5xxx  NETWORK   -- networking / IO-bound tasks
+#   9xxx  RESERVED  -- explicitly requested critical/system pids only
 PID_TYPE_KERNEL   = 1
 PID_TYPE_USER     = 2
 PID_TYPE_THREAD   = 3
@@ -1288,18 +1290,16 @@ class Scheduler:
 
     def __init__(self):
         self.cpu = CPU()
-        # callable returning the currently logged in username, so
-        # spawn()/kill() can stamp/verify ownership -- same idea as
-        # Services.usermanager, injected rather than imported here to
-        # avoid a circular import.
         self._current_user_fn = "root"
 
         self.table = {}          # pid -> Process
         self.running = False
         self._rand_seed = time.ticks_us() & 0xFFFFFFFF  # fallback PRNG state
         self._active_pid = None  # PID of the task currently executing
-                                  # (so a task can call sched.getpid())
 
+        # Execution tracing configuration
+        self.trace_execution = True  # Set to True to display execution info
+        
         self._ensure_storage()
         self._load_state()
 
@@ -1343,12 +1343,8 @@ class Scheduler:
             return None
 
     def _can_signal(self, target, system_token=None):
-        """Same rule Linux uses: you can signal your own processes, or
-        anything, if you're root. `system_token` lets trusted kernel
-        code (see Services.SystemPrivilege) bypass this like Linux lets
-        the kernel itself deliver signals regardless of UID."""
         if system_token is not None:
-            from Services import SystemPrivilege, _SYSTEM_TOKEN  # trusted import
+            from Services import SystemPrivilege, _SYSTEM_TOKEN
             if system_token == _SYSTEM_TOKEN:
                 return True
         caller = self._caller_user()
@@ -1364,11 +1360,6 @@ class Scheduler:
 
     # ---------------- pid allocation ----------------
     def _rand3(self):
-        """Three pseudo-random digits (0-999). Prefers the hardware
-        RNG (urandom) if the build has it; falls back to a tiny xorshift
-        seeded from ticks_us() so this still works on a build without
-        urandom -- deterministic-looking but fine for pid spreading,
-        not for anything security-sensitive."""
         if _HAVE_URANDOM:
             return urandom.getrandbits(10) % 1000
         x = self._rand_seed
@@ -1379,10 +1370,6 @@ class Scheduler:
         return x % 1000
 
     def _classify(self, mode, owner, ptype=None):
-        """Decide which pid type digit a new process gets. Explicit
-        `ptype` always wins; otherwise inferred from mode/owner, same
-        way Linux implicitly treats root-owned kernel threads
-        differently from user processes."""
         if ptype is not None:
             if ptype not in PID_TYPE_NAMES:
                 raise ValueError("invalid pid type: %r" % (ptype,))
@@ -1394,12 +1381,8 @@ class Scheduler:
         return PID_TYPE_USER
 
     def _alloc_pid(self, ptype):
-        """Random 3-digit suffix under the given type digit, retried on
-        collision. 1000 slots per type is far more than an embedded
-        process table will ever hold concurrently, so collisions are
-        rare and this converges in ~1 try almost always."""
         base = ptype * 1000
-        for _ in range(2000):   # generous cap; table can't realistically fill 1000 slots
+        for _ in range(2000):
             pid = base + self._rand3()
             if pid not in self.table:
                 return pid
@@ -1410,12 +1393,6 @@ class Scheduler:
     # ---------------- syscalls ----------------
     def spawn(self, name, func, *, mode=MODE_LOOP, period=0, priority=0,
               owner=None, expected_us=None, ptype=None):
-        """Create a new process. Returns its PID.
-
-        priority is a nice value: -20 (highest) .. 19 (lowest), 0 default.
-        ptype optionally forces the pid's type digit (see PID_TYPE_*);
-        otherwise it's inferred from mode/owner -- e.g. a root thread-mode
-        task becomes a 4xxx DAEMON pid automatically."""
         if mode not in (MODE_LOOP, MODE_PERIODIC, MODE_ONCE, MODE_THREAD):
             raise ValueError("invalid mode: %r" % (mode,))
         if mode == MODE_THREAD and not _HAVE_THREAD:
@@ -1451,30 +1428,19 @@ class Scheduler:
             return True
 
         if sig == SIGKILL and p.mode != MODE_THREAD:
-            # cooperative task, no thread to unwind -- we can end it now
             p.state = ZOMBIE
             p.exit_code = -SIGKILL
             self._persist()
             return True
 
-        # everything else (SIGTERM/SIGSTOP/SIGCONT, or SIGKILL against a
-        # real thread we can't force-stop) is delivered as a flag the
-        # task itself must observe at its next checkpoint.
         p.pending_signal = sig
         return True
 
     def should_die(self, pid):
-        """Call from inside a long-running/thread task to check for a
-        pending termination signal. Returns True if the task should
-        exit now."""
         p = self.table.get(pid)
         return bool(p and p.pending_signal in (SIGTERM, SIGKILL))
 
     def checkpoint(self, pid):
-        """Convenience for thread-mode tasks: call periodically inside
-        your own loop. Raises SystemExit if the task has been signaled
-        to stop, after marking the PCB ZOMBIE -- mirrors a Linux process
-        handling SIGTERM and calling exit()."""
         p = self.table.get(pid)
         if p and p.pending_signal in (SIGTERM, SIGKILL):
             p.state = ZOMBIE
@@ -1482,8 +1448,6 @@ class Scheduler:
             raise SystemExit
 
     def wait(self, pid, timeout_ms=None):
-        """Block (cooperatively sleeping) until pid is ZOMBIE/DEAD, or
-        timeout. Returns exit_code, or None on timeout. Reaps the PCB."""
         start = time.ticks_ms()
         while True:
             p = self.table.get(pid)
@@ -1508,7 +1472,6 @@ class Scheduler:
         return True
 
     def getpid(self):
-        """Only meaningful when called from inside a running task."""
         return self._active_pid
 
     def list(self):
@@ -1522,20 +1485,32 @@ class Scheduler:
     # ---------------- thread-mode tasks ----------------
     def _start_thread(self, p):
         def runner():
-            self._active_pid = p.pid  # best-effort; _thread has its own stack/globals
+            self._active_pid = p.pid
             p.state = RUNNING
+            
+            if self.trace_execution:
+                print("[EXEC TRACE] Executing Thread Task -> PID: {}, Name: {}, User: {}".format(
+                    p.pid, p.name, p.owner
+                ))
+
             start = time.ticks_us()
             try:
-                p.func(p.pid)   # thread tasks receive their own pid, for should_die()/checkpoint()
+                p.func(p.pid)
                 p.exit_code = 0
             except SystemExit:
                 pass
             except Exception as e:
                 print("[SCHED] pid {} ({}) raised: {}".format(p.pid, p.name, e))
                 p.exit_code = -1
+            
             elapsed = time.ticks_diff(time.ticks_us(), start)
             self._record_stat(p, elapsed)
             p.state = ZOMBIE
+
+            if self.trace_execution:
+                print("[EXEC TRACE] Finished Thread Task -> PID: {}, Name: {}, Elapsed: {}us".format(
+                    p.pid, p.name, elapsed
+                ))
 
         p._thread_started = True
         _thread.start_new_thread(runner, ())
@@ -1566,14 +1541,9 @@ class Scheduler:
         return out
 
     def _pick_next(self, runnable):
-        # CFS: lowest vruntime wins -- the task that's had the least
-        # weighted CPU time so far runs next. Ties broken by pid for
-        # determinism.
         return min(runnable, key=lambda p: (p.vruntime, p.pid))
 
     def _run_one(self, p):
-        # signal check happens *before* invocation -- this is the
-        # cooperative kill point.
         if p.pending_signal in (SIGTERM, SIGKILL):
             p.state = ZOMBIE
             p.exit_code = -p.pending_signal
@@ -1581,17 +1551,29 @@ class Scheduler:
 
         self._active_pid = p.pid
         p.state = RUNNING
+
+        if self.trace_execution:
+            print("[EXEC TRACE] Executing Task -> PID: {}, Name: {}, User: {}".format(
+                p.pid, p.name, p.owner
+            ))
+
         start = time.ticks_us()
         try:
             p.func()
         except Exception as e:
             print("[SCHED] pid {} ({}) raised: {}".format(p.pid, p.name, e))
+        
         elapsed = max(1, time.ticks_diff(time.ticks_us(), start))
         self._active_pid = None
 
         self._record_stat(p, elapsed)
-        p.vruntime += elapsed * 1024 // p.weight()   # weighted runtime
+        p.vruntime += elapsed * 1024 // p.weight()
         p._last_run = time.ticks_ms()
+
+        if self.trace_execution:
+            print("[EXEC TRACE] Finished Task -> PID: {}, Name: {}, Elapsed: {}us".format(
+                p.pid, p.name, elapsed
+            ))
 
         if p.mode == MODE_ONCE:
             p.state = ZOMBIE
@@ -1600,8 +1582,6 @@ class Scheduler:
             p.state = READY
 
     def tick(self):
-        """Run exactly one scheduling decision. Call this in the main
-        loop, or use start() for a self-driving frame loop."""
         runnable = self._runnable_cooperative()
         if not runnable:
             return False
@@ -1610,11 +1590,6 @@ class Scheduler:
         return True
 
     def _reap_zombies(self):
-        # auto-reap zombies with no waiter after a grace period would
-        # need a timestamp; kept manual via wait()/ps() for now so
-        # exit codes aren't lost silently. Dead cooperative processes
-        # just sit as ZOMBIE until something calls wait() or you clean
-        # them explicitly with reap(pid).
         pass
 
     def reap(self, pid):
@@ -1625,8 +1600,6 @@ class Scheduler:
         return False
 
     def start(self, frame_ms=16):
-        """Frame-driven main loop -- same shape as the old TaskManager,
-        but every iteration is one CFS pick instead of a flat scan."""
         self.running = True
         while self.running:
             frame_start = time.ticks_us()
@@ -1644,8 +1617,6 @@ class Scheduler:
 
     def stop(self):
         self.running = False
-
-
 # =============================================================================
 # system -- low-level system control, RAM/security housekeeping, guardian
 # =============================================================================
