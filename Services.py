@@ -3203,7 +3203,7 @@ class PackageManager:
     def _error(self, message):
         self.logger.error(message, source=self.source)
         print("[PKG] Error:", message)
-        class CPU:
+class CPU:
     def __init__(self, model="ESP32-S3N16R8"):
         self.model = model
         self.usage_pct = 0
