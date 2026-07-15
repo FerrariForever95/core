@@ -3343,4 +3343,82 @@ class PackageManager:
         print("[PKG] Error:", message)
 
 
+class IoTDevice:
+    """Represents an individual controllable IoT device."""
+    def __init__(self, device_id, name, device_type, platform_client):
+        self.device_id = device_id
+        self.name = name
+        self.device_type = device_type  # e.g., 'switch', 'light', 'fan'
+        self.client = platform_client   # The underlying platform connector (e.g., Sinric Pro)
 
+    def turn_on(self):
+        return self.client.set_power(self.device_id, True)
+
+    def turn_off(self):
+        return self.client.set_power(self.device_id, False)
+
+    def toggle(self):
+        # Implementation depends on whether status can be read or tracked state
+        current_state = getattr(self, "_state", False)
+        new_state = not current_state
+        success = self.client.set_power(self.device_id, new_state)
+        if success:
+            self._state = new_state
+        return new_state
+
+
+class SinricProPlatform:
+    """Platform adapter for Sinric Pro API handling."""
+    def __init__(self, api_key, app_secret=""):
+        self.api_key = api_key
+        self.app_secret = app_secret
+        # Initialize your underlying API/websocket connection here
+
+    def set_power(self, device_id, state):
+        # Translate this into the specific Sinric Pro REST API call or WebSocket payload
+        action = "on" if state else "off"
+        print(f"[SinricPro] Sending command '{action}' to device ID: {device_id}")
+        
+        # Example pseudo-code for API execution:
+        # response = urequests.put(f"https://api.sinric.pro/v1/devices/{device_id}", json={"value": action}, headers={"Authorization": self.api_key})
+        # return response.status_code == 200
+        
+        return True  # Simulated success
+
+
+class IoTManager:
+    """Core manager class to register, track, and toggle IoT devices across platforms."""
+    def __init__(self):
+        self.platforms = {}
+        self.devices = {}
+
+    def register_platform(self, name, client_instance):
+        """Register a backend platform like 'sinric'."""
+        self.platforms[name] = client_instance
+
+    def add_device(self, device_id, name, device_type, platform_name):
+        """Add a device by binding it to a registered platform."""
+        if platform_name not in self.platforms:
+            raise ValueError(f"Platform '{platform_name}' is not registered.")
+        
+        client = self.platforms[platform_name]
+        device = IoTDevice(device_id, name, device_type, client)
+        self.devices[device_id] = device
+        print(f"[IoTManager] Registered device '{name}' ({device_type}) on platform '{platform_name}'.")
+        return device
+
+    def toggle_device(self, device_id):
+        """Toggle a specific device by its ID."""
+        if device_id not in self.devices:
+            print(f"[IoTManager] Device ID '{device_id}' not found.")
+            return None
+        return self.devices[device_id].toggle()
+
+    def set_device_state(self, device_id, state: bool):
+        """Explicitly turn a device on (True) or off (False)."""
+        if device_id not in self.devices:
+            print(f"[IoTManager] Device ID '{device_id}' not found.")
+            return False
+        
+        dev = self.devices[device_id]
+        return dev.turn_on() if state else dev.turn_off()
