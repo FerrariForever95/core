@@ -1491,23 +1491,38 @@ class Scheduler:
         if p is None:
             raise ProcessError("no such pid: %d" % pid)
 
-        # SIGKILL is never permitted on a daemon, regardless of caller --
-        # daemons are thread-mode and must be stopped cooperatively via
-        # SIGTERM + checkpoint(), never yanked with no cleanup mid-task.
+    # SIGKILL is never permitted on a daemon, regardless of caller --
+    # daemons are thread-mode and must be stopped cooperatively via
+    # SIGTERM + checkpoint(), never yanked with no cleanup mid-task.
         if pid_type(p.pid) == PID_TYPE_DAEMON and sig == SIGKILL:
-            self.log_misuse(p, sig, reason="SIGKILL forbidden on daemon pid")
+            self.log.error(
+            "blocked signal {} on pid {} ({}, owner={}): SIGKILL forbidden on daemon pid".format(
+                sig, p.pid, p.name, p.owner
+            ),
+            source="SECSCAN",
+        )
             raise PermissionDenied(
-                "pid %d (%s) is a protected daemon; SIGKILL is not permitted, "
-                "use SIGTERM for cooperative shutdown" % (pid, p.name)
-            )
+            "pid %d (%s) is a protected daemon; SIGKILL is not permitted, "
+            "use SIGTERM for cooperative shutdown" % (pid, p.name)
+        )
 
         if not self._can_signal(p, system_token=system_token):
-            self.log_misuse(p, sig, reason="permission denied")
+            self.log.error(
+            "blocked signal {} on pid {} ({}, owner={}): permission denied".format(
+                sig, p.pid, p.name, p.owner
+            ),
+            source="SECSCAN",
+        )
             raise PermissionDenied(
-                "user cannot signal pid %d (owned by %s)" % (pid, p.owner)
-            )
+            "user cannot signal pid %d (owned by %s)" % (pid, p.owner)
+        )
         if p.state in (ZOMBIE, DEAD):
             return True
+
+        self.log.debug(
+        "killing pid {} ({}, owner={}) with signal {}".format(p.pid, p.name, p.owner, sig),
+        source="SCHED",
+    )
 
         if sig == SIGKILL and p.mode != MODE_THREAD:
             p.state = ZOMBIE
@@ -1517,6 +1532,48 @@ class Scheduler:
 
         p.pending_signal = sig
         return True
+
+
+    def killall(self, sig=SIGTERM, system_token=None, include_daemons=False):
+        """Signal every task the scheduler knows about. Daemons (4xxx) are
+        skipped by default -- protected, and on the boot-failure/reboot path
+        this is normally called from, about to die via machine.reset() anyway.
+        Pass include_daemons=True + a valid system_token to also SIGTERM
+        (never SIGKILL) daemons explicitly. Never raises."""
+        self.log.debug(
+        "killall requested (sig={}, include_daemons={})".format(sig, include_daemons),
+        source="SCHED",
+        )
+
+        killed, skipped, failed = [], [], []
+
+        for pid, p in list(self.table.items()):
+            is_daemon = pid_type(p.pid) == PID_TYPE_DAEMON
+
+            if is_daemon and not include_daemons:
+                skipped.append(pid)
+                continue
+    
+            effective_sig = SIGTERM if is_daemon else sig
+
+            try:
+                self.kill(pid, effective_sig, system_token=system_token)
+                killed.append(pid)
+            except Exception as e:
+                failed.append(pid)
+                self.log.error(
+                "killall: failed to signal pid {} ({}): {}".format(pid, p.name, e),
+                source="SCHED",
+                )
+
+        self.log.debug(
+        "killall complete: signaled={} skipped_daemons={} failed={}".format(
+            killed, skipped, failed
+            ),
+            source="SCHED",
+        )
+
+        return {"killed": killed, "skipped_daemons": skipped, "failed": failed}
 
     def should_die(self, pid):
         p = self.table.get(pid)
@@ -1701,19 +1758,8 @@ class Scheduler:
 
     def stop(self):
         self.running = False
-        self._log_debug("scheduler main loop stopped", source="SCHED")\
-    def killall(self, system_token=None):
-    """Best-effort: signal every non-daemon task to stop, skip daemons
-    (they're protected and about to die via machine.reset() anyway).
-    Never raises -- this runs on the boot-failure/reboot path and must
-    not block a reset."""
-    for pid, p in list(self.table.items()):
-        if pid_type(p.pid) == PID_TYPE_DAEMON:
-            continue
-        try:
-            self.kill(pid, SIGTERM, system_token=system_token)
-        except Exception:
-            pass
+        self._log_debug("scheduler main loop stopped", source="SCHED")
+
 # =============================================================================
 # system -- low-level system control, RAM/security housekeeping, guardian
 # =============================================================================
