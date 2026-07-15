@@ -1175,7 +1175,6 @@ try:
     _HAVE_URANDOM = True
 except ImportError:
     _HAVE_URANDOM = False
-
 PERSIST_PATH = "/LOGS/proc_state.json"
 
 #   1xxx  KERNEL    -- boot/UI/core system processes, owner=root
@@ -1288,7 +1287,7 @@ class Process:
 class Scheduler:
     """Zeno OS process scheduler. One instance lives at zeno.sched."""
 
-    def __init__(self):
+    def __init__(self, logger=None):
         self.cpu = CPU()
         self._current_user_fn = "root"
 
@@ -1298,10 +1297,57 @@ class Scheduler:
         self._active_pid = None  # PID of the task currently executing
 
         # Execution tracing configuration
-        self.trace_execution = True  # Set to True to display execution info
-        
+        self.trace_execution = True  # Set to True to display per-tick exec info
+
+        # Names of pids we've already announced via "service started" logging,
+        # so a periodic/looping task doesn't re-log every reschedule.
+        self._announced = set()
+
+        self._logger = logger  # optional Logger instance; falls back to print
+
         self._ensure_storage()
         self._load_state()
+
+    # ---------------- logging ----------------
+    def _get_logger(self):
+        if self._logger is not None:
+            return self._logger
+        try:
+            from Services import logger as _logger_accessor
+            return _logger_accessor()
+        except Exception:
+            return None
+
+    def _log_debug(self, msg, source="SCHED"):
+        log = self._get_logger()
+        if log is not None:
+            try:
+                log.debug(msg, source=source)
+                return
+            except Exception:
+                pass
+        print("[{}] {}".format(source, msg))
+
+    def _log_error(self, msg, source="SCHED"):
+        log = self._get_logger()
+        if log is not None:
+            try:
+                log.error(msg, source=source)
+                return
+            except Exception:
+                pass
+        print("[{}][ERROR] {}".format(source, msg))
+
+    def log_misuse(self, p, sig, reason):
+        """Every rejected/blocked signal attempt on a process is recorded
+        here -- centralized at the source (kill()) so nothing slips
+        through, and daemons don't need to poll for this themselves."""
+        self._log_error(
+            "blocked signal {} on pid {} ({}, owner={}): {}".format(
+                sig, p.pid, p.name, p.owner, reason
+            ),
+            source="SECSCAN",
+        )
 
     # ---------------- persistence ----------------
     def _ensure_storage(self):
@@ -1399,7 +1445,20 @@ class Scheduler:
             raise ProcessError("_thread not available on this build")
 
         owner = owner or self._caller_user() or "root"
-        pid = self._alloc_pid(self._classify(mode, owner, ptype))
+        resolved_ptype = self._classify(mode, owner, ptype)
+
+        # Daemon-series (4xxx) processes are critical background services
+        # (guardian, etc). They must run as real threads so they can't be
+        # starved or torn out by the cooperative runqueue -- enforce this
+        # at spawn time rather than silently upgrading the mode, so a
+        # misconfigured daemon fails loudly during development.
+        if resolved_ptype == PID_TYPE_DAEMON and mode != MODE_THREAD:
+            raise ValueError(
+                "daemon-series (4xxx) processes must use mode=MODE_THREAD "
+                "(got mode=%r for name=%r)" % (mode, name)
+            )
+
+        pid = self._alloc_pid(resolved_ptype)
         ppid = self._active_pid or 0
 
         p = Process(pid, ppid, owner, name, func, mode, period, priority)
@@ -1411,6 +1470,17 @@ class Scheduler:
         p.state = READY
         self.table[pid] = p
 
+        # Announce once per pid -- "started guardian service" etc -- so the
+        # log records what's running without spamming on every reschedule.
+        if pid not in self._announced:
+            self._announced.add(pid)
+            self._log_debug(
+                "started {} service -> pid={} type={} owner={} mode={} priority={}".format(
+                    name, pid, pid_type_name(pid), owner, mode, priority
+                ),
+                source="SCHED",
+            )
+
         if mode == MODE_THREAD:
             self._start_thread(p)
 
@@ -1420,7 +1490,19 @@ class Scheduler:
         p = self.table.get(pid)
         if p is None:
             raise ProcessError("no such pid: %d" % pid)
+
+        # SIGKILL is never permitted on a daemon, regardless of caller --
+        # daemons are thread-mode and must be stopped cooperatively via
+        # SIGTERM + checkpoint(), never yanked with no cleanup mid-task.
+        if pid_type(p.pid) == PID_TYPE_DAEMON and sig == SIGKILL:
+            self.log_misuse(p, sig, reason="SIGKILL forbidden on daemon pid")
+            raise PermissionDenied(
+                "pid %d (%s) is a protected daemon; SIGKILL is not permitted, "
+                "use SIGTERM for cooperative shutdown" % (pid, p.name)
+            )
+
         if not self._can_signal(p, system_token=system_token):
+            self.log_misuse(p, sig, reason="permission denied")
             raise PermissionDenied(
                 "user cannot signal pid %d (owned by %s)" % (pid, p.owner)
             )
@@ -1487,7 +1569,7 @@ class Scheduler:
         def runner():
             self._active_pid = p.pid
             p.state = RUNNING
-            
+
             if self.trace_execution:
                 print("[EXEC TRACE] Executing Thread Task -> PID: {}, Name: {}, User: {}".format(
                     p.pid, p.name, p.owner
@@ -1500,9 +1582,9 @@ class Scheduler:
             except SystemExit:
                 pass
             except Exception as e:
-                print("[SCHED] pid {} ({}) raised: {}".format(p.pid, p.name, e))
+                self._log_error("pid {} ({}) raised: {}".format(p.pid, p.name, e), source="SCHED")
                 p.exit_code = -1
-            
+
             elapsed = time.ticks_diff(time.ticks_us(), start)
             self._record_stat(p, elapsed)
             p.state = ZOMBIE
@@ -1561,8 +1643,8 @@ class Scheduler:
         try:
             p.func()
         except Exception as e:
-            print("[SCHED] pid {} ({}) raised: {}".format(p.pid, p.name, e))
-        
+            self._log_error("pid {} ({}) raised: {}".format(p.pid, p.name, e), source="SCHED")
+
         elapsed = max(1, time.ticks_diff(time.ticks_us(), start))
         self._active_pid = None
 
@@ -1596,11 +1678,13 @@ class Scheduler:
         p = self.table.get(pid)
         if p and p.state == ZOMBIE:
             del self.table[pid]
+            self._announced.discard(pid)
             return True
         return False
 
     def start(self, frame_ms=16):
         self.running = True
+        self._log_debug("scheduler main loop starting (frame_ms={})".format(frame_ms), source="SCHED")
         while self.running:
             frame_start = time.ticks_us()
             budget_us = frame_ms * 1000
@@ -1617,6 +1701,7 @@ class Scheduler:
 
     def stop(self):
         self.running = False
+        self._log_debug("scheduler main loop stopped", source="SCHED")
 # =============================================================================
 # system -- low-level system control, RAM/security housekeeping, guardian
 # =============================================================================
