@@ -18,7 +18,7 @@ import zeno
 import zfs
 from machine import Pin, SPI, I2C, PWM, SoftSPI, RTC
 from firmware import DS3231
-from dev import SDCard
+from firmware import SDCard
 
 SD_SCK, SD_MOSI, SD_MISO, SD_CS = 40, 6, 5, 7
 LOGS_DIR = "/LOGS"
@@ -1701,19 +1701,19 @@ class Scheduler:
 
     def stop(self):
         self.running = False
-        self._log_debug("scheduler main loop stopped", source="SCHED")\
+        self._log_debug("scheduler main loop stopped", source="SCHED")
     def killall(self, system_token=None):
-    """Best-effort: signal every non-daemon task to stop, skip daemons
-    (they're protected and about to die via machine.reset() anyway).
-    Never raises -- this runs on the boot-failure/reboot path and must
-    not block a reset."""
-    for pid, p in list(self.table.items()):
-        if pid_type(p.pid) == PID_TYPE_DAEMON:
-            continue
-        try:
-            self.kill(pid, SIGTERM, system_token=system_token)
-        except Exception:
-            pass
+        """Best-effort: signal every non-daemon task to stop, skip daemons
+        (they're protected and about to die via machine.reset() anyway).
+        Never raises -- this runs on the boot-failure/reboot path and must
+        not block a reset."""
+        for pid, p in list(self.table.items()):
+            if pid_type(p.pid) == PID_TYPE_DAEMON:
+                continue
+            try:
+                self.kill(pid, SIGTERM, system_token=system_token)
+            except Exception:
+                pass
 # =============================================================================
 # system -- low-level system control, RAM/security housekeeping, guardian
 # =============================================================================
@@ -3341,5 +3341,6 @@ class PackageManager:
     def _error(self, message):
         self.logger.error(message, source=self.source)
         print("[PKG] Error:", message)
+
 
 
