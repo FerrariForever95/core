@@ -2,16 +2,6 @@ print("ZenCMD/2 initializing...")
 
 import os
 import sys
-
-# =================================================
-# RECOVERY  (standalone -- must NEVER import anything from /Services,
-# so it keeps working even when Services, PackageManager, Git, Network,
-# or zeno.py are missing/corrupted. Only built-in MicroPython modules
-# are used here: os, json, time, urandom, and -- guarded -- network /
-# urequests. This class is intentionally self-contained: it doesn't
-# touch any ZenCMD global state, so it can be defined and used before
-# the rest of ZenCMD has finished booting.)
-# =================================================
 import json
 import time
 
@@ -471,6 +461,7 @@ def _load_services():
     FileManager      = _svc("FileManager")
     PackageManager   = _svc("PackageManager")
     Scheduler        = _svc("Scheduler")
+    IoTManager		 = _svc("IotManager")
 
     try:
         zeno = _fresh_import("zeno")
@@ -502,6 +493,7 @@ def _load_services():
         "bluetoothmgr": BluetoothManager,
         "pkg":          PackageManager,
         "ps":           Scheduler,
+        "iot":          IoTManager,
     }
     MODULES = {k: v for k, v in all_modules.items() if v is not None}
 
@@ -514,7 +506,7 @@ _load_services()
 # =================================================
 # VERSION
 # =================================================
-ZENCMD_VERSION = "2.2.0"
+ZENCMD_VERSION = "3.81"
 ZENOS_NAME     = "Zeno OS"
 
 # Commands that require Super Mode.
