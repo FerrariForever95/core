@@ -1162,7 +1162,9 @@ def cfg_get(cfg, *keys):
     for k in keys:
         if k in cfg:
             return cfg[k]
-
+import time
+import os
+import json
 
 try:
     import _thread
@@ -1175,6 +1177,7 @@ try:
     _HAVE_URANDOM = True
 except ImportError:
     _HAVE_URANDOM = False
+
 PERSIST_PATH = "/LOGS/proc_state.json"
 
 #   1xxx  KERNEL    -- boot/UI/core system processes, owner=root
@@ -1207,6 +1210,7 @@ def pid_type(pid):
 
 def pid_type_name(pid):
     return PID_TYPE_NAMES.get(pid_type(pid), "UNKNOWN")
+
 
 # ---------------- process states ----------------
 NEW     = "NEW"
@@ -1288,8 +1292,8 @@ class Scheduler:
     """Zeno OS process scheduler. One instance lives at zeno.sched."""
 
     def __init__(self, logger=None):
-        self.cpu = CPU()
-        self._current_user_fn = "root"
+        self.cpu = None
+        self._current_user_fn = lambda: "root"
 
         self.table = {}          # pid -> Process
         self.running = False
@@ -1447,11 +1451,6 @@ class Scheduler:
         owner = owner or self._caller_user() or "root"
         resolved_ptype = self._classify(mode, owner, ptype)
 
-        # Daemon-series (4xxx) processes are critical background services
-        # (guardian, etc). They must run as real threads so they can't be
-        # starved or torn out by the cooperative runqueue -- enforce this
-        # at spawn time rather than silently upgrading the mode, so a
-        # misconfigured daemon fails loudly during development.
         if resolved_ptype == PID_TYPE_DAEMON and mode != MODE_THREAD:
             raise ValueError(
                 "daemon-series (4xxx) processes must use mode=MODE_THREAD "
@@ -1470,8 +1469,6 @@ class Scheduler:
         p.state = READY
         self.table[pid] = p
 
-        # Announce once per pid -- "started guardian service" etc -- so the
-        # log records what's running without spamming on every reschedule.
         if pid not in self._announced:
             self._announced.add(pid)
             self._log_debug(
@@ -1491,38 +1488,35 @@ class Scheduler:
         if p is None:
             raise ProcessError("no such pid: %d" % pid)
 
-    # SIGKILL is never permitted on a daemon, regardless of caller --
-    # daemons are thread-mode and must be stopped cooperatively via
-    # SIGTERM + checkpoint(), never yanked with no cleanup mid-task.
         if pid_type(p.pid) == PID_TYPE_DAEMON and sig == SIGKILL:
-            self.log.error(
-            "blocked signal {} on pid {} ({}, owner={}): SIGKILL forbidden on daemon pid".format(
-                sig, p.pid, p.name, p.owner
-            ),
-            source="SECSCAN",
-        )
+            self._log_error(
+                "blocked signal {} on pid {} ({}, owner={}): SIGKILL forbidden on daemon pid".format(
+                    sig, p.pid, p.name, p.owner
+                ),
+                source="SECSCAN",
+            )
             raise PermissionDenied(
-            "pid %d (%s) is a protected daemon; SIGKILL is not permitted, "
-            "use SIGTERM for cooperative shutdown" % (pid, p.name)
-        )
+                "pid %d (%s) is a protected daemon; SIGKILL is not permitted, "
+                "use SIGTERM for cooperative shutdown" % (pid, p.name)
+            )
 
         if not self._can_signal(p, system_token=system_token):
-            self.log.error(
-            "blocked signal {} on pid {} ({}, owner={}): permission denied".format(
-                sig, p.pid, p.name, p.owner
-            ),
-            source="SECSCAN",
-        )
+            self._log_error(
+                "blocked signal {} on pid {} ({}, owner={}): permission denied".format(
+                    sig, p.pid, p.name, p.owner
+                ),
+                source="SECSCAN",
+            )
             raise PermissionDenied(
-            "user cannot signal pid %d (owned by %s)" % (pid, p.owner)
-        )
+                "user cannot signal pid %d (owned by %s)" % (pid, p.owner)
+            )
         if p.state in (ZOMBIE, DEAD):
             return True
 
-        self.log.debug(
-        "killing pid {} ({}, owner={}) with signal {}".format(p.pid, p.name, p.owner, sig),
-        source="SCHED",
-    )
+        self._log_debug(
+            "killing pid {} ({}, owner={}) with signal {}".format(p.pid, p.name, p.owner, sig),
+            source="SCHED",
+        )
 
         if sig == SIGKILL and p.mode != MODE_THREAD:
             p.state = ZOMBIE
@@ -1533,16 +1527,11 @@ class Scheduler:
         p.pending_signal = sig
         return True
 
-
     def killall(self, sig=SIGTERM, system_token=None, include_daemons=False):
-        """Signal every task the scheduler knows about. Daemons (4xxx) are
-        skipped by default -- protected, and on the boot-failure/reboot path
-        this is normally called from, about to die via machine.reset() anyway.
-        Pass include_daemons=True + a valid system_token to also SIGTERM
-        (never SIGKILL) daemons explicitly. Never raises."""
-        self.log.debug(
-        "killall requested (sig={}, include_daemons={})".format(sig, include_daemons),
-        source="SCHED",
+        """Signal every task the scheduler knows about."""
+        self._log_debug(
+            "killall requested (sig={}, include_daemons={})".format(sig, include_daemons),
+            source="SCHED",
         )
 
         killed, skipped, failed = [], [], []
@@ -1561,14 +1550,14 @@ class Scheduler:
                 killed.append(pid)
             except Exception as e:
                 failed.append(pid)
-                self.log.error(
-                "killall: failed to signal pid {} ({}): {}".format(pid, p.name, e),
-                source="SCHED",
+                self._log_error(
+                    "killall: failed to signal pid {} ({}): {}".format(pid, p.name, e),
+                    source="SCHED",
                 )
 
-        self.log.debug(
-        "killall complete: signaled={} skipped_daemons={} failed={}".format(
-            killed, skipped, failed
+        self._log_debug(
+            "killall complete: signaled={} skipped_daemons={} failed={}".format(
+                killed, skipped, failed
             ),
             source="SCHED",
         )
@@ -1729,7 +1718,12 @@ class Scheduler:
         return True
 
     def _reap_zombies(self):
-        pass
+        # FIXED: Automatically clean up finished/zombie processes so table & list update properly
+        for pid, p in list(self.table.items()):
+            if p.state == ZOMBIE:
+                p.state = DEAD
+                del self.table[pid]
+                self._announced.discard(pid)
 
     def reap(self, pid):
         p = self.table.get(pid)
@@ -1752,7 +1746,7 @@ class Scheduler:
             idle = max(0, budget_us - busy)
             if idle > 0:
                 time.sleep_us(idle)
-            if hasattr(self.cpu, "report_frame"):
+            if self.cpu is not None and hasattr(self.cpu, "report_frame"):
                 self.cpu.report_frame(busy, idle)
             self._persist()
 
@@ -1760,7 +1754,16 @@ class Scheduler:
         self.running = False
         self._log_debug("scheduler main loop stopped", source="SCHED")
 
-# =============================================================================
+    def handle_boot_button_long_press(self):
+        """Called when boot button is held down for 4 seconds.
+        Signals all daemons/services with SIGTERM, logs to logger, and stops scheduler."""
+        self._log_debug("Boot button held for 4s: initiating graceful shutdown of all processes/daemons.", source="BOOTBTN")
+        
+        # Killall including daemons via SIGTERM (cooperative exit checkpoints)
+        self.killall(sig=SIGTERM, include_daemons=True)
+        
+        # Stop scheduler loop
+        self.stop()# =============================================================================
 # system -- low-level system control, RAM/security housekeeping, guardian
 # =============================================================================
 
