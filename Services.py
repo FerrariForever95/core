@@ -19,6 +19,8 @@ import zfs
 from machine import Pin, SPI, I2C, PWM, SoftSPI, RTC
 from firmware import DS3231
 from firmware import SDCard
+from sinricpro import SinricPro
+from sinricpro_device import SinricProDevice
 
 SD_SCK, SD_MOSI, SD_MISO, SD_CS = 40, 6, 5, 7
 LOGS_DIR = "/LOGS"
@@ -3343,82 +3345,57 @@ class PackageManager:
         print("[PKG] Error:", message)
 
 
-class IoTDevice:
-    """Represents an individual controllable IoT device."""
-    def __init__(self, device_id, name, device_type, platform_client):
-        self.device_id = device_id
-        self.name = name
-        self.device_type = device_type  # e.g., 'switch', 'light', 'fan'
-        self.client = platform_client   # The underlying platform connector (e.g., Sinric Pro)
-
-    def turn_on(self):
-        return self.client.set_power(self.device_id, True)
-
-    def turn_off(self):
-        return self.client.set_power(self.device_id, False)
-
-    def toggle(self):
-        # Implementation depends on whether status can be read or tracked state
-        current_state = getattr(self, "_state", False)
-        new_state = not current_state
-        success = self.client.set_power(self.device_id, new_state)
-        if success:
-            self._state = new_state
-        return new_state
-
-
-class SinricProPlatform:
-    """Platform adapter for Sinric Pro API handling."""
-    def __init__(self, api_key, app_secret=""):
-        self.api_key = api_key
-        self.app_secret = app_secret
-        # Initialize your underlying API/websocket connection here
-
-    def set_power(self, device_id, state):
-        # Translate this into the specific Sinric Pro REST API call or WebSocket payload
-        action = "on" if state else "off"
-        print(f"[SinricPro] Sending command '{action}' to device ID: {device_id}")
-        
-        # Example pseudo-code for API execution:
-        # response = urequests.put(f"https://api.sinric.pro/v1/devices/{device_id}", json={"value": action}, headers={"Authorization": self.api_key})
-        # return response.status_code == 200
-        
-        return True  # Simulated success
-
 
 class IoTManager:
-    """Core manager class to register, track, and toggle IoT devices across platforms."""
-    def __init__(self):
-        self.platforms = {}
+    """Standalone IoT Manager using the official Sinric Pro SDK."""
+    def __init__(self, app_key, app_secret):
+        self.app_key = app_key
+        self.app_secret = app_secret
         self.devices = {}
-
-    def register_platform(self, name, client_instance):
-        """Register a backend platform like 'sinric'."""
-        self.platforms[name] = client_instance
-
-    def add_device(self, device_id, name, device_type, platform_name):
-        """Add a device by binding it to a registered platform."""
-        if platform_name not in self.platforms:
-            raise ValueError(f"Platform '{platform_name}' is not registered.")
         
-        client = self.platforms[platform_name]
-        device = IoTDevice(device_id, name, device_type, client)
+        # Initialize official Sinric Pro client
+        self.client = SinricPro(app_key, app_secret)
+
+    def add_device(self, device_id, name, device_type="switch", custom_callback=None):
+        """Register a device with Sinric Pro and link its state callback."""
+        device = self.client.add(SinricProDevice(device_id, device_type))
+        
+        # Default behavior when voice/app toggles the device
+        def default_callback(did, state):
+            status = "ON" if state else "OFF"
+            print(f"\n[IoTManager] Command received -> '{name}' ({did}) turned {status}")
+            
+            # TODO: Add your hardware relay or pin control here!
+            # Example: pin.value(1 if state else 0)
+            
+            if custom_callback:
+                custom_callback(did, state)
+            return True
+
+        device.on_power_state(default_callback)
         self.devices[device_id] = device
-        print(f"[IoTManager] Registered device '{name}' ({device_type}) on platform '{platform_name}'.")
+        print(f"[IoTManager] Registered '{name}' (ID: {device_id}) as {device_type}")
         return device
 
-    def toggle_device(self, device_id):
-        """Toggle a specific device by its ID."""
-        if device_id not in self.devices:
-            print(f"[IoTManager] Device ID '{device_id}' not found.")
-            return None
-        return self.devices[device_id].toggle()
+    def turn_on(self, device_id):
+        """Send an ON state feedback event upstream."""
+        if device_id in self.devices:
+            self.devices[device_id].raise_power_state_event(True)
+            return True
+        print(f"[IoTManager] Device ID '{device_id}' not found.")
+        return False
 
-    def set_device_state(self, device_id, state: bool):
-        """Explicitly turn a device on (True) or off (False)."""
-        if device_id not in self.devices:
-            print(f"[IoTManager] Device ID '{device_id}' not found.")
-            return False
-        
-        dev = self.devices[device_id]
-        return dev.turn_on() if state else dev.turn_off()
+    def turn_off(self, device_id):
+        """Send an OFF state feedback event upstream."""
+        if device_id in self.devices:
+            self.devices[device_id].raise_power_state_event(False)
+            return True
+        print(f"[IoTManager] Device ID '{device_id}' not found.")
+        return False
+
+    def handle(self):
+        """Polls network/WebSocket events. Must be called regularly."""
+        try:
+            self.client.handle()
+        except Exception as e:
+            print(f"[IoTManager] Handle loop error: {e}")
