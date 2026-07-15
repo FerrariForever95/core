@@ -1,3 +1,8 @@
+
+import sys
+if '/lib' not in sys.path:
+    sys.path.append('/lib')
+# sys.path.insert(0, '/lib/sinric pro')
 import time
 import os
 import machine
@@ -20,7 +25,7 @@ from machine import Pin, SPI, I2C, PWM, SoftSPI, RTC
 from firmware import DS3231
 from firmware import SDCard
 from sinricpro import SinricPro
-from sinricpro_device import SinricProDevice
+from sinricpro.devices.sinricpro_switch import SinricProSwitch
 
 SD_SCK, SD_MOSI, SD_MISO, SD_CS = 40, 6, 5, 7
 LOGS_DIR = "/LOGS"
@@ -3347,55 +3352,95 @@ class PackageManager:
 
 
 class IoTManager:
-    """Standalone IoT Manager using the official Sinric Pro SDK."""
+    """Manager class to coordinate smart home devices via Sinric Pro."""
     def __init__(self, app_key, app_secret):
         self.app_key = app_key
         self.app_secret = app_secret
-        self.devices = {}
+        self.devices = {}      # Maps device_id -> device object
+        self.name_map = {}     # Maps friendly name -> device_id for easy lookup
         
-        # Initialize official Sinric Pro client
-        self.client = SinricPro(app_key, app_secret)
+        self.client = SinricPro()
 
-    def add_device(self, device_id, name, device_type="switch", custom_callback=None):
-        """Register a device with Sinric Pro and link its state callback."""
-        device = self.client.add(SinricProDevice(device_id, device_type))
+    def add_switch(self, device_id, name, pin_number=None, custom_callback=None):
+        """Register a switch device and link it to an optional hardware pin."""
+        hardware_pin = Pin(pin_number, Pin.OUT) if pin_number is not None else None
+        switch_device = SinricProSwitch(device_id)
         
-        # Default behavior when voice/app toggles the device
-        def default_callback(did, state):
-            status = "ON" if state else "OFF"
-            print(f"\n[IoTManager] Command received -> '{name}' ({did}) turned {status}")
+        def power_state_callback(did, state):
+            status_label = "ON" if state else "OFF"
+            print(f"\n[IoTManager] Cloud Command -> '{name}' ({did}) set to {status_label}")
             
-            # TODO: Add your hardware relay or pin control here!
-            # Example: pin.value(1 if state else 0)
-            
+            if hardware_pin:
+                hardware_pin.value(1 if state else 0)
+                
             if custom_callback:
                 custom_callback(did, state)
+                
             return True
 
-        device.on_power_state(default_callback)
-        self.devices[device_id] = device
-        print(f"[IoTManager] Registered '{name}' (ID: {device_id}) as {device_type}")
-        return device
+        switch_device.on_power_state(power_state_callback)
+        self.client.add(switch_device)
+        
+        # Track device metadata
+        device_info = {
+            "device": switch_device,
+            "name": name,
+            "pin": hardware_pin
+        }
+        self.devices[device_id] = device_info
+        self.name_map[name.lower()] = device_id
+        
+        print(f"[IoTManager] Registered switch '{name}' [ID: {device_id}]")
+        return switch_device
 
-    def turn_on(self, device_id):
-        """Send an ON state feedback event upstream."""
-        if device_id in self.devices:
-            self.devices[device_id].raise_power_state_event(True)
-            return True
-        print(f"[IoTManager] Device ID '{device_id}' not found.")
-        return False
+    def _resolve_identifier(self, identifier):
+        """Resolves either a device ID or a friendly name to a device ID."""
+        if identifier in self.devices:
+            return identifier
+        # Try case-insensitive friendly name lookup
+        key = str(identifier).lower()
+        if key in self.name_map:
+            return self.name_map[key]
+        return None
 
-    def turn_off(self, device_id):
-        """Send an OFF state feedback event upstream."""
-        if device_id in self.devices:
-            self.devices[device_id].raise_power_state_event(False)
-            return True
-        print(f"[IoTManager] Device ID '{device_id}' not found.")
-        return False
+    def on(self, identifier):
+        """Turn a device ON using its device ID or friendly name. Usage: iot.on('Living Room Light')"""
+        did = self._resolve_identifier(identifier)
+        if not did:
+            print(f"[IoTManager] Device '{identifier}' not found.")
+            return False
+        
+        # Raise event upstream to cloud/app and trigger local handlers
+        self.devices[did]["device"].raise_power_state_event(True)
+        print(f"[IoTManager] Local command -> Turned ON '{self.devices[did]['name']}'")
+        
+        # Also actuate physical pin locally if mapped
+        pin = self.devices[did]["pin"]
+        if pin:
+            pin.value(1)
+        return True
+
+    def off(self, identifier):
+        """Turn a device OFF using its device ID or friendly name. Usage: iot.off('Living Room Light')"""
+        did = self._resolve_identifier(identifier)
+        if not did:
+            print(f"[IoTManager] Device '{identifier}' not found.")
+            return False
+        
+        self.devices[did]["device"].raise_power_state_event(False)
+        print(f"[IoTManager] Local command -> Turned OFF '{self.devices[did]['name']}'")
+        
+        pin = self.devices[did]["pin"]
+        if pin:
+            pin.value(0)
+        return True
+
+    def start(self):
+        print("[IoTManager] Connecting to Sinric Pro...")
+        self.client.start(self.app_key, self.app_secret)
 
     def handle(self):
-        """Polls network/WebSocket events. Must be called regularly."""
         try:
             self.client.handle()
         except Exception as e:
-            print(f"[IoTManager] Handle loop error: {e}")
+            print(f"[IoTManager] Network handle error: {e}")
