@@ -3379,7 +3379,7 @@ class IoTManager:
             return True
 
         switch_device.on_power_state(power_state_callback)
-        self.client.add(switch_device)
+        self.client.add_device(switch_device)
         
         # Track device metadata
         device_info = {
