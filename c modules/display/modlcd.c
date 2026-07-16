@@ -28,7 +28,13 @@
  *                                                madctl=0x48 for portrait
  *   moclcd.reset()
  *   moclcd.panel_init()
- *   moclcd.backlight(on)
+ *   moclcd.backlight(on)                     -- digital on/off; drives PWM duty
+ *                                                to max/0 instead if backlight_init()
+ *                                                was called
+ *   moclcd.backlight_init(freq_hz=5000, resolution_bits=8)
+ *                                             -- sets up LEDC PWM on the BL pin
+ *   moclcd.backlight_set(level)              -- level is 0.0-1.0 brightness fraction,
+ *                                                requires backlight_init() first
  *   moclcd.cmd(cmd, params=None)     -- raw passthrough, still available
  *   moclcd.data(buf)                 -- raw passthrough, still available
  *   moclcd.fill_rect(x, y, w, h, color)      -- raises ValueError if out of bounds
@@ -49,6 +55,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_heap_caps.h"
+#include "driver/ledc.h"
 
 #include <string.h>
 
@@ -58,7 +65,7 @@
 #define LCD_CMD_RAMWRC 0x3C   /* continuation write, used for pixel streaming */
 
 /* how many pixels we buffer per DMA chunk (2 bytes/pixel -> 4KB chunks) */
-#define FILL_CHUNK_PIXELS  32768
+#define FILL_CHUNK_PIXELS  65536
 
 /* ---- module state ---- */
 static esp_lcd_i80_bus_handle_t  s_bus       = NULL;
@@ -71,6 +78,8 @@ static uint16_t                  s_width     = 480;
 static uint16_t                  s_height    = 320;
 static uint8_t                   s_madctl    = 0x28; /* landscape (MV set); 0x48=portrait, 0x88/0xE8=other rotations */
 static uint8_t                  *s_fill_buf  = NULL; /* FILL_CHUNK_PIXELS*2 bytes, DMA capable */
+static bool                      s_bl_pwm_inited = false;
+static uint32_t                  s_bl_duty_max   = 255; /* set by backlight_init() from resolution_bits */
 
 /* -------------------------------------------------------------------
  * helpers
@@ -303,11 +312,92 @@ static mp_obj_t moclcd_panel_init(void)
 static MP_DEFINE_CONST_FUN_OBJ_0(moclcd_panel_init_obj, moclcd_panel_init);
 
 /* -------------------------------------------------------------------
+ * moclcd.backlight_init(freq_hz=5000, resolution_bits=8)
+ * Sets up an LEDC PWM channel on the backlight pin. Call once, before
+ * using backlight_set() or expecting backlight() to dim rather than
+ * just switch on/off.
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_backlight_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
+{
+    enum { ARG_freq, ARG_res_bits };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_freq_hz,          MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 5000} },
+        { MP_QSTR_resolution_bits,  MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 8} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    int res_bits = args[ARG_res_bits].u_int;
+
+    ledc_timer_config_t timer_cfg = {
+        .speed_mode      = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = (ledc_timer_bit_t)res_bits,
+        .timer_num       = LEDC_TIMER_0,
+        .freq_hz         = (uint32_t)args[ARG_freq].u_int,
+        .clk_cfg         = LEDC_AUTO_CLK,
+    };
+    io_check(ledc_timer_config(&timer_cfg), "ledc_timer_config");
+
+    ledc_channel_config_t ch_cfg = {
+        .gpio_num   = s_bl_pin,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel    = LEDC_CHANNEL_0,
+        .intr_type  = LEDC_INTR_DISABLE,
+        .timer_sel  = LEDC_TIMER_0,
+        .duty       = 0,
+        .hpoint     = 0,
+    };
+    io_check(ledc_channel_config(&ch_cfg), "ledc_channel_config");
+
+    s_bl_duty_max   = (1u << res_bits) - 1;
+    s_bl_pwm_inited = true;
+
+    /* start fully on, matching the plain-GPIO backlight()'s prior default */
+    io_check(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, s_bl_duty_max), "ledc_set_duty");
+    io_check(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0), "ledc_update_duty");
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(moclcd_backlight_init_obj, 0, moclcd_backlight_init);
+
+/* -------------------------------------------------------------------
+ * moclcd.backlight_set(level)
+ * level is a 0.0-1.0 brightness fraction. Requires backlight_init().
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_backlight_set(mp_obj_t level_in)
+{
+    if (!s_bl_pwm_inited) {
+        mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("moclcd.backlight_init() must be called first"));
+    }
+    mp_float_t level = mp_obj_get_float(level_in);
+    if (level < 0) level = 0;
+    if (level > 1) level = 1;
+
+    uint32_t duty = (uint32_t)(level * s_bl_duty_max + 0.5f);
+    io_check(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty), "ledc_set_duty");
+    io_check(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0), "ledc_update_duty");
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_1(moclcd_backlight_set_obj, moclcd_backlight_set);
+
+/* -------------------------------------------------------------------
  * moclcd.backlight(on)
+ * Plain on/off. If backlight_init() has been called, this drives the
+ * PWM duty to max/0 instead of touching the pin directly (the pin is
+ * now owned by the LEDC peripheral, not plain GPIO).
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_backlight(mp_obj_t on_in)
 {
-    mp_hal_pin_write(s_bl_pin, mp_obj_is_true(on_in) ? 1 : 0);
+    bool on = mp_obj_is_true(on_in);
+
+    if (s_bl_pwm_inited) {
+        uint32_t duty = on ? s_bl_duty_max : 0;
+        io_check(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty), "ledc_set_duty");
+        io_check(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0), "ledc_update_duty");
+    } else {
+        mp_hal_pin_write(s_bl_pin, on ? 1 : 0);
+    }
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(moclcd_backlight_obj, moclcd_backlight);
@@ -607,6 +697,8 @@ static const mp_rom_map_elem_t moclcd_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_reset),       MP_ROM_PTR(&moclcd_reset_obj)       },
     { MP_ROM_QSTR(MP_QSTR_panel_init),  MP_ROM_PTR(&moclcd_panel_init_obj)  },
     { MP_ROM_QSTR(MP_QSTR_backlight),   MP_ROM_PTR(&moclcd_backlight_obj)   },
+    { MP_ROM_QSTR(MP_QSTR_backlight_init), MP_ROM_PTR(&moclcd_backlight_init_obj) },
+    { MP_ROM_QSTR(MP_QSTR_backlight_set),  MP_ROM_PTR(&moclcd_backlight_set_obj)  },
     { MP_ROM_QSTR(MP_QSTR_cmd),         MP_ROM_PTR(&moclcd_cmd_obj)         },
     { MP_ROM_QSTR(MP_QSTR_data),        MP_ROM_PTR(&moclcd_data_obj)        },
     { MP_ROM_QSTR(MP_QSTR_fill_rect),   MP_ROM_PTR(&moclcd_fill_rect_obj)   },
