@@ -22,17 +22,17 @@
 #define LCD_CMD_RAMWRC 0x3C
 
 /* ---- single-display module state ---- */
-STATIC esp_lcd_i80_bus_handle_t  s_bus       = NULL;
-STATIC esp_lcd_panel_io_handle_t s_io        = NULL;
-STATIC mp_hal_pin_obj_t          s_reset_pin;
-STATIC bool                      s_has_reset = false;
+static esp_lcd_i80_bus_handle_t  s_bus       = NULL;
+static esp_lcd_panel_io_handle_t s_io        = NULL;
+static mp_hal_pin_obj_t          s_reset_pin;
+static bool                      s_has_reset = false;
 
 /* -------------------------------------------------------------------
  * lcd_min.init(pclk=10_000_000)
  * Configures your specific pin mapping automatically using 
  * ESP-IDF's hardware 8080 parallel peripheral.
  * ---------------------------------------------------------------- */
-STATIC mp_obj_t lcd_min_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
+static mp_obj_t lcd_min_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
     enum { ARG_pclk };
     static const mp_arg_t allowed[] = {
@@ -102,12 +102,12 @@ STATIC mp_obj_t lcd_min_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *
 
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_KW(lcd_min_init_obj, 0, lcd_min_init);
+static MP_DEFINE_CONST_FUN_OBJ_KW(lcd_min_init_obj, 0, lcd_min_init);
 
 /* -------------------------------------------------------------------
  * lcd_min.reset()
  * ---------------------------------------------------------------- */
-STATIC mp_obj_t lcd_min_reset(void)
+static mp_obj_t lcd_min_reset(void)
 {
     if (!s_has_reset) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("no reset pin configured"));
@@ -120,12 +120,12 @@ STATIC mp_obj_t lcd_min_reset(void)
     mp_hal_delay_us(150 * 1000);
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_0(lcd_min_reset_obj, lcd_min_reset);
+static MP_DEFINE_CONST_FUN_OBJ_0(lcd_min_reset_obj, lcd_min_reset);
 
 /* -------------------------------------------------------------------
  * lcd_min.cmd(cmd, params=None)
  * ---------------------------------------------------------------- */
-STATIC mp_obj_t lcd_min_cmd(size_t n_args, const mp_obj_t *args_in)
+static mp_obj_t lcd_min_cmd(size_t n_args, const mp_obj_t *args_in)
 {
     if (s_io == NULL) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("lcd_min.init() must be called first"));
@@ -147,12 +147,12 @@ STATIC mp_obj_t lcd_min_cmd(size_t n_args, const mp_obj_t *args_in)
     }
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lcd_min_cmd_obj, 1, 2, lcd_min_cmd);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(lcd_min_cmd_obj, 1, 2, lcd_min_cmd);
 
 /* -------------------------------------------------------------------
  * lcd_min.data(buf)
  * ---------------------------------------------------------------- */
-STATIC mp_obj_t lcd_min_data(mp_obj_t buf_in)
+static mp_obj_t lcd_min_data(mp_obj_t buf_in)
 {
     if (s_io == NULL) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("lcd_min.init() must be called first"));
@@ -166,17 +166,17 @@ STATIC mp_obj_t lcd_min_data(mp_obj_t buf_in)
     }
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_1(lcd_min_data_obj, lcd_min_data);
+static MP_DEFINE_CONST_FUN_OBJ_1(lcd_min_data_obj, lcd_min_data);
 
 /* ---- module table ---- */
-STATIC const mp_rom_map_elem_t lcd_min_globals_table[] = {
+static const mp_rom_map_elem_t lcd_min_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_lcd_min)     },
     { MP_ROM_QSTR(MP_QSTR_init),     MP_ROM_PTR(&lcd_min_init_obj)   },
     { MP_ROM_QSTR(MP_QSTR_reset),    MP_ROM_PTR(&lcd_min_reset_obj)  },
     { MP_ROM_QSTR(MP_QSTR_cmd),      MP_ROM_PTR(&lcd_min_cmd_obj)    },
     { MP_ROM_QSTR(MP_QSTR_data),     MP_ROM_PTR(&lcd_min_data_obj)   },
 };
-STATIC MP_DEFINE_CONST_DICT(lcd_min_globals, lcd_min_globals_table);
+static MP_DEFINE_CONST_DICT(lcd_min_globals, lcd_min_globals_table);
 
 const mp_obj_module_t mp_module_lcd_min = {
     .base    = { &mp_type_module },
