@@ -22,15 +22,23 @@
  *   like the original demo script did.
  *
  * API:
- *   moclcd.init(pclk=10_000_000, width=320, height=480)
+ *   moclcd.init(pclk=10_000_000, width=480, height=320, madctl=0x28)
+ *                                             -- defaults to landscape;
+ *                                                pass width=320, height=480,
+ *                                                madctl=0x48 for portrait
  *   moclcd.reset()
  *   moclcd.panel_init()
  *   moclcd.backlight(on)
  *   moclcd.cmd(cmd, params=None)     -- raw passthrough, still available
  *   moclcd.data(buf)                 -- raw passthrough, still available
- *   moclcd.fill_rect(x, y, w, h, color)
+ *   moclcd.fill_rect(x, y, w, h, color)      -- raises ValueError if out of bounds
  *   moclcd.fill_screen(color)
- *   moclcd.blit(x, y, w, h, buf)     -- buf is raw RGB565 bytes, MSB first
+ *   moclcd.blit(x, y, w, h, buf)             -- buf is raw RGB565 bytes, MSB first
+ *   moclcd.draw_pixel(x, y, color)           -- clipped silently if off-panel
+ *   moclcd.draw_line(x0, y0, x1, y1, color)  -- clipped silently if off-panel
+ *   moclcd.draw_rect(x, y, w, h, color)      -- outline; clipped silently if off-panel
+ *   moclcd.draw_circle(x0, y0, r, color)     -- outline; clipped silently if off-panel
+ *   moclcd.fill_circle(x0, y0, r, color)     -- filled; clipped silently if off-panel
  */
 
 #include "py/obj.h"
@@ -59,8 +67,9 @@ static mp_hal_pin_obj_t          s_reset_pin = 12;
 static mp_hal_pin_obj_t          s_bl_pin    = 38;
 static mp_hal_pin_obj_t          s_rd_pin    = 41;
 static bool                      s_has_reset = false;
-static uint16_t                  s_width     = 320;
-static uint16_t                  s_height    = 480;
+static uint16_t                  s_width     = 480;
+static uint16_t                  s_height    = 320;
+static uint8_t                   s_madctl    = 0x28; /* landscape (MV set); 0x48=portrait, 0x88/0xE8=other rotations */
 static uint8_t                  *s_fill_buf  = NULL; /* FILL_CHUNK_PIXELS*2 bytes, DMA capable */
 
 /* -------------------------------------------------------------------
@@ -108,22 +117,79 @@ static void set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
     lcd_cmd_raw(LCD_CMD_RAMWR, NULL, 0);
 }
 
+/* stream `total_pixels` copies of `color` right after the address
+ * window has been armed via set_window(). Shared by fill_rect() and by
+ * the line/rect/circle primitives below so they all get the same
+ * chunked, DMA-pipelined path. */
+static void stream_solid(uint32_t total_pixels, uint16_t color)
+{
+    ensure_fill_buf();
+
+    uint32_t chunk = total_pixels < FILL_CHUNK_PIXELS ? total_pixels : FILL_CHUNK_PIXELS;
+    uint8_t hi = (uint8_t)(color >> 8);
+    uint8_t lo = (uint8_t)(color & 0xFF);
+    for (uint32_t i = 0; i < chunk; i++) {
+        s_fill_buf[2 * i]     = hi;
+        s_fill_buf[2 * i + 1] = lo;
+    }
+
+    uint32_t remaining = total_pixels;
+    while (remaining > 0) {
+        uint32_t n = remaining < FILL_CHUNK_PIXELS ? remaining : FILL_CHUNK_PIXELS;
+        io_check(esp_lcd_panel_io_tx_color(s_io, LCD_CMD_RAMWRC, s_fill_buf, n * 2), "fill");
+        remaining -= n;
+    }
+}
+
+/* Clip a rectangle to the panel bounds in place. Returns false if the
+ * result is empty (nothing to draw), unlike the strict fill_rect()
+ * below which raises on out-of-bounds. Shapes like circles and lines
+ * routinely have parts that fall off the edge, so the primitives that
+ * build on this clip silently instead of erroring. */
+static bool clip_rect(int *x, int *y, int *w, int *h)
+{
+    if (*x < 0) { *w += *x; *x = 0; }
+    if (*y < 0) { *h += *y; *y = 0; }
+    if (*x + *w > s_width)  *w = (int)s_width  - *x;
+    if (*y + *h > s_height) *h = (int)s_height - *y;
+    return (*w > 0 && *h > 0 && *x < s_width && *y < s_height);
+}
+
+static void do_fill_rect_clip(int x, int y, int w, int h, uint16_t color)
+{
+    if (!clip_rect(&x, &y, &w, &h)) return;
+    set_window((uint16_t)x, (uint16_t)y, (uint16_t)(x + w - 1), (uint16_t)(y + h - 1));
+    stream_solid((uint32_t)w * (uint32_t)h, color);
+}
+
+static void do_draw_pixel(int x, int y, uint16_t color)
+{
+    if (x < 0 || y < 0 || x >= s_width || y >= s_height) return;
+    set_window((uint16_t)x, (uint16_t)y, (uint16_t)x, (uint16_t)y);
+    stream_solid(1, color);
+}
+
 /* -------------------------------------------------------------------
  * moclcd.init(pclk=10_000_000, width=320, height=480)
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
-    enum { ARG_pclk, ARG_width, ARG_height };
+    enum { ARG_pclk, ARG_width, ARG_height, ARG_madctl };
     static const mp_arg_t allowed[] = {
         { MP_QSTR_pclk,   MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 10000000} },
-        { MP_QSTR_width,  MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 320} },
-        { MP_QSTR_height, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 480} },
+        { MP_QSTR_width,  MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 480} },
+        { MP_QSTR_height, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 320} },
+        /* 0x28 = landscape (MV set). 0x48 = portrait (original orientation).
+           0x88 / 0xE8 = the other two 90-degree rotations. If the image
+           comes up mirrored or upside down in landscape, try 0xE8. */
+        { MP_QSTR_madctl, MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 0x28} },
     };
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
     s_width  = (uint16_t)args[ARG_width].u_int;
     s_height = (uint16_t)args[ARG_height].u_int;
+    s_madctl = (uint8_t)args[ARG_madctl].u_int;
 
     /* --- Your exact data pins (D0 through D7) --- */
     int data_gpios[8] = { 16, 15, 11, 10, 9, 4, 18, 17 };
@@ -217,7 +283,7 @@ static mp_obj_t moclcd_panel_init(void)
     lcd_cmd_raw(0x3A, &colmod, 1);           /* 16bpp */
     mp_hal_delay_us(10 * 1000);
 
-    uint8_t madctl = 0x48;
+    uint8_t madctl = s_madctl;
     lcd_cmd_raw(0x36, &madctl, 1);
     mp_hal_delay_us(10 * 1000);
 
@@ -305,27 +371,8 @@ static mp_obj_t moclcd_fill_rect(size_t n_args, const mp_obj_t *args_in)
         mp_raise_ValueError(MP_ERROR_TEXT("fill_rect out of bounds"));
     }
 
-    ensure_fill_buf();
-
-    uint32_t total_pixels = (uint32_t)w * (uint32_t)h;
-    uint32_t chunk = total_pixels < FILL_CHUNK_PIXELS ? total_pixels : FILL_CHUNK_PIXELS;
-
-    /* MSB-first, matching the byte order the working Python demo used */
-    uint8_t hi = (uint8_t)(color >> 8);
-    uint8_t lo = (uint8_t)(color & 0xFF);
-    for (uint32_t i = 0; i < chunk; i++) {
-        s_fill_buf[2 * i]     = hi;
-        s_fill_buf[2 * i + 1] = lo;
-    }
-
     set_window((uint16_t)x, (uint16_t)y, (uint16_t)(x + w - 1), (uint16_t)(y + h - 1));
-
-    uint32_t remaining = total_pixels;
-    while (remaining > 0) {
-        uint32_t n = remaining < FILL_CHUNK_PIXELS ? remaining : FILL_CHUNK_PIXELS;
-        io_check(esp_lcd_panel_io_tx_color(s_io, LCD_CMD_RAMWRC, s_fill_buf, n * 2), "fill_rect");
-        remaining -= n;
-    }
+    stream_solid((uint32_t)w * (uint32_t)h, color);
 
     return mp_const_none;
 }
@@ -380,6 +427,179 @@ static mp_obj_t moclcd_blit(size_t n_args, const mp_obj_t *args_in)
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_blit_obj, 5, 5, moclcd_blit);
 
+/* -------------------------------------------------------------------
+ * moclcd.draw_pixel(x, y, color)
+ * Silently clipped if off-panel (consistent with the primitives below,
+ * unlike the strict fill_rect()/blit() calls above).
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_draw_pixel(size_t n_args, const mp_obj_t *args_in)
+{
+    require_init();
+    int x = mp_obj_get_int(args_in[0]);
+    int y = mp_obj_get_int(args_in[1]);
+    uint16_t color = (uint16_t)mp_obj_get_int(args_in[2]);
+    do_draw_pixel(x, y, color);
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_pixel_obj, 3, 3, moclcd_draw_pixel);
+
+/* -------------------------------------------------------------------
+ * moclcd.draw_line(x0, y0, x1, y1, color)
+ * Horizontal/vertical lines take a fast path through fill_rect's
+ * chunked DMA stream (a "line" one pixel thick). Diagonals fall back
+ * to a pixel-by-pixel Bresenham walk, since each pixel needs its own
+ * address window on this bus.
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_draw_line(size_t n_args, const mp_obj_t *args_in)
+{
+    require_init();
+    int x0 = mp_obj_get_int(args_in[0]);
+    int y0 = mp_obj_get_int(args_in[1]);
+    int x1 = mp_obj_get_int(args_in[2]);
+    int y1 = mp_obj_get_int(args_in[3]);
+    uint16_t color = (uint16_t)mp_obj_get_int(args_in[4]);
+
+    if (y0 == y1) {
+        int x = x0 < x1 ? x0 : x1;
+        int w = (x0 < x1 ? x1 - x0 : x0 - x1) + 1;
+        do_fill_rect_clip(x, y0, w, 1, color);
+        return mp_const_none;
+    }
+    if (x0 == x1) {
+        int y = y0 < y1 ? y0 : y1;
+        int h = (y0 < y1 ? y1 - y0 : y0 - y1) + 1;
+        do_fill_rect_clip(x0, y, 1, h, color);
+        return mp_const_none;
+    }
+
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = y1 > y0 ? -(y1 - y0) : (y0 - y1);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    int x = x0, y = y0;
+    for (;;) {
+        do_draw_pixel(x, y, color);
+        if (x == x1 && y == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x += sx; }
+        if (e2 <= dx) { err += dx; y += sy; }
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_line_obj, 5, 5, moclcd_draw_line);
+
+/* -------------------------------------------------------------------
+ * moclcd.draw_rect(x, y, w, h, color)
+ * Outline only (four 1px-thick edges via the DMA fill path). Use
+ * fill_rect() for a solid rectangle.
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_draw_rect(size_t n_args, const mp_obj_t *args_in)
+{
+    require_init();
+    int x = mp_obj_get_int(args_in[0]);
+    int y = mp_obj_get_int(args_in[1]);
+    int w = mp_obj_get_int(args_in[2]);
+    int h = mp_obj_get_int(args_in[3]);
+    uint16_t color = (uint16_t)mp_obj_get_int(args_in[4]);
+
+    if (w <= 0 || h <= 0) return mp_const_none;
+
+    do_fill_rect_clip(x, y, w, 1, color);          /* top */
+    do_fill_rect_clip(x, y + h - 1, w, 1, color);   /* bottom */
+    do_fill_rect_clip(x, y, 1, h, color);           /* left */
+    do_fill_rect_clip(x + w - 1, y, 1, h, color);   /* right */
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_rect_obj, 5, 5, moclcd_draw_rect);
+
+/* -------------------------------------------------------------------
+ * moclcd.draw_circle(x0, y0, r, color)
+ * Midpoint circle algorithm, 8-way symmetry, pixel-by-pixel (each
+ * pixel needs its own address window on this bus, same as draw_line's
+ * diagonal case).
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_draw_circle(size_t n_args, const mp_obj_t *args_in)
+{
+    require_init();
+    int x0 = mp_obj_get_int(args_in[0]);
+    int y0 = mp_obj_get_int(args_in[1]);
+    int r  = mp_obj_get_int(args_in[2]);
+    uint16_t color = (uint16_t)mp_obj_get_int(args_in[3]);
+
+    if (r < 0) return mp_const_none;
+
+    int f = 1 - r;
+    int ddF_x = 1;
+    int ddF_y = -2 * r;
+    int x = 0;
+    int y = r;
+
+    do_draw_pixel(x0, y0 + r, color);
+    do_draw_pixel(x0, y0 - r, color);
+    do_draw_pixel(x0 + r, y0, color);
+    do_draw_pixel(x0 - r, y0, color);
+
+    while (x < y) {
+        if (f >= 0) { y--; ddF_y += 2; f += ddF_y; }
+        x++;
+        ddF_x += 2;
+        f += ddF_x;
+
+        do_draw_pixel(x0 + x, y0 + y, color);
+        do_draw_pixel(x0 - x, y0 + y, color);
+        do_draw_pixel(x0 + x, y0 - y, color);
+        do_draw_pixel(x0 - x, y0 - y, color);
+        do_draw_pixel(x0 + y, y0 + x, color);
+        do_draw_pixel(x0 - y, y0 + x, color);
+        do_draw_pixel(x0 + y, y0 - x, color);
+        do_draw_pixel(x0 - y, y0 - x, color);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_circle_obj, 4, 4, moclcd_draw_circle);
+
+/* -------------------------------------------------------------------
+ * moclcd.fill_circle(x0, y0, r, color)
+ * Midpoint circle algorithm filled via vertical spans (same approach
+ * Adafruit_GFX uses) -- each span goes through the DMA fill path
+ * instead of being plotted pixel by pixel, so a filled circle is much
+ * cheaper than the same shape built out of draw_pixel() calls.
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_fill_circle(size_t n_args, const mp_obj_t *args_in)
+{
+    require_init();
+    int x0 = mp_obj_get_int(args_in[0]);
+    int y0 = mp_obj_get_int(args_in[1]);
+    int r  = mp_obj_get_int(args_in[2]);
+    uint16_t color = (uint16_t)mp_obj_get_int(args_in[3]);
+
+    if (r < 0) return mp_const_none;
+
+    do_fill_rect_clip(x0, y0 - r, 1, 2 * r + 1, color); /* central vertical span */
+
+    int f = 1 - r;
+    int ddF_x = 1;
+    int ddF_y = -2 * r;
+    int x = 0;
+    int y = r;
+
+    while (x < y) {
+        if (f >= 0) { y--; ddF_y += 2; f += ddF_y; }
+        x++;
+        ddF_x += 2;
+        f += ddF_x;
+
+        do_fill_rect_clip(x0 + x, y0 - y, 1, 2 * y + 1, color);
+        do_fill_rect_clip(x0 - x, y0 - y, 1, 2 * y + 1, color);
+        do_fill_rect_clip(x0 + y, y0 - x, 1, 2 * x + 1, color);
+        do_fill_rect_clip(x0 - y, y0 - x, 1, 2 * x + 1, color);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_fill_circle_obj, 4, 4, moclcd_fill_circle);
+
 /* ---- module table ---- */
 static const mp_rom_map_elem_t moclcd_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__),   MP_ROM_QSTR(MP_QSTR_moclcd)          },
@@ -392,6 +612,11 @@ static const mp_rom_map_elem_t moclcd_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_fill_rect),   MP_ROM_PTR(&moclcd_fill_rect_obj)   },
     { MP_ROM_QSTR(MP_QSTR_fill_screen), MP_ROM_PTR(&moclcd_fill_screen_obj) },
     { MP_ROM_QSTR(MP_QSTR_blit),        MP_ROM_PTR(&moclcd_blit_obj)        },
+    { MP_ROM_QSTR(MP_QSTR_draw_pixel),  MP_ROM_PTR(&moclcd_draw_pixel_obj)  },
+    { MP_ROM_QSTR(MP_QSTR_draw_line),   MP_ROM_PTR(&moclcd_draw_line_obj)   },
+    { MP_ROM_QSTR(MP_QSTR_draw_rect),   MP_ROM_PTR(&moclcd_draw_rect_obj)   },
+    { MP_ROM_QSTR(MP_QSTR_draw_circle), MP_ROM_PTR(&moclcd_draw_circle_obj) },
+    { MP_ROM_QSTR(MP_QSTR_fill_circle), MP_ROM_PTR(&moclcd_fill_circle_obj) },
 };
 static MP_DEFINE_CONST_DICT(moclcd_globals, moclcd_globals_table);
 
