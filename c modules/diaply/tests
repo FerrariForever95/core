@@ -1,0 +1,114 @@
+import time
+import Graphics as gfx
+
+# -------------------------------------------------
+# 1. Initialization (No Touch Handler)
+# -------------------------------------------------
+
+print("Initializing Display for Custom Dashboard Screen...")
+gfx.init_display(pclk=10_000_000, width=480, height=320, madctl=0x28)
+gfx.set_background(gfx.color565(15, 15, 30))
+gfx.clear()
+print("Display initialized successfully.")
+time.sleep(0.5)
+
+# -------------------------------------------------
+# 2. Build the Screen Layout & Taskbar
+# -------------------------------------------------
+
+screen = gfx.UIScreen(taskbar_text="ZenoOS Dashboard")
+screen.start_withoutexit()
+
+# -------------------------------------------------
+# 3. Draw UI Panels & Containers
+# -------------------------------------------------
+
+print("Drawing Dashboard Panels...")
+
+# Left Panel (System Status)
+panel_left = gfx.UIPanel(x=15, y=45, w=215, h=255, title="System Status")
+panel_left.draw()
+
+# Right Panel (Controls & Metrics)
+panel_right = gfx.UIPanel(x=245, y=45, w=220, h=255, title="Controls")
+panel_right.draw()
+
+# -------------------------------------------------
+# 4. Populate Left Panel (Status & Metrics)
+# -------------------------------------------------
+
+# Status indicator lights
+ok_ind = gfx.UIStatusIndicator(x=35, y=85, r=8, state=gfx.UIStatusIndicator.OK)
+ok_ind.draw()
+txt_ok = gfx.UIText(55, 78, "Core Engine: OK", fg=gfx.WHITE)
+txt_ok.draw()
+
+warn_ind = gfx.UIStatusIndicator(x=35, y=125, r=8, state=gfx.UIStatusIndicator.WARN)
+warn_ind.draw()
+txt_warn = gfx.UIText(55, 118, "Memory: Warning", fg=gfx.WHITE)
+txt_warn.draw()
+
+# Progress bar inside the left panel
+txt_pbar = gfx.UIText(30, 165, "Storage Usage", fg=gfx.color565(200, 200, 200))
+txt_pbar.draw()
+pbar = gfx.UIProgressBar(x=30, y=185, w=185, h=14, value=78)
+pbar.draw()
+
+# Text box log summary
+tbox = gfx.UITextBoxView(x=30, y=215, w=185, h=70, text="Boot: OK\nDrivers: Loaded\nIP: 192.168.1.50")
+tbox.draw()
+
+# -------------------------------------------------
+# 5. Populate Right Panel (Interactive Widgets)
+# -------------------------------------------------
+
+# Interactive Push Button
+def handle_action():
+    print("Dashboard Action Triggered!")
+
+btn = gfx.UIButton(
+    x=265, y=80, w=180, h=35,
+    label="Execute Task",
+    color=gfx.color565(0, 120, 200),
+    action=handle_action
+)
+btn.draw()
+
+# Toggle Switch
+txt_toggle = gfx.UIText(265, 135, "Auto-Sync Mode", fg=gfx.WHITE)
+txt_toggle.draw()
+
+def handle_toggle(state):
+    print("Toggle State:", state)
+
+toggle = gfx.UIToggleSwitch(x=390, y=130, w=55, h=26, state=True, action=handle_toggle)
+toggle.draw()
+
+# Slider Component
+txt_slider = gfx.UIText(265, 180, "Brightness Level", fg=gfx.WHITE)
+txt_slider.draw()
+
+def handle_slider(val):
+    print("Slider Value:", val)
+
+slider = gfx.UISlider(x=265, y=205, w=180, min_v=0, max_v=100, value=65, action=handle_slider)
+slider.draw()
+
+# Checkbox
+def handle_check(checked):
+    print("Checkbox:", checked)
+
+checkbox = gfx.UICheckBox(x=265, y=250, label="Enable Telemetry", checked=True, action=handle_check)
+checkbox.draw()
+
+# -------------------------------------------------
+# 6. Keep Display Live (No Touch Required)
+# -------------------------------------------------
+
+print("Custom dashboard screen rendered successfully.")
+
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\nExiting dashboard screen.")
