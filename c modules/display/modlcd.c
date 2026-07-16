@@ -58,7 +58,7 @@
 #define LCD_CMD_RAMWRC 0x3C   /* continuation write, used for pixel streaming */
 
 /* how many pixels we buffer per DMA chunk (2 bytes/pixel -> 4KB chunks) */
-#define FILL_CHUNK_PIXELS 2048
+#define FILL_CHUNK_PIXELS  32768
 
 /* ---- module state ---- */
 static esp_lcd_i80_bus_handle_t  s_bus       = NULL;
