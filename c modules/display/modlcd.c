@@ -56,6 +56,10 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_heap_caps.h"
 #include "driver/ledc.h"
+#include "extmod/font_petme128_8x8.h"   /* same 8x8 font MicroPython's framebuf.text() uses */
+#include "py/mperrno.h"
+
+#include <stdio.h>
 
 #include <string.h>
 
@@ -65,7 +69,7 @@
 #define LCD_CMD_RAMWRC 0x3C   /* continuation write, used for pixel streaming */
 
 /* how many pixels we buffer per DMA chunk (2 bytes/pixel -> 4KB chunks) */
-#define FILL_CHUNK_PIXELS  65536
+#define FILL_CHUNK_PIXELS 2048
 
 /* ---- module state ---- */
 static esp_lcd_i80_bus_handle_t  s_bus       = NULL;
@@ -80,6 +84,12 @@ static uint8_t                   s_madctl    = 0x28; /* landscape (MV set); 0x48
 static uint8_t                  *s_fill_buf  = NULL; /* FILL_CHUNK_PIXELS*2 bytes, DMA capable */
 static bool                      s_bl_pwm_inited = false;
 static uint32_t                  s_bl_duty_max   = 255; /* set by backlight_init() from resolution_bits */
+static uint8_t                  *s_glyph_buf = NULL;    /* 8*8*2 bytes, DMA capable, reused per glyph */
+
+#define FONT_CHAR_W     8
+#define FONT_CHAR_H     8
+#define FONT_FIRST_CHAR 32
+#define FONT_LAST_CHAR  127
 
 /* -------------------------------------------------------------------
  * helpers
@@ -177,6 +187,228 @@ static void do_draw_pixel(int x, int y, uint16_t color)
     set_window((uint16_t)x, (uint16_t)y, (uint16_t)x, (uint16_t)y);
     stream_solid(1, color);
 }
+
+/* -------------------------------------------------------------------
+ * text rendering -- font_petme128_8x8 is column-major: 8 bytes/char,
+ * byte i is column i, bit j of that byte is row j. Same table and
+ * bit layout MicroPython's framebuf.text() uses internally.
+ * ---------------------------------------------------------------- */
+static void ensure_glyph_buf(void)
+{
+    if (s_glyph_buf == NULL) {
+        s_glyph_buf = heap_caps_malloc(FONT_CHAR_W * FONT_CHAR_H * 2, MALLOC_CAP_DMA);
+        if (s_glyph_buf == NULL) {
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("no DMA memory for glyph buffer"));
+        }
+    }
+}
+
+/* Draws one 8x8 glyph at (x,y). If bg_transparent, only foreground
+ * pixels are plotted (one address-window per lit pixel -- slower, but
+ * leaves whatever's already behind the glyph untouched). Otherwise the
+ * whole 8x8 cell (fg+bg) is built in a small buffer and sent as a
+ * single DMA transfer when it fully fits on-panel. */
+static void draw_glyph(int x, int y, char c, uint16_t fg, uint16_t bg, bool bg_transparent)
+{
+    if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR) c = ' ';
+    const uint8_t *glyph = &font_petme128_8x8[(c - FONT_FIRST_CHAR) * 8];
+
+    if (bg_transparent) {
+        for (int col = 0; col < FONT_CHAR_W; col++) {
+            uint8_t line = glyph[col];
+            for (int row = 0; row < FONT_CHAR_H; row++) {
+                if ((line >> row) & 1) {
+                    do_draw_pixel(x + col, y + row, fg);
+                }
+            }
+        }
+        return;
+    }
+
+    int cx = x, cy = y, cw = FONT_CHAR_W, ch = FONT_CHAR_H;
+    if (!clip_rect(&cx, &cy, &cw, &ch)) return;
+
+    if (cw != FONT_CHAR_W || ch != FONT_CHAR_H) {
+        /* clipped by a screen edge: fall back to per-pixel so we don't
+           send pixels that belong to a different part of the screen */
+        for (int col = 0; col < FONT_CHAR_W; col++) {
+            uint8_t line = glyph[col];
+            for (int row = 0; row < FONT_CHAR_H; row++) {
+                do_draw_pixel(x + col, y + row, ((line >> row) & 1) ? fg : bg);
+            }
+        }
+        return;
+    }
+
+    ensure_glyph_buf();
+    uint8_t fg_hi = (uint8_t)(fg >> 8), fg_lo = (uint8_t)(fg & 0xFF);
+    uint8_t bg_hi = (uint8_t)(bg >> 8), bg_lo = (uint8_t)(bg & 0xFF);
+
+    for (int row = 0; row < FONT_CHAR_H; row++) {
+        for (int col = 0; col < FONT_CHAR_W; col++) {
+            bool on = (glyph[col] >> row) & 1;
+            int p = (row * FONT_CHAR_W + col) * 2;
+            s_glyph_buf[p]     = on ? fg_hi : bg_hi;
+            s_glyph_buf[p + 1] = on ? fg_lo : bg_lo;
+        }
+    }
+
+    set_window((uint16_t)x, (uint16_t)y, (uint16_t)(x + FONT_CHAR_W - 1), (uint16_t)(y + FONT_CHAR_H - 1));
+    io_check(esp_lcd_panel_io_tx_color(s_io, LCD_CMD_RAMWRC, s_glyph_buf, FONT_CHAR_W * FONT_CHAR_H * 2), "text");
+}
+
+/* -------------------------------------------------------------------
+ * moclcd.draw_text8x8(x, y, text, fg, bg=None)
+ * bg omitted/None -> transparent background (only fg pixels drawn).
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_draw_text8x8(size_t n_args, const mp_obj_t *args_in)
+{
+    require_init();
+
+    int x = mp_obj_get_int(args_in[0]);
+    int y = mp_obj_get_int(args_in[1]);
+
+    size_t len;
+    const char *text = mp_obj_str_get_data(args_in[2], &len);
+
+    uint16_t fg = (uint16_t)mp_obj_get_int(args_in[3]);
+
+    bool bg_transparent = (n_args < 5) || (args_in[4] == mp_const_none);
+    uint16_t bg = bg_transparent ? 0 : (uint16_t)mp_obj_get_int(args_in[4]);
+
+    for (size_t i = 0; i < len; i++) {
+        draw_glyph(x + (int)i * FONT_CHAR_W, y, text[i], fg, bg, bg_transparent);
+    }
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_text8x8_obj, 4, 5, moclcd_draw_text8x8);
+
+/* -------------------------------------------------------------------
+ * moclcd.draw_bmp(path, x, y, w=None, h=None, max_w=None, max_h=None)
+ * Minimal loader: uncompressed 24-bit BMP only (no palette, no RLE).
+ * w/h/max_w/max_h of 0 (the default) are treated as "unset", same as
+ * the Python version's None. The whole converted image is built in
+ * one DMA-capable buffer and sent as a single transfer, same approach
+ * as blit().
+ *
+ * Note: this uses the C library's fopen()/fread(), so `path` must be
+ * reachable through the ESP-IDF VFS (e.g. internal flash or SD mounted
+ * via esp_vfs) -- the same filesystem MicroPython's own open() sees.
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_draw_bmp(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
+{
+    require_init();
+
+    enum { ARG_path, ARG_x, ARG_y, ARG_w, ARG_h, ARG_max_w, ARG_max_h };
+    static const mp_arg_t allowed[] = {
+        { MP_QSTR_path,  MP_ARG_REQUIRED | MP_ARG_OBJ, {.u_rom_obj = MP_ROM_NONE} },
+        { MP_QSTR_x,     MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_y,     MP_ARG_REQUIRED | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_w,     MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_h,     MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_max_w, MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0} },
+        { MP_QSTR_max_h, MP_ARG_KW_ONLY  | MP_ARG_INT, {.u_int = 0} },
+    };
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
+    mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
+
+    const char *path = mp_obj_str_get_str(args[ARG_path].u_obj);
+    int x = args[ARG_x].u_int;
+    int y = args[ARG_y].u_int;
+    int want_w = args[ARG_w].u_int;
+    int want_h = args[ARG_h].u_int;
+    int max_w  = args[ARG_max_w].u_int;
+    int max_h  = args[ARG_max_h].u_int;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        mp_raise_OSError(MP_ENOENT);
+    }
+
+    uint8_t header[54];
+    if (fread(header, 1, 54, f) != 54 || header[0] != 'B' || header[1] != 'M') {
+        fclose(f);
+        mp_raise_ValueError(MP_ERROR_TEXT("not a BMP file"));
+    }
+
+    uint32_t data_offset = (uint32_t)header[10] | ((uint32_t)header[11] << 8) |
+                           ((uint32_t)header[12] << 16) | ((uint32_t)header[13] << 24);
+    int32_t bmp_w = (int32_t)((uint32_t)header[18] | ((uint32_t)header[19] << 8) |
+                              ((uint32_t)header[20] << 16) | ((uint32_t)header[21] << 24));
+    int32_t bmp_h_raw = (int32_t)((uint32_t)header[22] | ((uint32_t)header[23] << 8) |
+                                  ((uint32_t)header[24] << 16) | ((uint32_t)header[25] << 24));
+    uint16_t bpp = (uint16_t)header[28] | ((uint16_t)header[29] << 8);
+    uint32_t compression = (uint32_t)header[30] | ((uint32_t)header[31] << 8) |
+                           ((uint32_t)header[32] << 16) | ((uint32_t)header[33] << 24);
+
+    if (bpp != 24 || compression != 0) {
+        fclose(f);
+        mp_raise_ValueError(MP_ERROR_TEXT("only uncompressed 24-bit BMP is supported"));
+    }
+
+    bool top_down = bmp_h_raw < 0;
+    int32_t bmp_h = top_down ? -bmp_h_raw : bmp_h_raw;
+    int row_size = ((bmp_w * 3 + 3) / 4) * 4; /* rows padded to 4 bytes */
+
+    int out_w = want_w > 0 ? want_w : (int)bmp_w;
+    int out_h = want_h > 0 ? want_h : (int)bmp_h;
+    if (max_w > 0 && out_w > max_w) out_w = max_w;
+    if (max_h > 0 && out_h > max_h) out_h = max_h;
+
+    if (out_w <= 0 || out_h <= 0) {
+        fclose(f);
+        return mp_const_none;
+    }
+
+    int dx = x, dy = y, dw = out_w, dh = out_h;
+    if (!clip_rect(&dx, &dy, &dw, &dh)) {
+        fclose(f);
+        return mp_const_none;
+    }
+
+    int skip_rows = dy - y; /* how many source rows/cols the top/left clip ate */
+    int skip_cols = dx - x;
+
+    uint8_t *row_buf = heap_caps_malloc(row_size, MALLOC_CAP_DEFAULT);
+    uint8_t *img = heap_caps_malloc((size_t)dw * (size_t)dh * 2, MALLOC_CAP_DMA);
+    if (!row_buf || !img) {
+        if (row_buf) heap_caps_free(row_buf);
+        if (img) heap_caps_free(img);
+        fclose(f);
+        mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("no memory for bmp load"));
+    }
+
+    for (int row = 0; row < dh; row++) {
+        int dest_row = row + skip_rows;
+        int src_row = top_down ? dest_row : ((int)bmp_h - 1 - dest_row);
+
+        fseek(f, (long)(data_offset + (uint32_t)src_row * (uint32_t)row_size), SEEK_SET);
+        if (fread(row_buf, 1, row_size, f) != (size_t)row_size) {
+            break; /* short read / EOF: stop rather than send garbage rows */
+        }
+
+        int p = row * dw * 2;
+        for (int col = 0; col < dw; col++) {
+            int src_col = col + skip_cols;
+            uint8_t b = row_buf[src_col * 3 + 0];
+            uint8_t g = row_buf[src_col * 3 + 1];
+            uint8_t r = row_buf[src_col * 3 + 2];
+            uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+            img[p++] = (uint8_t)(c >> 8);
+            img[p++] = (uint8_t)(c & 0xFF);
+        }
+    }
+
+    set_window((uint16_t)dx, (uint16_t)dy, (uint16_t)(dx + dw - 1), (uint16_t)(dy + dh - 1));
+    io_check(esp_lcd_panel_io_tx_color(s_io, LCD_CMD_RAMWRC, img, (size_t)dw * (size_t)dh * 2), "bmp");
+
+    heap_caps_free(row_buf);
+    heap_caps_free(img);
+    fclose(f);
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_KW(moclcd_draw_bmp_obj, 3, moclcd_draw_bmp);
 
 /* -------------------------------------------------------------------
  * moclcd.init(pclk=10_000_000, width=320, height=480)
