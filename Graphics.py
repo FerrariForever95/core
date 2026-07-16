@@ -16,22 +16,26 @@ old ui.get_touch(). Wire your touch driver in once at boot:
     gfx.init_display()                 # landscape 480x320
     gfx.set_touch_handler(my_touch.read)
 
-Text and images: moclcd has no font/BMP support, so:
-  - draw_text8x8() renders through MicroPython's built-in `framebuf`
-    8x8 font into a scratch buffer, then blits it (with a byte swap,
-    since framebuf packs RGB565 low-byte-first and moclcd wants
-    high-byte-first).
-  - draw_bmp() is a minimal loader for uncompressed 24-bit BMP files.
+Text and images: moclcd now renders both natively in C, so this module
+is a thin pass-through rather than a Python-side implementation:
+  - draw_text8x8() calls moclcd.draw_text8x8() directly. moclcd streams
+    the same font_petme128_8x8 table MicroPython's framebuf.text() uses,
+    via the DMA fill path, and supports a native transparent background
+    (only foreground pixels touched when bg is omitted) — no more
+    building a scratch framebuf and byte-swapping RGB565 in Python.
+  - draw_bmp() calls moclcd.draw_bmp() directly. moclcd reads the
+    uncompressed 24-bit BMP straight off the ESP-IDF VFS in C and sends
+    it as a single DMA transfer, with the same clip-instead-of-raise
+    behavior as moclcd's other drawing primitives — no more per-row
+    Python parsing/conversion loop.
 """
 
 import time
 import urandom
 import math
-import framebuf
-
 import moclcd
 
-# -------------------------------------------------------------------
+moclcd.backlight_init()
 # Display setup / globals
 # -------------------------------------------------------------------
 
@@ -39,14 +43,17 @@ WIDTH = 480
 HEIGHT = 320
 
 active_screen = None
-
+def brightness(value):
+    moclcd.backlight_set(value) 
 
 def init_display(pclk=10_000_000, width=480, height=320, madctl=0x28):
     """Bring up the panel in landscape by default and sync WIDTH/HEIGHT.
     Pass width=320, height=480, madctl=0x48 for portrait instead."""
     global WIDTH, HEIGHT
     WIDTH, HEIGHT = width, height
+    moclcd.backlight(False) 
     moclcd.init(pclk=pclk, width=width, height=height, madctl=madctl)
+    moclcd.backlight(True) 
     moclcd.reset()
     time.sleep_ms(20)
     moclcd.panel_init()
@@ -156,72 +163,42 @@ def blit(x, y, w, h, buf):
 
 
 def draw_text8x8(x, y, text, fg, bg=None):
-    """Render text using MicroPython's built-in framebuf 8x8 font."""
+    """Render text via moclcd's native C font renderer (DMA-pipelined,
+    same font_petme128_8x8 table MicroPython's framebuf.text() uses).
+
+    bg=None -> transparent background: only foreground pixels are
+    touched, using moclcd's native transparent-bg path (one address
+    window per lit pixel, but no scratch buffer / byte-swap needed).
+    Passing an explicit bg fills the full 8x8 cell per glyph in a
+    single DMA transfer, same as before.
+
+    Unlike moclcd.draw_text8x8() called directly, this wrapper resolves
+    bg=None to the module-wide `background` default the rest of this
+    file uses, so callers keep their old "bg=None means use screen
+    background" expectations... except moclcd's own None means
+    *transparent*, not "paint the module background". To keep both
+    behaviors available: pass bg=None for a truly transparent glyph
+    (e.g. overlaying text on an image), or pass an explicit color
+    (background or otherwise) to erase behind the glyph.
+    """
     if not text:
         return
     if bg is None:
-        bg = background
-
-    w = len(text) * 8
-    h = 8
-    buf = bytearray(w * h * 2)
-    fb = framebuf.FrameBuffer(buf, w, h, framebuf.RGB565)
-    fb.fill(bg)
-    fb.text(text, 0, 0, fg)
-
-    # framebuf packs RGB565 low-byte-first; moclcd wants high-byte-first
-    for i in range(0, len(buf), 2):
-        buf[i], buf[i + 1] = buf[i + 1], buf[i]
-
-    blit(x, y, w, h, buf)
+        moclcd.draw_text8x8(x, y, text, fg)
+    else:
+        moclcd.draw_text8x8(x, y, text, fg, bg)
 
 
 def draw_bmp(path, x, y, w=None, h=None, max_w=None, max_h=None):
-    """Minimal loader: uncompressed 24-bit BMP only (no palette, no RLE)."""
-    with open(path, "rb") as f:
-        header = f.read(54)
-        if header[0:2] != b"BM":
-            raise ValueError("not a BMP file")
-
-        data_offset = int.from_bytes(header[10:14], "little")
-        bmp_w = int.from_bytes(header[18:22], "little")
-        bmp_h_raw = int.from_bytes(header[22:26], "little", signed=True)
-        bpp = int.from_bytes(header[28:30], "little")
-        compression = int.from_bytes(header[30:34], "little")
-
-        if bpp != 24 or compression != 0:
-            raise ValueError("only uncompressed 24-bit BMP is supported")
-
-        top_down = bmp_h_raw < 0
-        bmp_h = abs(bmp_h_raw)
-
-        row_size = ((bmp_w * 3 + 3) // 4) * 4  # rows padded to 4 bytes
-
-        out_w = w or bmp_w
-        out_h = h or bmp_h
-        if max_w:
-            out_w = min(out_w, max_w)
-        if max_h:
-            out_h = min(out_h, max_h)
-
-        buf = bytearray(out_w * out_h * 2)
-        row_buf = bytearray(row_size)
-
-        for row in range(out_h):
-            src_row = row if top_down else (bmp_h - 1 - row)
-            f.seek(data_offset + src_row * row_size)
-            f.readinto(row_buf)
-            p = row * out_w * 2
-            for col in range(out_w):
-                b = row_buf[col * 3]
-                g = row_buf[col * 3 + 1]
-                r = row_buf[col * 3 + 2]
-                c = color565(r, g, b)
-                buf[p] = c >> 8       # MSB first, matching moclcd
-                buf[p + 1] = c & 0xFF
-                p += 2
-
-    blit(x, y, out_w, out_h, buf)
+    """Minimal BMP loader delegated to moclcd's native C implementation
+    (uncompressed 24-bit BMP only, no palette, no RLE — same restriction
+    as before). moclcd clips to the panel internally, so partially
+    off-screen images are trimmed rather than skipped or raising."""
+    moclcd.draw_bmp(
+        path, x, y,
+        w=w or 0, h=h or 0,
+        max_w=max_w or 0, max_h=max_h or 0,
+    )
 
 
 # -------------------------------------------------------------------
