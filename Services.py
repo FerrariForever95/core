@@ -32,6 +32,219 @@ LOGS_DIR = "/LOGS"
 
 if not zfs.info()["mounted"]:
     zfs.mount()
+# =================================================
+
+try:
+    import machine
+except ImportError:                      # pragma: no cover - desktop/testing
+    machine = None
+
+try:
+    import sys as _sys
+    _PLATFORM = _sys.platform
+except Exception:
+    _PLATFORM = "unknown"
+
+
+# Known safe frequency tiers per platform, in Hz. Extend this as you add
+# board support -- unknown platforms fall back to a single-level table
+# built from whatever machine.freq() reports at boot, so set_level()
+# degrades to a no-op instead of erroring out.
+_PLATFORM_LEVELS = {
+    "esp32":  {"low": 80_000_000,  "normal": 160_000_000, "high": 240_000_000, "turbo": 240_000_000},
+    "rp2":    {"low": 48_000_000,  "normal": 125_000_000, "high": 200_000_000, "turbo": 250_000_000},
+}
+
+# ordering used to pick the "highest currently-requested" level
+_LEVEL_ORDER = ("low", "normal", "high", "turbo")
+
+
+class PowerManagement:
+    def __init__(self, logger=None):
+        self.logger = logger or (Logger() if "Logger" in globals() else None)
+        self.source = "POWERMGR"
+
+        self.levels = dict(_PLATFORM_LEVELS.get(_PLATFORM, {}))
+        if not self.levels:
+            # unknown platform -- build a single-level table around
+            # whatever frequency we're actually running at right now
+            base = self._raw_freq() or 0
+            self.levels = {"low": base, "normal": base, "high": base, "turbo": base}
+
+        self.baseline = "normal" if "normal" in self.levels else _LEVEL_ORDER[0]
+        self._requests = {}     # reason -> level, e.g. {"pkg_download": "high"}
+
+    def help(self):
+        print("  power                          Show current frequency / active boosts")
+        print("  power levels                   List available frequency tiers")
+        print("  power set <level>               Manually pin CPU to a tier (low/normal/high/turbo)")
+        print("  power boost <reason> [level]    Request a frequency tier, tracked by reason")
+        print("  power release <reason>          Release a previous boost request")
+        print("  power baseline <level>          Change the default idle tier")
+
+    # =============================================
+    # status / introspection
+    # =============================================
+    def status(self):
+        current = self._raw_freq()
+        print("\n[Power]")
+        print("  Platform      : {}".format(_PLATFORM))
+        print("  Current freq  : {}".format(self._fmt_hz(current)))
+        print("  Baseline tier : {} ({})".format(self.baseline, self._fmt_hz(self.levels.get(self.baseline))))
+        if self._requests:
+            print("  Active boosts :")
+            for reason, level in self._requests.items():
+                print("    - {:<20} -> {}".format(reason, level))
+        else:
+            print("  Active boosts : none")
+        return {"platform": _PLATFORM, "current_hz": current, "requests": dict(self._requests)}
+
+    def levels_list(self):
+        print("\n[Power] Available tiers ({}):".format(_PLATFORM))
+        for name in _LEVEL_ORDER:
+            if name in self.levels:
+                print("  {:<8} {}".format(name, self._fmt_hz(self.levels[name])))
+        return dict(self.levels)
+
+    # =============================================
+    # direct control
+    # =============================================
+    def set_level(self, level):
+        """Pin the CPU to a named tier right now, ignoring any active
+        boost requests. Mostly useful for manual/debug use -- normal code
+        should prefer boost()/release() so it doesn't clobber other
+        requesters."""
+        return self._apply(level)
+
+    def baseline_set(self, level):
+        """Change the idle/default tier that release() falls back to."""
+        if level not in self.levels:
+            self._error("Unknown level '{}'".format(level))
+            return False
+        self.baseline = level
+        if not self._requests:
+            self._apply(level)
+        return True
+
+    # =============================================
+    # reference-counted boost / release
+    # =============================================
+    def boost(self, reason, level="high"):
+        """Request a frequency tier under the given reason. If multiple
+        reasons are active at once, the highest requested tier wins.
+        Call release(reason) with the same reason when done."""
+        if level not in self.levels:
+            self._error("Unknown level '{}'".format(level))
+            return False
+        self._requests[reason] = level
+        return self._apply(self._highest_requested())
+
+    def release(self, reason):
+        """Drop a previous boost request. CPU frequency falls back to the
+        next-highest remaining request, or the baseline tier if none are
+        left."""
+        if reason in self._requests:
+            del self._requests[reason]
+        target = self._highest_requested() or self.baseline
+        return self._apply(target)
+
+    def boosted(self, level="high", reason="context"):
+        """Context manager: 'with power.boosted(): do_slow_thing()' boosts
+        for the duration of the block and always releases afterwards, even
+        if the block raises."""
+        return _BoostContext(self, level, reason)
+
+    # =============================================
+    # simple demand-based helper
+    # =============================================
+    def auto_scale(self, load_percent, reason="auto"):
+        """Optional convenience for callers that *do* have some notion of
+        load (e.g. a queue depth, a request rate, time spent in a loop):
+        boost when load is high, release when it drops back down."""
+        if load_percent is None:
+            return
+        if load_percent >= 70:
+            self.boost(reason, "high")
+        elif load_percent >= 40:
+            self.boost(reason, "normal")
+        else:
+            self.release(reason)
+
+    # =============================================
+    # internals
+    # =============================================
+    def _highest_requested(self):
+        active = [lvl for lvl in self._requests.values() if lvl in self.levels]
+        if not active:
+            return None
+        return max(active, key=lambda lvl: _LEVEL_ORDER.index(lvl))
+
+    def _apply(self, level):
+        if level not in self.levels:
+            self._error("Unknown level '{}'".format(level))
+            return False
+        hz = self.levels[level]
+        if not hz:
+            self._error("No known frequency for level '{}' on platform '{}'".format(level, _PLATFORM))
+            return False
+        if machine is None:
+            self._log("machine module unavailable -- would set {} ({})".format(level, self._fmt_hz(hz)))
+            return True
+        try:
+            machine.freq(hz)
+            self._log("CPU frequency set to {} ({})".format(level, self._fmt_hz(hz)))
+            return True
+        except Exception as e:
+            self._error("Failed to set frequency: {}".format(e))
+            return False
+
+    def _raw_freq(self):
+        if machine is None:
+            return None
+        try:
+            return machine.freq()
+        except Exception:
+            return None
+
+    def _fmt_hz(self, hz):
+        if not hz:
+            return "unknown"
+        return "{:.0f} MHz".format(hz / 1_000_000)
+
+    def _log(self, message):
+        if self.logger:
+            try:
+                self.logger.debug(message, source=self.source)
+            except Exception:
+                pass
+
+    def _error(self, message):
+        if self.logger:
+            try:
+                self.logger.error(message, source=self.source)
+            except Exception:
+                pass
+        print("[POWER] Error:", message)
+
+
+class _BoostContext:
+    """Backs PowerManagement.boosted() -- a plain class instead of
+    @contextmanager so this has no dependency on the 'contextlib' module,
+    which may not be present on every MicroPython build."""
+
+    def __init__(self, power, level, reason):
+        self.power = power
+        self.level = level
+        self.reason = reason
+
+    def __enter__(self):
+        self.power.boost(self.reason, self.level)
+        return self.power
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.power.release(self.reason)
+        return False  # never swallow exceptions
+            
 class CPU:
     def __init__(self, model="ESP32-S3N16R8"):
         self.model = model
@@ -1291,10 +1504,183 @@ class Process:
         )
 
 
+# =================================================
+# Scheduler -- Zeno OS process scheduler
+# =================================================
+# Now actually drives PowerManagement instead of leaving it as an unused
+# side service. Two independent signals feed it, both through the normal
+# boost()/release() reference-counted request table (so PERFORMANCE /
+# POWERSAVING policy in PowerManagement still pins the hardware at an
+# extreme no matter what either signal below asks for -- only DYNAMIC
+# policy actually lets them move the CPU):
+#
+#   1. FRAME-LEVEL LOAD -- once per scheduler frame, the whole-system
+#      busy/idle ratio already computed by CPU.report_frame() is fed to
+#      power.auto_scale(cpu.usage()). This is the "balance" in dynamic
+#      mode: sustained high load across all tasks raises the tier,
+#      sustained low load drops it back to baseline.
+#
+#   2. PER-TASK LOAD -- every cooperative task already tracks a running
+#      avg_us (exponential moving average of its own execution time).
+#      A task whose average crosses TASK_BOOST_THRESHOLD_US -- i.e. a
+#      genuine "large loop" that keeps being expensive every time it's
+#      scheduled -- gets its own named boost request that persists for
+#      as long as it stays expensive. A "small function" that never
+#      crosses the threshold never requests anything -- no boost, no
+#      thrash, no wasted frequency switch. We wait for a few samples
+#      (TASK_BOOST_MIN_SAMPLES) before acting either way, so a single
+#      slow first-call doesn't flip the tier off one data point.
+#
+# Thread-mode tasks (mode=MODE_THREAD, e.g. daemons like the guardian)
+# are intentionally left out of per-task boosting: they run once as a
+# persistent thread rather than being re-scheduled per-tick, so a
+# per-call average isn't meaningful for them, and pinning frequency high
+# for a thread's entire lifetime (which may be "forever, mostly asleep")
+# would fight the dynamic policy instead of serving it.
+
+import time
+import json
+import os
+
+try:
+    import _thread
+    _HAVE_THREAD = True
+except ImportError:
+    _HAVE_THREAD = False
+
+try:
+    import urandom
+    _HAVE_URANDOM = True
+except ImportError:
+    _HAVE_URANDOM = False
+
+PERSIST_PATH = "/LOGS/proc_state.json"
+
+#   1xxx  KERNEL    -- boot/UI/core system processes, owner=root
+#   2xxx  USER      -- ordinary cooperative apps (loop/periodic/once)
+#   3xxx  THREAD    -- real _thread-backed concurrent tasks
+#   4xxx  DAEMON    -- root-owned background housekeeping (guardian, etc)
+#   5xxx  NETWORK   -- networking / IO-bound tasks
+#   9xxx  RESERVED  -- explicitly requested critical/system pids only
+PID_TYPE_KERNEL   = 1
+PID_TYPE_USER     = 2
+PID_TYPE_THREAD   = 3
+PID_TYPE_DAEMON   = 4
+PID_TYPE_NETWORK  = 5
+PID_TYPE_RESERVED = 9
+
+PID_TYPE_NAMES = {
+    PID_TYPE_KERNEL:   "KERNEL",
+    PID_TYPE_USER:     "USER",
+    PID_TYPE_THREAD:   "THREAD",
+    PID_TYPE_DAEMON:   "DAEMON",
+    PID_TYPE_NETWORK:  "NETWORK",
+    PID_TYPE_RESERVED: "RESERVED",
+}
+
+
+def pid_type(pid):
+    """Return the type digit encoded in a pid (its thousands place)."""
+    return pid // 1000
+
+
+def pid_type_name(pid):
+    return PID_TYPE_NAMES.get(pid_type(pid), "UNKNOWN")
+
+# ---------------- process states ----------------
+NEW     = "NEW"
+READY   = "READY"
+RUNNING = "RUNNING"
+BLOCKED = "BLOCKED"
+ZOMBIE  = "ZOMBIE"     # finished/killed, exit info not yet reaped
+DEAD    = "DEAD"       # reaped
+
+# ---------------- signals ------------------------
+SIGTERM = 15   # "please stop, next checkpoint"
+SIGKILL = 9    # cooperative tasks: removed immediately, no cleanup call
+SIGSTOP = 19   # pause (skip scheduling) without killing
+SIGCONT = 18   # resume from SIGSTOP
+
+MODE_LOOP     = "loop"      # runs every time it's scheduled
+MODE_PERIODIC = "periodic"  # runs every `period` ms
+MODE_ONCE     = "once"      # runs once then becomes ZOMBIE
+MODE_THREAD   = "thread"    # runs on a real FreeRTOS thread via _thread
+
+NICE_MIN, NICE_MAX = -20, 19
+
+
+def _weight(nice):
+    """Same idea as Linux's sched_prio_to_weight table, simplified:
+    lower nice = more weight = scheduled more often. Weight halves
+    every ~4 nice levels."""
+    nice = max(NICE_MIN, min(NICE_MAX, nice))
+    return max(1, 1024 >> ((nice + 20) // 4))
+
+
+class ProcessError(Exception):
+    pass
+
+
+class PermissionDenied(ProcessError):
+    pass
+
+
+class Process:
+    """PCB -- Process Control Block."""
+
+    __slots__ = (
+        "pid", "ppid", "owner", "name", "func", "mode", "period",
+        "priority", "state", "vruntime", "pending_signal",
+        "exit_code", "meta", "_last_run", "_thread_started",
+    )
+
+    def __init__(self, pid, ppid, owner, name, func, mode, period, priority):
+        self.pid = pid
+        self.ppid = ppid
+        self.owner = owner          # username, or "root" for kernel/system procs
+        self.name = name
+        self.func = func
+        self.mode = mode
+        self.period = period
+        self.priority = priority
+        self.state = NEW
+        self.vruntime = 0           # accumulated weighted runtime (us)
+        self.pending_signal = None
+        self.exit_code = None
+        self.meta = {"samples": 0, "avg_us": None, "min_us": None,
+                     "max_us": None, "last_us": None}
+        self._last_run = 0
+        self._thread_started = False
+
+    def weight(self):
+        return _weight(self.priority)
+
+    def as_row(self):
+        return "{:<5} {:<8} {:<8} {:<16} {:<9} {:<4} {:<8} {}".format(
+            self.pid, pid_type_name(self.pid), self.owner, self.name,
+            self.state, self.priority, self.mode,
+            self.meta.get("avg_us") or "-"
+        )
+
+
 class Scheduler:
     """Zeno OS process scheduler. One instance lives at zeno.sched."""
 
-    def __init__(self, logger=None):
+    # -------- power-scaling tuning --------
+    # A task averaging at/above this many microseconds of CPU time per
+    # scheduled run counts as a "large loop" and earns its own boost
+    # request. Small/quick functions never reach this and never touch
+    # frequency at all.
+    TASK_BOOST_THRESHOLD_US = 8_000
+    # Don't act on a task's load until it's run at least this many times
+    # -- avoids one slow first call (cache miss, cold import, etc.)
+    # deciding policy off a single sample.
+    TASK_BOOST_MIN_SAMPLES = 3
+    # Reason key used for the whole-system, frame-level auto_scale() call.
+    FRAME_LOAD_REASON = "scheduler:frame"
+
+    def __init__(self, logger=None, power=None):
+        from Services import CPU
         self.cpu = CPU()
         self._current_user_fn = "root"
 
@@ -1311,6 +1697,13 @@ class Scheduler:
         self._announced = set()
 
         self._logger = logger  # optional Logger instance; falls back to print
+
+        # PowerManagement wiring. `power` can be passed in explicitly
+        # (e.g. a shared instance from Services); otherwise it's created
+        # lazily on first use. `False` is used internally as a "already
+        # tried and failed, don't retry every tick" sentinel.
+        self.power = power
+        self._boosted_tasks = set()   # reasons currently holding a per-task boost
 
         self._ensure_storage()
         self._load_state()
@@ -1355,6 +1748,99 @@ class Scheduler:
             ),
             source="SECSCAN",
         )
+
+    # ---------------- power management ----------------
+    def _get_power(self):
+        """Lazily obtain (and cache) a PowerManagement instance. Returns
+        None if it isn't available on this build, without raising or
+        retrying every single call."""
+        if self.power is False:
+            return None
+        if self.power is not None:
+            return self.power
+        try:
+            self.power = PowerManagement(logger=self._get_logger())
+        except Exception as e:
+            self._log_error("PowerManagement unavailable: {}".format(e), source="POWER")
+            self.power = False
+            return None
+        return self.power
+
+    def set_power_policy(self, policy):
+        """Passthrough: 'dynamic' (default, load-balanced) / 'performance'
+        (pin max) / 'powersaving' (pin min)."""
+        power = self._get_power()
+        if power is None:
+            self._log_error("cannot set power policy: PowerManagement unavailable", source="POWER")
+            return False
+        return power.policy_set(policy)
+
+    def power_status(self):
+        power = self._get_power()
+        if power is None:
+            print("[SCHED] PowerManagement unavailable.")
+            return None
+        return power.status()
+
+    def _scale_for_frame_load(self):
+        """Whole-system load signal, fed once per scheduler frame."""
+        power = self._get_power()
+        if power is None:
+            return
+        try:
+            power.auto_scale(self.cpu.usage(), reason=self.FRAME_LOAD_REASON)
+        except Exception as e:
+            self._log_error("frame-level power scaling failed: {}".format(e), source="POWER")
+
+    def _task_boost_reason(self, p):
+        return "task:{}:{}".format(p.pid, p.name)
+
+    def _scale_for_task(self, p):
+        """Per-task load signal: only "large loop" tasks (sustained high
+        avg_us across several runs) request a boost; quick tasks never
+        touch frequency."""
+        power = self._get_power()
+        if power is None:
+            return
+
+        avg = p.meta.get("avg_us")
+        samples = p.meta.get("samples", 0)
+        if avg is None or samples < self.TASK_BOOST_MIN_SAMPLES:
+            return  # not enough history to trust yet
+
+        reason = self._task_boost_reason(p)
+        is_large = avg >= self.TASK_BOOST_THRESHOLD_US
+        already_boosted = reason in self._boosted_tasks
+
+        if is_large and not already_boosted:
+            if power.boost(reason, "high"):
+                self._boosted_tasks.add(reason)
+                self._log_debug(
+                    "boosting CPU for large task '{}' (pid {}, avg {}us >= {}us)".format(
+                        p.name, p.pid, avg, self.TASK_BOOST_THRESHOLD_US
+                    ),
+                    source="POWER",
+                )
+        elif not is_large and already_boosted:
+            power.release(reason)
+            self._boosted_tasks.discard(reason)
+            self._log_debug(
+                "releasing CPU boost for task '{}' (pid {}, avg {}us < {}us)".format(
+                    p.name, p.pid, avg, self.TASK_BOOST_THRESHOLD_US
+                ),
+                source="POWER",
+            )
+
+    def _release_task_boost(self, p):
+        """Always safe to call -- no-op if this task never held a boost.
+        Called on every path a task can die on so a killed 'large loop'
+        task can't leave its boost request stuck forever."""
+        reason = self._task_boost_reason(p)
+        if reason in self._boosted_tasks:
+            self._boosted_tasks.discard(reason)
+            power = self._get_power()
+            if power is not None:
+                power.release(reason)
 
     # ---------------- persistence ----------------
     def _ensure_storage(self):
@@ -1519,6 +2005,7 @@ class Scheduler:
         if sig == SIGKILL and p.mode != MODE_THREAD:
             p.state = ZOMBIE
             p.exit_code = -SIGKILL
+            self._release_task_boost(p)
             self._persist()
             return True
 
@@ -1534,6 +2021,7 @@ class Scheduler:
         if p and p.pending_signal in (SIGTERM, SIGKILL):
             p.state = ZOMBIE
             p.exit_code = -p.pending_signal
+            self._release_task_boost(p)
             raise SystemExit
 
     def wait(self, pid, timeout_ms=None):
@@ -1595,6 +2083,7 @@ class Scheduler:
             elapsed = time.ticks_diff(time.ticks_us(), start)
             self._record_stat(p, elapsed)
             p.state = ZOMBIE
+            self._release_task_boost(p)
 
             if self.trace_execution:
                 print("[EXEC TRACE] Finished Thread Task -> PID: {}, Name: {}, Elapsed: {}us".format(
@@ -1636,6 +2125,7 @@ class Scheduler:
         if p.pending_signal in (SIGTERM, SIGKILL):
             p.state = ZOMBIE
             p.exit_code = -p.pending_signal
+            self._release_task_boost(p)
             return
 
         self._active_pid = p.pid
@@ -1659,6 +2149,10 @@ class Scheduler:
         p.vruntime += elapsed * 1024 // p.weight()
         p._last_run = time.ticks_ms()
 
+        # Per-task power signal: only sustained "large loop" tasks get a
+        # boost request out of this -- see _scale_for_task().
+        self._scale_for_task(p)
+
         if self.trace_execution:
             print("[EXEC TRACE] Finished Task -> PID: {}, Name: {}, Elapsed: {}us".format(
                 p.pid, p.name, elapsed
@@ -1667,6 +2161,7 @@ class Scheduler:
         if p.mode == MODE_ONCE:
             p.state = ZOMBIE
             p.exit_code = 0
+            self._release_task_boost(p)
         else:
             p.state = READY
 
@@ -1684,6 +2179,7 @@ class Scheduler:
     def reap(self, pid):
         p = self.table.get(pid)
         if p and p.state == ZOMBIE:
+            self._release_task_boost(p)
             del self.table[pid]
             self._announced.discard(pid)
             return True
@@ -1704,11 +2200,15 @@ class Scheduler:
                 time.sleep_us(idle)
             if hasattr(self.cpu, "report_frame"):
                 self.cpu.report_frame(busy, idle)
+            # Frame-level power signal: whole-system busy/idle ratio for
+            # this frame drives the "balanced" dynamic-policy behavior.
+            self._scale_for_frame_load()
             self._persist()
 
     def stop(self):
         self.running = False
         self._log_debug("scheduler main loop stopped", source="SCHED")
+
     def killall(self, system_token=None):
         """Best-effort: signal every non-daemon task to stop, skip daemons
         (they're protected and about to die via machine.reset() anyway).
@@ -2853,6 +3353,26 @@ class PackageManager:
         # outermost operation, so nested calls don't re-download it
         self._pkgtable_cache = None
 
+        # -----------------------------------------------------------
+        # Command registry -- maps command name -> callable.
+        # This is what makes an installed package immediately usable
+        # as a shell command in ZenCMD, without a reboot.
+        # Kept as a single flat dict (name -> function reference) to
+        # minimize RAM: no wrapper objects, no per-package class
+        # instances, just a reference to the already-imported module's
+        # function.
+        # -----------------------------------------------------------
+        self.commands = {}
+        # command name -> module name, so unregister()/reload can find
+        # and drop the right entry from sys.modules without guessing
+        self._command_modules = {}
+        # set to the module name currently running its install(pm)
+        # hook, so register() can auto-record which module owns which
+        # command without requiring package authors to pass it
+        # explicitly (MicroPython has no `inspect` to derive this from
+        # the call stack)
+        self._installing_module = None
+
     def install(self, name, force=False):
         if not self._require_root("install"):
             return False
@@ -2916,10 +3436,104 @@ class PackageManager:
                     except OSError:
                         pass
 
+            # bring the new command online immediately -- import the
+            # module and let it register itself, no reboot required
+            self._load_and_install_module(name, installed[name])
+
             print("[PKG] '{}' v{} installed successfully.".format(name, entry.get("version")))
             return True
         finally:
             self._end_op()
+
+    def _module_name_for(self, record):
+        """
+        Derive an importable module name for a package record.
+
+        Packages are plain .py modules dropped under install_path, so
+        the module name is just the filename without the .py suffix.
+        install_path is expected to already be on sys.path (or be '/'
+        or '/lib', which MicroPython searches by default) -- this
+        mirrors how packages were located for exec() under the old
+        architecture, just importing instead of exec'ing.
+        """
+        filename = record.get("filename", "")
+        if filename.endswith(".py"):
+            filename = filename[:-3]
+        return filename
+
+    def _load_and_install_module(self, name, record):
+        """
+        Import a package's module (fresh, dropping any stale cached
+        copy first) and call its install(pm) hook if present.
+
+        This is the core of the new architecture: a package is just a
+        module with a module-level install(pm)/uninstall(pm) and a
+        run(args, shell) function. Importing it and calling install()
+        is what makes its command appear in self.commands right away.
+        """
+        module_name = self._module_name_for(record)
+        if not module_name:
+            self._error("Cannot determine module name for package '{}'".format(name))
+            return False
+
+        # drop any previously-imported copy so we always pick up the
+        # freshly-downloaded file (needed for update()/reinstall())
+        if module_name in sys.modules:
+            del sys.modules[module_name]
+
+        try:
+            module = __import__(module_name)
+        except Exception as e:
+            self._error("Could not import module '{}' for package '{}': {}".format(module_name, name, e))
+            return False
+
+        installer = getattr(module, "install", None)
+        if installer is not None:
+            self._installing_module = module_name
+            try:
+                installer(self)
+            except Exception as e:
+                self._error("install(pm) failed for package '{}': {}".format(name, e))
+                return False
+            finally:
+                self._installing_module = None
+        else:
+            # older/simple packages may not define install() at all --
+            # that's fine, they just won't appear in self.commands and
+            # can still be run via the legacy exec path
+            self.logger.debug("Package '{}' has no install(pm) hook".format(name), source=self.source)
+
+        return True
+
+    def _unload_module(self, name, record):
+        """
+        Call a package's uninstall(pm) hook if present, then drop its
+        module from sys.modules and remove any command(s) it left in
+        the registry. Best-effort: failures here should never block
+        the actual file removal in uninstall().
+        """
+        module_name = self._module_name_for(record)
+        module = sys.modules.get(module_name) if module_name else None
+
+        if module is not None:
+            uninstaller = getattr(module, "uninstall", None)
+            if uninstaller is not None:
+                try:
+                    uninstaller(self)
+                except Exception as e:
+                    self.logger.warning(
+                        "uninstall(pm) failed for package '{}': {}".format(name, e), source=self.source
+                    )
+
+        # belt-and-suspenders: even if the package didn't call
+        # self.unregister() itself, drop any command(s) that were
+        # pointing at this module so nothing dangling is left behind
+        stale = [cmd for cmd, mod in self._command_modules.items() if mod == module_name]
+        for cmd in stale:
+            self.unregister(cmd)
+
+        if module_name and module_name in sys.modules:
+            del sys.modules[module_name]
 
     def uninstall(self, name):
         if not self._require_root("uninstall"):
@@ -2943,6 +3557,11 @@ class PackageManager:
                 return False
 
             install_dir = record.get("install_path")
+
+            # give the package a chance to clean up after itself and
+            # pull its command out of the registry before its files
+            # are deleted
+            self._unload_module(name, record)
 
             # refuse to recursively delete anything that isn't a real,
             # specific package subdirectory -- protects against wiping
@@ -3000,7 +3619,31 @@ class PackageManager:
         finally:
             self._end_op()
 
-    def run(self, name, *args):
+    def run(self, command, *args):
+        """
+        Execute a registered command's callback.
+
+        This is the normal, RAM-cheap path used by ZenCMD: a package's
+        install() already put a function reference into self.commands,
+        so running it is just a dict lookup + call -- no re-exec, no
+        re-reading the file from flash.
+        """
+        callback = self.commands.get(command)
+        if callback is None:
+            # fall back to the legacy exec-based path for any package
+            # installed under the old architecture (no install()/run()
+            # module functions, no registry entry) -- keeps old
+            # pkglist.json entries working without forcing a reinstall
+            return self._run_legacy(command, *args)
+
+        try:
+            callback(list(args), self)
+        except Exception as e:
+            self._error("Command '{}' raised an error while running: {}".format(command, e))
+            return False
+        return True
+
+    def _run_legacy(self, name, *args):
         installed = self._load_pkglist()
         if name not in installed:
             self._error("Package '{}' is not installed.".format(name))
@@ -3021,6 +3664,73 @@ class PackageManager:
             self._error("Package '{}' raised an error while running: {}".format(name, e))
             return False
         return True
+
+    # -----------------------------------------------------------------
+    # Command registry helpers
+    # -----------------------------------------------------------------
+
+    def register(self, command, callback, module_name=None):
+        """
+        Register a command -> callback mapping. Called by a package's
+        own install(pm) function, e.g.:
+
+            def install(pm):
+                pm.register(COMMAND, run)
+
+        Overwrites any existing registration for the same command name
+        (this is what makes reload()/update() work without a reboot).
+        Returns True on success.
+        """
+        if not command or not callable(callback):
+            self._error("register() requires a non-empty command name and a callable")
+            return False
+        self.commands[command] = callback
+        module_name = module_name or self._installing_module
+        if module_name:
+            self._command_modules[command] = module_name
+        self.logger.debug("Registered command '{}'".format(command), source=self.source)
+        return True
+
+    def unregister(self, command):
+        """Remove a command from the registry. Returns True if it existed."""
+        existed = command in self.commands
+        self.commands.pop(command, None)
+        self._command_modules.pop(command, None)
+        if existed:
+            self.logger.debug("Unregistered command '{}'".format(command), source=self.source)
+        return existed
+
+    def check(self, command):
+        """
+        Return True if `command` is currently registered and runnable.
+
+        Note: this now checks the live command registry rather than
+        pkglist.json, since a package can register a command without
+        necessarily matching its own package name (or vice versa).
+        """
+        return command in self.commands
+
+    def list_commands(self):
+        """Return a list of every currently registered command name."""
+        return list(self.commands.keys())
+
+    def reload(self, name):
+        """
+        Hot-reload an already-installed package's module: drop it from
+        sys.modules, re-import it, and re-run install(pm). Since
+        register() overwrites any existing entry for the same command,
+        this swaps the callback in place -- no reboot needed.
+
+        Use after a package's files have been updated on disk outside
+        of update()/install() (e.g. manually edited), or simply to
+        force a fresh import.
+        """
+        installed = self._load_pkglist()
+        record = installed.get(name)
+        if record is None:
+            self._error("Package '{}' is not installed.".format(name))
+            return False
+        return self._load_and_install_module(name, record)
 
     def info(self, name):
         installed = self._load_pkglist()
@@ -3094,13 +3804,6 @@ class PackageManager:
             return issues
         finally:
             self._cleanup_pkgtable_cache()
-    def check(self,module):
-        installed = self._load_pkglist()
-        entry=self._find_package(installed,module)
-        if entry is None:
-            return False
-        else:
-            return True
     def _begin_op(self):
         self._op_depth += 1
 
@@ -3527,3 +4230,4 @@ class IoTManager:
             handler()
         except Exception as e:
             print(f"[IoTManager] Network handle error: {e}")
+            
