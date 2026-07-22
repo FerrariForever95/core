@@ -493,7 +493,7 @@ def _load_services():
         "bluetoothmgr": BluetoothManager,
         "pkg":          PackageManager,
         "ps":           Scheduler,
-        "iot":          IoTManager,
+        "iot":          IoTManager
     }
     MODULES = {k: v for k, v in all_modules.items() if v is not None}
 
