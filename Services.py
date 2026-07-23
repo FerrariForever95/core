@@ -1153,7 +1153,7 @@ class FileManager:
 class Logger:
     LEVELS = {0: "ERROR", 1: "WARNING", 2: "DEBUG"}
 
-    def __init__(self, log_file_user="/LOGS/systemlog.txt", boot=False):
+    def __init__(self, log_file_user="/Logs/systemlog.txt", boot=False):
         self.i2c = I2C(0, scl=Pin(4), sda=Pin(5))
         self.rtc = DS3231(self.i2c)
         self.boot = boot
