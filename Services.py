@@ -28,7 +28,7 @@ from sinricpro import SinricPro
 from sinricpro.devices.sinricpro_switch import SinricProSwitch
 
 SD_SCK, SD_MOSI, SD_MISO, SD_CS = 40, 6, 5, 7
-LOGS_DIR = "/LOGS"
+LOGS_DIR = "/Logs"
 
 if not zfs.info()["mounted"]:
     zfs.mount()
