@@ -3335,8 +3335,8 @@ class AppDB:
 class PackageManager:
     DEFAULT_USER = "FerrariForever95"
     DEFAULT_REPO = "Zeno-Micro-PC"
-    PKGLIST_PATH = "/pkglist.json"
-    PKGTABLE_CACHE_PATH = "/pkgtable_cache.json"
+    PKGLIST_PATH = "/bin/pkglist.json"
+    PKGTABLE_CACHE_PATH = "/.cache/pkgtable_cache.json"
 
     def __init__(self, git=None, repo_user=None, repo_name=None):
         self.logger = Logger()
