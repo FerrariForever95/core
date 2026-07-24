@@ -829,8 +829,8 @@ class PackageManager:
         """
         Make sure a package's install_path is importable.
 
-        Delegates to core.SysPathManager (the single shared place
-        Services/ZenCMD do dynamic-path management) so this doesn't
+        Delegates to syspathmanager.SysPathManager (the single shared
+        place Services/ZenCMD do dynamic-path management) so this doesn't
         duplicate its sys.path bookkeeping. Kept as a thin wrapper --
         rather than removing it outright -- since it's still a useful,
         explicit "make sure X is importable" call on its own; a no-op
@@ -851,7 +851,7 @@ class PackageManager:
         is what makes its command appear in self.commands right away.
 
         The actual sys.path update + cache-busted import is delegated
-        to core.SysPathManager.import_from(), the same helper
+        to syspathmanager.SysPathManager.import_from(), the same helper
         Services/ZenCMD use for dynamic package imports -- every
         package lives at /bin/<name>/<name>.py, so folder_name and
         module_name are both just the package's own name.
@@ -862,7 +862,7 @@ class PackageManager:
             return False
 
         try:
-            from core import SysPathManager
+            from syspathmanager import SysPathManager
             module = SysPathManager.import_from("/bin", name, module_name)
         except NotADirectoryError as e:
             self._error("Package '{}' install directory is missing/broken: {}".format(name, e))
