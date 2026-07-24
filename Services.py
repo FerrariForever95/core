@@ -5,8 +5,8 @@ The original ~4300-line Services.py has been split into 7 subsystem
 files (logger, power, filesystem, security, process, packages, system)
 plus a rewritten network.py. Every one of those now ships and updates
 as its own package at /bin/<name>/<name>.py -- same as any third-party
-package -- and is loaded here through core.SysPathManager, the single
-shared dynamic-import helper Services/ZenCMD both use. This module
+package -- and is loaded here through syspathmanager.SysPathManager, the
+single shared dynamic-import helper Services/ZenCMD both use. This module
 re-exports everything from them so existing `from Services import X`
 imports elsewhere in the codebase (including ZenCMD.py) keep working
 unchanged.
@@ -20,10 +20,10 @@ passed in explicitly).
 
 If /bin/<name>/<name>.py is missing or broken for one of these core
 modules, that's a boot-time problem for 'recover' to fix -- this shim
-does not fall back to anything else, on purpose (see core.py's note
-about recovery.py deliberately not depending on it).
+does not fall back to anything else, on purpose (see syspathmanager.py's
+note about recovery.py deliberately not depending on it).
 """
-from core import SysPathManager
+from syspathmanager import SysPathManager
 
 _BIN = "/bin"
 
