@@ -782,13 +782,18 @@ class PackageManager:
             if not self._save_pkglist(installed):
                 return False
 
-            self.fm.refresh_tree(entry["install_path"])
+            self.fm.refresh_tree(installed[name]["install_path"])
 
-            # a force-install that moved filename/install_path leaves an
-            # orphaned old file behind -- clean it up
+            # Every package is stored at /bin/<name>/<name>.py, keyed only
+            # by its own name -- so a force-install always resolves to the
+            # exact same path as before it. Nothing can be "orphaned" by a
+            # moved install_path/filename anymore, but a stale file from a
+            # pre-/bin install layout can still be left behind if this
+            # package was previously installed under a different scheme;
+            # clean that up if the prior record points somewhere else.
             if prior_record:
                 old_path = self._full_path(prior_record.get("install_path"), prior_record.get("filename"))
-                new_path = self._full_path(entry.get("install_path"), entry.get("file", "").split("/")[-1])
+                new_path = self._full_path(installed[name].get("install_path"), installed[name].get("filename"))
                 if old_path != new_path:
                     try:
                         os.remove(old_path)
@@ -824,13 +829,12 @@ class PackageManager:
         """
         Make sure a package's install_path is importable.
 
-        __import__() only finds a module if its directory is in
-        sys.path. '/' and '/lib' are on sys.path by default in
-        MicroPython, but any other install_path (e.g. '/pkgs/wifimgr')
-        is not -- so without this, packages installed anywhere else
-        would import-fail every time, including right after a fresh
-        install() and especially on the next boot. Called before every
-        import; a no-op if the path is already present.
+        Delegates to core.SysPathManager (the single shared place
+        Services/ZenCMD do dynamic-path management) so this doesn't
+        duplicate its sys.path bookkeeping. Kept as a thin wrapper --
+        rather than removing it outright -- since it's still a useful,
+        explicit "make sure X is importable" call on its own; a no-op
+        if the path is already present.
         """
         path = (install_path or "/").rstrip("/") or "/"
         if path not in sys.path:
@@ -845,21 +849,27 @@ class PackageManager:
         module with a module-level install(pm)/uninstall(pm) and a
         run(args, shell) function. Importing it and calling install()
         is what makes its command appear in self.commands right away.
+
+        The actual sys.path update + cache-busted import is delegated
+        to core.SysPathManager.import_from(), the same helper
+        Services/ZenCMD use for dynamic package imports -- every
+        package lives at /bin/<name>/<name>.py, so folder_name and
+        module_name are both just the package's own name.
         """
         module_name = self._module_name_for(record)
         if not module_name:
             self._error("Cannot determine module name for package '{}'".format(name))
             return False
 
-        self._ensure_on_path(record.get("install_path"))
-
-        # drop any previously-imported copy so we always pick up the
-        # freshly-downloaded file (needed for update()/reinstall())
-        if module_name in sys.modules:
-            del sys.modules[module_name]
-
         try:
-            module = __import__(module_name)
+            from core import SysPathManager
+            module = SysPathManager.import_from("/bin", name, module_name)
+        except NotADirectoryError as e:
+            self._error("Package '{}' install directory is missing/broken: {}".format(name, e))
+            return False
+        except ImportError as e:
+            self._error("Could not import module '{}' for package '{}': {}".format(module_name, name, e))
+            return False
         except Exception as e:
             self._error("Could not import module '{}' for package '{}': {}".format(module_name, name, e))
             return False
@@ -1315,11 +1325,20 @@ class PackageManager:
             self._error("Could not write '{}': {}".format(path, e))
             return False
 
+    def _bin_dir_for(self, name):
+        """Every installed package lives at /bin/<name>/<name>.py --
+        regardless of whatever install_path/file the catalog entry
+        specifies -- so /bin becomes a flat, predictable command
+        directory: one subfolder per package, one file per subfolder,
+        always named after the package itself."""
+        return "/bin/{}".format(name)
+
     def _make_pkglist_entry(self, entry):
+        name = entry.get("name")
         return {
-            "name": entry.get("name"), "version": entry.get("version"), "author": entry.get("author"),
+            "name": name, "version": entry.get("version"), "author": entry.get("author"),
             "repository": entry.get("repository"), "branch": entry.get("branch") or self.git.default_branch,
-            "install_path": entry.get("install_path"), "filename": entry.get("file", "").split("/")[-1],
+            "install_path": self._bin_dir_for(name), "filename": "{}.py".format(name),
             "dependencies": entry.get("dependencies", []),
             # essential-OS-component flag, kept only for the future Recovery
             # module; defaults to False for backward compatibility with
@@ -1329,9 +1348,31 @@ class PackageManager:
 
     def _download_package(self, entry):
         # each catalog entry carries its own author/repository/branch --
-        # independent of the repo used for pkgtable.json itself
-        return self.git.download(entry.get("author"), entry.get("repository"), entry.get("file"),
-                                  branch=entry.get("branch"), save_dir=entry.get("install_path"))
+        # independent of the repo used for pkgtable.json itself. The
+        # catalog's own install_path is ignored: everything always lands
+        # in /bin/<name>/, and the downloaded file is renamed to
+        # <name>.py if the source file in the repo was called something
+        # else, so /bin/<name>/<name>.py is guaranteed either way.
+        name = entry.get("name")
+        target_dir = self._bin_dir_for(name)
+        ok = self.git.download(entry.get("author"), entry.get("repository"), entry.get("file"),
+                                branch=entry.get("branch"), save_dir=target_dir)
+        if not ok:
+            return False
+
+        source_basename = (entry.get("file") or "").split("/")[-1]
+        desired_path = "{}/{}.py".format(target_dir, name)
+        if source_basename and source_basename != "{}.py".format(name):
+            actual_path = "{}/{}".format(target_dir, source_basename)
+            try:
+                os.rename(actual_path, desired_path)
+            except OSError as e:
+                self.logger.warning(
+                    "Downloaded '{}' but could not rename it to '{}': {}".format(actual_path, desired_path, e),
+                    source=self.source,
+                )
+                return False
+        return True
 
     def _ensure_dependency(self, dep, pkgtable, installed):
         dep_name = dep.get("name")
@@ -1475,6 +1516,9 @@ def help():
     return (
         "packages.py -- package manager + net file transfer helpers\n"
         "  PackageManager(git=None, repo_user=None, repo_name=None)\n"
+        "    every package is stored at /bin/<name>/<name>.py -- /bin is a flat\n"
+        "    command directory, one subfolder per package, regardless of what\n"
+        "    the pkgtable.json catalog entry's own install_path/file say\n"
         "    .install(name, force=False) / .uninstall(name) / .reinstall(name)\n"
         "    .update(name=None) / .reload(name) / .list() / .info(name) / .verify()\n"
         "    .run(command, *args) / .register(command, callback, module_name=None)\n"
