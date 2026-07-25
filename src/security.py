@@ -12,7 +12,8 @@ import os
 import time
 import json
 import zfs
-import zeno
+import core
+zeno=core.SysPathManager.import_from("/","","zeno")
 from core import SysPathManager
 from filesystem import dewrapper, PermissionError
 process = SysPathManager.import_from("/bin","process","process")
@@ -238,4 +239,5 @@ def help():
         "    .change_username(user, password, new_username)\n"
         "    .removeuser(name) / .rebuild(system_token=None)"
     )
+
 
