@@ -12,7 +12,7 @@ from machine import Pin, I2C
 # flip this at runtime should do:
 #     import logger as _logger_mod
 #     _logger_mod.debug_log_enabled = True
-debug_log_enabled = False
+debug_log_enabled = True
 
 
 class Logger:
@@ -105,4 +105,5 @@ def help():
         "    .clear_logs()\n"
         "  module var: debug_log_enabled (bool) -- toggle console echo of log writes"
     )
+
 
