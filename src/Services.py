@@ -127,7 +127,7 @@ _process_help = _process_mod.help
 # file, which is why WifiManager went missing. The package folder is
 # still /bin/network for install_path/pkglist purposes; only the
 # importable module name changed.
-_network_mod = SysPathManager.import_from(_BIN, "network", "wifinet")
+_network_mod = SysPathManager.import_from(_BIN, "netservice", "netservice")
 WifiManager = _network_mod.WifiManager
 _network_help = _network_mod.help
 # Backwards-compat note: old code that did `from Services import Network`
@@ -171,3 +171,4 @@ def help():
         _logger_help(), _power_help(), _filesystem_help(), _security_help(),
         _process_help(), _network_help(), _packages_help(), _system_help(),
     ])
+
