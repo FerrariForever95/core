@@ -27,7 +27,7 @@ class Recovery:
 
     PKGTABLE_URL = "https://raw.githubusercontent.com/FerrariForever95/Zeno-Micro-PC/main/pkgtable.json"
     PKGLIST_PATH = "/pkglist.json"
-    ZENO_PATH    = "/bin/zeno.py"
+    ZENO_PATH    = "/zeno.py"
 
     ZENO_TEMPLATE = """import urandom,time
 
@@ -472,17 +472,15 @@ def _load_services():
     logger = Logger() if Logger else _NullLogger()
     _um = usermanager() if usermanager else None
     _fm = FileManager() if FileManager else None   # <-- ALL filesystem access goes through here when available
-    _pm = PackageManager() if PackageManager else None
+    _pm = PackageManager() if PackageManager else None   # cheap now -- packages load lazily on first run(), not here
 
-    # WifiManager (Services' replacement for the old "Network" class)
-    # requires a Logger instance -- MODULES[name]() below always calls
-    # its entry with zero args, so we can't register the class itself.
-    # Wrap it in a zero-arg factory that closes over the logger we just
-    # built, matching how every other MODULES entry gets instantiated.
-    if _WifiManagerCls is not None:
-        Network = lambda: _WifiManagerCls(logger)
-    else:
-        Network = None
+    # WifiManager (the merged Services.py's replacement for the old
+    # "Network" class) requires a Logger instance -- MODULES[name]()
+    # below always calls its entry with zero args, so we can't register
+    # the class itself. Wrap it in a zero-arg factory that closes over
+    # the logger we just built, matching how every other MODULES entry
+    # gets instantiated.
+    Network = (lambda cls=_WifiManagerCls: cls(logger)) if _WifiManagerCls is not None else None
 
     # NOTE: "encrypter": ZenZip was removed -- ZenZip is never imported
     # anywhere in Services, so leaving it wired in here would crash ZenCMD
