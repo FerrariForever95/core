@@ -33,6 +33,18 @@ can be pinned to the corner of any widget (button, icon, tab, avatar)
 to indicate unread/pending state — the classic "red dot" pattern.
 Toast() gives a non-blocking, stackable banner for transient messages;
 call Toast.update() once per frame from your main loop.
+
+Backlight: moclcd.backlight_set() requires moclcd.backlight_init() to
+have run first, or it raises OSError. init_display(dimmable=True) (or
+a standalone enable_dimming() call) sets up the LEDC PWM channel so
+brightness()/backlight_set() work; without it, brightness() raises a
+clear RuntimeError instead of letting that OSError surface from moclcd.
+
+Pixels: set_pixel(x, y, color) (alias draw_pixel()) wraps moclcd's
+native draw_pixel() for one-off dots — cheaper and clearer than
+fill_rect(x, y, 1, 1, color), and clip-safe like every other primitive
+here. Participates in begin_capture()/end_capture() and the genie
+animations the same as circles/lines/rects do.
 """
 
 import time
@@ -48,19 +60,51 @@ HEIGHT = 320
 
 active_screen = None
 
+_dimmable = False  # set True once backlight_init() has actually run
+
 
 def brightness(value):
+    """Set backlight brightness as a 0.0-1.0 fraction.
+
+    Requires PWM dimming to be enabled first -- either pass dimmable=True
+    to init_display(), or call enable_dimming() yourself. moclcd.backlight_set()
+    raises OSError if backlight_init() was never called, so this checks
+    the flag up front and gives a clearer error instead of a bare
+    OSError bubbling out of the C module.
+    """
+    if not _dimmable:
+        raise RuntimeError(
+            "brightness() needs PWM dimming: call init_display(dimmable=True) "
+            "or enable_dimming() first"
+        )
     moclcd.backlight_set(value)
 
 
-def init_display(pclk=10_000_000, width=480, height=320, madctl=0x28):
+def enable_dimming(freq_hz=5000, resolution_bits=8):
+    """Set up LEDC PWM on the backlight pin so brightness()/backlight_set()
+    can dim smoothly instead of only supporting on/off. Safe to call more
+    than once. After this, moclcd.backlight(on) also drives PWM duty to
+    max/0 rather than toggling the raw GPIO."""
+    global _dimmable
+    moclcd.backlight_init(freq_hz=freq_hz, resolution_bits=resolution_bits)
+    _dimmable = True
+
+
+def init_display(pclk=10_000_000, width=480, height=320, madctl=0x28, dimmable=False):
     """Bring up the panel in landscape by default and sync WIDTH/HEIGHT.
-    Pass width=320, height=480, madctl=0x48 for portrait instead."""
+    Pass width=320, height=480, madctl=0x48 for portrait instead.
+
+    dimmable=True also calls enable_dimming() so brightness()/backlight_set()
+    work immediately instead of raising; leave False if you only ever need
+    a hard on/off backlight.
+    """
     global WIDTH, HEIGHT
     WIDTH, HEIGHT = width, height
     moclcd.init(pclk=pclk, width=width, height=height, madctl=madctl)
     moclcd.reset()
     moclcd.panel_init()
+    if dimmable:
+        enable_dimming()
     moclcd.backlight(True)
 
 # ---------------------------------------------------------------------
@@ -240,6 +284,19 @@ def end_capture():
     global _capturing
     _capturing = False
     return _capture_ops
+
+
+def set_pixel(x, y, color):
+    """Plot a single pixel via moclcd's native draw_pixel() -- silently
+    clipped if off-panel, same as the other primitives here. Cheaper and
+    clearer than fill_rect(x, y, 1, 1, color) for one-off dots (custom
+    shapes, crosshairs, sparse plots, per-pixel effects)."""
+    moclcd.draw_pixel(x, y, color)
+    if _capturing:
+        _capture_ops.append(('pixel', x, y, color))
+
+
+draw_pixel = set_pixel  # alias matching moclcd's own naming
 
 
 def fill_circle(cx, cy, r, color):
@@ -540,6 +597,12 @@ def replay_ops(ops, scale, origin_x, origin_y, text_reveal=0.92):
                 color,
             )
 
+        elif kind == 'pixel':
+            _, x, y, color = op
+            nx = origin_x + (x - origin_x) * scale
+            ny = origin_y + (y - origin_y) * scale
+            set_pixel(int(nx), int(ny), color)
+
         elif kind == 'bmp':
             _, path, x, y, w, h = op
             nx = origin_x + (x - origin_x) * scale
@@ -584,6 +647,10 @@ def _ops_bbox(ops):
             _, lx0, ly0, lx1, ly1, color = op
             x0, y0 = min(x0, lx0, lx1), min(y0, ly0, ly1)
             x1, y1 = max(x1, lx0, lx1), max(y1, ly0, ly1)
+        elif kind == 'pixel':
+            _, px, py, color = op
+            x0, y0 = min(x0, px), min(y0, py)
+            x1, y1 = max(x1, px + 1), max(y1, py + 1)
         elif kind == 'text':
             _, x, y, text, fg, bg = op
             x0, y0 = min(x0, x), min(y0, y)
@@ -2420,4 +2487,3 @@ class VKTouchCalibrator:
 
         self._msg("Calibration complete.")
         return final
-
