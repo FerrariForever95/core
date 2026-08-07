@@ -33,44 +33,10 @@ can be pinned to the corner of any widget (button, icon, tab, avatar)
 to indicate unread/pending state — the classic "red dot" pattern.
 Toast() gives a non-blocking, stackable banner for transient messages;
 call Toast.update() once per frame from your main loop.
-
-Framebuffer readback: moclcd is a write-only DMA panel with no
-readback bus, so reading "what's currently on screen" is backed by an
-opt-in shadow copy moclcd.c keeps in sync with every draw call.
-  - enable_framebuffer_mirror() turns mirroring on (~300KB RAM at
-    480x320); call once near startup if you'll need this at all.
-  - read_framebuffer(dest=None, x=0, y=0, w=None, h=None) forwards the
-    current frame (or a sub-rect) into `dest` -- your own pre-allocated
-    buffer/variable -- or allocates and returns one if dest is None.
-  - screenshot_to_file(path, ...) is read_framebuffer() + a raw write.
-
-Faster screen animations: window_open_animation()/window_close_
-animation() and their content-aware _live() "genie" counterparts now
-batch each frame's rects through moclcd.blit_fast() (one C call per
-frame instead of one Python->C call per rect), so opening/closing
-screens is noticeably snappier, especially for busy screens with many
-widgets. replay_ops_fast() is the batched version of replay_ops() used
-internally by the _live() variants.
-
-Multi-font text: moclcd's built-in font (id 0) is the fixed 8x8
-font_petme128_8x8 table. register_font(font_id, glyph_data, char_w,
-char_h, first_char, last_char) registers an additional font (ids 1-7)
-from a column-major glyph table (same byte layout as
-font_petme128_8x8), and draw_text(x, y, text, fg, bg=None, font=font_id)
-draws with it -- useful for a bigger/bold heading font alongside the
-default body text.
-
-Filesystem note for draw_bmp()/draw_logo(): these go through moclcd's
-native BMP loader, which opens files via fopen() -> MicroPython's VFS,
-same as Python's own open(). Calling them before the filesystem is
-mounted (os.mount(), or the board's default flash mount) will raise —
-moclcd now detects that case and explains it directly instead of a
-bare "file not found". See init_display()'s docstring for details.
 """
 
 import time
 import urandom
-import array
 import moclcd
 
 # ---------------------------------------------------------------------
@@ -87,152 +53,15 @@ def brightness(value):
     moclcd.backlight_set(value)
 
 
-def init_display(pclk=20_000_000, width=480, height=320, madctl=0x28):
+def init_display(pclk=10_000_000, width=480, height=320, madctl=0x28):
     """Bring up the panel in landscape by default and sync WIDTH/HEIGHT.
-    Pass width=320, height=480, madctl=0x48 for portrait instead.
-
-    NOTE on draw_bmp()/draw_logo(): those go through moclcd's native
-    BMP loader, which opens files via C's fopen() -> MicroPython's VFS.
-    That means the filesystem must already be mounted (os.mount(), or
-    the board's default flash mount) before any draw_bmp() call, or
-    every path will look like it doesn't exist. init_display() itself
-    doesn't touch the filesystem, so it's always safe to call from
-    boot.py; just don't call draw_bmp()/draw_logo() until after the FS
-    is mounted (normally that just means "not before main.py runs").
-    """
+    Pass width=320, height=480, madctl=0x48 for portrait instead."""
     global WIDTH, HEIGHT
     WIDTH, HEIGHT = width, height
-    moclcd.backlight(False)
     moclcd.init(pclk=pclk, width=width, height=height, madctl=madctl)
-    moclcd.backlight(True)
     moclcd.reset()
-    time.sleep_ms(20)
     moclcd.panel_init()
-
-
-# ---------------------------------------------------------------------
-# Framebuffer readback
-#
-# moclcd is a write-only DMA panel with no readback bus, so "reading
-# the current frame" is backed by an opt-in shadow copy that moclcd.c
-# keeps in sync with every draw call (see mirror_enable() in
-# modlcd.c). Turn it on once (costs ~300KB RAM at 480x320) if your app
-# needs to grab pixels back -- e.g. for a screenshot-to-file feature,
-# a "restore what was here" pattern for popups/toasts, or feeding a
-# captured region back into blit() elsewhere on screen.
-# ---------------------------------------------------------------------
-
-_mirroring = False
-
-
-def enable_framebuffer_mirror():
-    """Start mirroring every draw call into an internal shadow
-    framebuffer so read_framebuffer() has something to read. Call this
-    once near startup (after init_display()) if you'll need frame
-    capture at all -- it costs extra RAM and a little CPU per draw
-    call, so it's off by default."""
-    global _mirroring
-    moclcd.mirror_enable()
-    _mirroring = True
-
-
-def disable_framebuffer_mirror(free_memory=False):
-    """Stop mirroring. Pass free_memory=True to also release the
-    shadow buffer's RAM (mirror_free()) instead of just pausing it."""
-    global _mirroring
-    if free_memory:
-        moclcd.mirror_free()
-    else:
-        moclcd.mirror_disable()
-    _mirroring = False
-
-
-def read_framebuffer(dest=None, x=0, y=0, w=None, h=None):
-    """Read the current frame (or a sub-rectangle of it) out of the
-    shadow framebuffer and forward it into `dest` -- a pre-allocated
-    writable buffer such as a bytearray, or a variable you already
-    hold a reference to. If `dest` is omitted, a correctly-sized
-    bytearray is allocated and returned for you.
-
-    Requires enable_framebuffer_mirror() to have been called first.
-    Result is RGB565, MSB-first per pixel -- the same layout blit()
-    expects, so you can feed a captured region straight back in:
-
-        buf = gfx.read_framebuffer(x=10, y=10, w=64, h=64)
-        ... draw a popup over that area ...
-        gfx.blit(10, 10, 64, 64, buf)   # restore what was there
-    """
-    if not _mirroring:
-        raise OSError("read_framebuffer: call enable_framebuffer_mirror() first")
-
-    rw = w if w is not None else WIDTH
-    rh = h if h is not None else HEIGHT
-
-    if dest is None:
-        dest = bytearray(rw * rh * 2)
-
-    moclcd.read_framebuffer(dest, x=x, y=y, w=rw, h=rh)
-    return dest
-
-
-def screenshot_to_file(path, x=0, y=0, w=None, h=None):
-    """Convenience: read_framebuffer() then write the raw RGB565 bytes
-    straight to `path`. Requires enable_framebuffer_mirror() to have
-    been called first. Requires the filesystem to already be mounted
-    (same caveat as draw_bmp() -- see init_display()'s docstring)."""
-    buf = read_framebuffer(x=x, y=y, w=w, h=h)
-    with open(path, "wb") as f:
-        f.write(buf)
-    return buf
-
-
-# ---------------------------------------------------------------------
-# Multi-font support
-#
-# moclcd's built-in font (id 0) is the fixed 8x8 font_petme128_8x8
-# table. Additional fonts can be registered at runtime with
-# register_font() -- pass a column-major glyph table (same byte layout
-# as font_petme128_8x8: char_w bytes per glyph, bit j of byte i is row
-# j of column i) exported from wherever you convert a .bdf/.ttf/image
-# font offline. Once registered, draw text with that font id via
-# draw_text(..., font=font_id).
-# ---------------------------------------------------------------------
-
-_registered_fonts = {}  # font_id -> (char_w, char_h, first_char, last_char)
-
-
-def register_font(font_id, glyph_data, char_w, char_h, first_char=32, last_char=127):
-    """Register a font (id 1..7; id 0 is always the built-in 8x8 font
-    and can't be overwritten). glyph_data is a bytes-like column-major
-    bitmap table covering (last_char - first_char + 1) characters,
-    char_w bytes each. Once registered, use draw_text(..., font=font_id)."""
-    moclcd.register_font(font_id, glyph_data, char_w, char_h, first_char, last_char)
-    _registered_fonts[font_id] = (char_w, char_h, first_char, last_char)
-
-
-def unregister_font(font_id):
-    moclcd.unregister_font(font_id)
-    _registered_fonts.pop(font_id, None)
-
-
-def font_metrics(font_id=0):
-    """Returns (char_w, char_h, first_char, last_char) for a font id."""
-    return moclcd.font_metrics(font_id)
-
-
-def draw_text(x, y, text, fg, bg=None, font=0):
-    """Like draw_text8x8() but with a `font` id selecting which
-    registered font to draw with (0 = built-in 8x8). bg=None means
-    the module default `background` is used as an opaque fill, same
-    convention as draw_text8x8(); pass bg=False for moclcd's native
-    transparent mode instead (only foreground pixels are plotted)."""
-    if not text:
-        return
-    actual_bg = background if bg is None else (None if bg is False else bg)
-    moclcd.draw_text(x, y, text, fg, bg=actual_bg, font=font)
-    if _capturing:
-        _capture_ops.append(('text_font', x, y, text, fg, actual_bg, font))
-
+    moclcd.backlight(True)
 
 # ---------------------------------------------------------------------
 # Colors — an iOS-ish default palette, small and consistent
@@ -570,31 +399,6 @@ def draw_logo(path, box_x=0, box_y=0, box_w=WIDTH, box_h=HEIGHT,
 # Screen transition animations
 # ---------------------------------------------------------------------
 
-# ---------------------------------------------------------------------
-# blit_fast batching helper: builds int32 arrays for a batch of rects
-# and sends them to moclcd in one C call instead of one Python call
-# per rect. Cuts per-frame MicroPython call/bounds-check overhead out
-# of the animation hot loop -- fill_rect() clips+validates in Python
-# and moclcd.fill_rect() re-validates in C on *every* call; blit_fast
-# skips straight to the batched C-side clip+stream path used by
-# do_fill_rect_clip() in modlcd.c.
-# ---------------------------------------------------------------------
-
-def _flush_batch(xs, ys, ws, hs, cs):
-    n = len(xs)
-    if n == 0:
-        return
-    moclcd.blit_fast(
-        array.array('i', xs), array.array('i', ys),
-        array.array('i', ws), array.array('i', hs),
-        array.array('i', cs), n,
-    )
-    if _capturing:
-        for i in range(n):
-            _capture_ops.append(('rect', xs[i], ys[i], ws[i], hs[i], cs[i]))
-    xs.clear(); ys.clear(); ws.clear(); hs.clear(); cs.clear()
-
-
 def window_close_animation(duration=0.4, fps=60, color=None, ease=True):
     if color is None:
         color = WHITE
@@ -624,16 +428,14 @@ def window_close_animation(duration=0.4, fps=60, color=None, ease=True):
         x1 = x0 + w - 1
         y1 = y0 + h - 1
 
-        xs, ys, ws, hs, cs = [], [], [], [], []
         if y0 > prev_y0:
-            xs.append(prev_x0); ys.append(prev_y0); ws.append(prev_x1 - prev_x0 + 1); hs.append(y0 - prev_y0); cs.append(background)
+            fill_rect(prev_x0, prev_y0, prev_x1 - prev_x0 + 1, y0 - prev_y0, background)
         if y1 < prev_y1:
-            xs.append(prev_x0); ys.append(y1 + 1); ws.append(prev_x1 - prev_x0 + 1); hs.append(prev_y1 - y1); cs.append(background)
+            fill_rect(prev_x0, y1 + 1, prev_x1 - prev_x0 + 1, prev_y1 - y1, background)
         if x0 > prev_x0:
-            xs.append(prev_x0); ys.append(y0); ws.append(x0 - prev_x0); hs.append(y1 - y0 + 1); cs.append(background)
+            fill_rect(prev_x0, y0, x0 - prev_x0, y1 - y0 + 1, background)
         if x1 < prev_x1:
-            xs.append(x1 + 1); ys.append(y0); ws.append(prev_x1 - x1); hs.append(y1 - y0 + 1); cs.append(background)
-        _flush_batch(xs, ys, ws, hs, cs)
+            fill_rect(x1 + 1, y0, prev_x1 - x1, y1 - y0 + 1, background)
 
         prev_x0, prev_y0, prev_x1, prev_y1 = x0, y0, x1, y1
         time.sleep(delay)
@@ -666,16 +468,14 @@ def window_open_animation(duration=0.4, fps=60, color=None, ease=True):
         x1 = x0 + w - 1
         y1 = y0 + h - 1
 
-        xs, ys, ws, hs, cs = [], [], [], [], []
         if y0 < prev_y0:
-            xs.append(x0); ys.append(y0); ws.append(w); hs.append(prev_y0 - y0); cs.append(color)
+            fill_rect(x0, y0, w, prev_y0 - y0, color)
         if y1 > prev_y1:
-            xs.append(x0); ys.append(prev_y1 + 1); ws.append(w); hs.append(y1 - prev_y1); cs.append(color)
+            fill_rect(x0, prev_y1 + 1, w, y1 - prev_y1, color)
         if x0 < prev_x0:
-            xs.append(x0); ys.append(prev_y0); ws.append(prev_x0 - x0); hs.append(prev_y1 - prev_y0 + 1); cs.append(color)
+            fill_rect(x0, prev_y0, prev_x0 - x0, prev_y1 - prev_y0 + 1, color)
         if x1 > prev_x1:
-            xs.append(prev_x1 + 1); ys.append(prev_y0); ws.append(x1 - prev_x1); hs.append(prev_y1 - prev_y0 + 1); cs.append(color)
-        _flush_batch(xs, ys, ws, hs, cs)
+            fill_rect(prev_x1 + 1, prev_y0, x1 - prev_x1, prev_y1 - prev_y0 + 1, color)
 
         prev_x0, prev_y0, prev_x1, prev_y1 = x0, y0, x1, y1
         time.sleep(delay)
@@ -756,91 +556,6 @@ def replay_ops(ops, scale, origin_x, origin_y, text_reveal=0.92):
             draw_text8x8(int(origin_x + (x - origin_x) * scale), int(origin_y + (y - origin_y) * scale),
                          text, fg, bg)
 
-        elif kind == 'text_font':
-            if scale < text_reveal:
-                continue
-            _, x, y, text, fg, bg, font = op
-            moclcd.draw_text(int(origin_x + (x - origin_x) * scale), int(origin_y + (y - origin_y) * scale),
-                              text, fg, bg=bg, font=font)
-
-
-def replay_ops_fast(ops, scale, origin_x, origin_y, text_reveal=0.92):
-    """Same as replay_ops(), but batches every plain filled-rect op
-    ('rect') in the list into as few moclcd.blit_fast() calls as
-    possible instead of one moclcd.fill_rect() call per rect. A genie
-    animation frame with a taskbar + several buttons can easily be
-    10-30 'rect' ops; this turns that into a single C round trip per
-    frame for the fills, while circles/lines/outlines/bmps/text (which
-    aren't flat fills) still go through their normal per-op calls."""
-    xs, ys, ws, hs, cs = [], [], [], [], []
-
-    def flush():
-        _flush_batch(xs, ys, ws, hs, cs)
-
-    for op in ops:
-        kind = op[0]
-
-        if kind == 'rect':
-            _, x, y, w, h, color = op
-            nx = origin_x + (x - origin_x) * scale
-            ny = origin_y + (y - origin_y) * scale
-            xs.append(int(nx)); ys.append(int(ny))
-            ws.append(max(1, int(w * scale))); hs.append(max(1, int(h * scale)))
-            cs.append(color)
-            continue
-
-        # any non-'rect' op breaks the run of batchable fills -- flush
-        # what's queued so ordering/z-order stays correct, then handle
-        # this op the normal way.
-        flush()
-
-        if kind == 'rect_outline':
-            _, x, y, w, h, color = op
-            nx = origin_x + (x - origin_x) * scale
-            ny = origin_y + (y - origin_y) * scale
-            draw_rect(int(nx), int(ny), max(1, int(w * scale)), max(1, int(h * scale)), color)
-
-        elif kind == 'circle':
-            _, cx, cy, r, color, filled = op
-            ncx = origin_x + (cx - origin_x) * scale
-            ncy = origin_y + (cy - origin_y) * scale
-            nr = max(1, int(r * scale))
-            if filled:
-                fill_circle(int(ncx), int(ncy), nr, color)
-            else:
-                draw_circle(int(ncx), int(ncy), nr, color)
-
-        elif kind == 'line':
-            _, x0, y0, x1, y1, color = op
-            draw_line(
-                int(origin_x + (x0 - origin_x) * scale), int(origin_y + (y0 - origin_y) * scale),
-                int(origin_x + (x1 - origin_x) * scale), int(origin_y + (y1 - origin_y) * scale),
-                color,
-            )
-
-        elif kind == 'bmp':
-            _, path, x, y, w, h = op
-            nx = origin_x + (x - origin_x) * scale
-            ny = origin_y + (y - origin_y) * scale
-            try:
-                draw_bmp(path, int(nx), int(ny), max(1, int(w * scale)), max(1, int(h * scale)))
-            except Exception:
-                pass
-
-        elif kind == 'text':
-            if scale >= text_reveal:
-                _, x, y, text, fg, bg = op
-                draw_text8x8(int(origin_x + (x - origin_x) * scale), int(origin_y + (y - origin_y) * scale),
-                             text, fg, bg)
-
-        elif kind == 'text_font':
-            if scale >= text_reveal:
-                _, x, y, text, fg, bg, font = op
-                moclcd.draw_text(int(origin_x + (x - origin_x) * scale), int(origin_y + (y - origin_y) * scale),
-                                  text, fg, bg=bg, font=font)
-
-    flush()
-
 
 def _ops_bbox(ops):
     """Bounding box (x0, y0, x1, y1) covering every primitive in a
@@ -873,11 +588,6 @@ def _ops_bbox(ops):
             _, x, y, text, fg, bg = op
             x0, y0 = min(x0, x), min(y0, y)
             x1, y1 = max(x1, x + len(text) * 8), max(y1, y + 8)
-        elif kind == 'text_font':
-            _, x, y, text, fg, bg, font = op
-            cw, ch, _f, _l = moclcd.font_metrics(font)
-            x0, y0 = min(x0, x), min(y0, y)
-            x1, y1 = max(x1, x + len(text) * cw), max(y1, y + ch)
 
     if x1 < x0 or y1 < y0:
         return 0, 0, WIDTH, HEIGHT
@@ -918,18 +628,16 @@ def window_close_animation_live(ops, duration=0.4, fps=60, origin=None, ease=Tru
 
         # vacate whatever the previous (bigger) frame occupied that
         # this (smaller) frame no longer covers
-        xs, ys, ws, hs, cs = [], [], [], [], []
         if y0 > prev_y0:
-            xs.append(prev_x0); ys.append(prev_y0); ws.append(prev_x1 - prev_x0); hs.append(y0 - prev_y0); cs.append(bg)
+            fill_rect(prev_x0, prev_y0, prev_x1 - prev_x0, y0 - prev_y0, bg)
         if y1 < prev_y1:
-            xs.append(prev_x0); ys.append(y1); ws.append(prev_x1 - prev_x0); hs.append(prev_y1 - y1); cs.append(bg)
+            fill_rect(prev_x0, y1, prev_x1 - prev_x0, prev_y1 - y1, bg)
         if x0 > prev_x0:
-            xs.append(prev_x0); ys.append(y0); ws.append(x0 - prev_x0); hs.append(y1 - y0); cs.append(bg)
+            fill_rect(prev_x0, y0, x0 - prev_x0, y1 - y0, bg)
         if x1 < prev_x1:
-            xs.append(x1); ys.append(y0); ws.append(prev_x1 - x1); hs.append(y1 - y0); cs.append(bg)
-        _flush_batch(xs, ys, ws, hs, cs)
+            fill_rect(x1, y0, prev_x1 - x1, y1 - y0, bg)
 
-        replay_ops_fast(ops, t, ox, oy)
+        replay_ops(ops, t, ox, oy)
 
         prev_x0, prev_y0, prev_x1, prev_y1 = x0, y0, x1, y1
         time.sleep(delay)
@@ -955,7 +663,7 @@ def window_open_animation_live(ops, duration=0.4, fps=60, origin=None, ease=True
         t = i / frames
         if ease:
             t = 1 - (1 - t) ** 3
-        replay_ops_fast(ops, t, ox, oy)
+        replay_ops(ops, t, ox, oy)
         time.sleep(delay)
 
 
