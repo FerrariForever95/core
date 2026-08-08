@@ -90,7 +90,7 @@ def enable_dimming(freq_hz=5000, resolution_bits=8):
     _dimmable = True
 
 
-def init_display(pclk=10_000_000, width=480, height=320, madctl=0x28, dimmable=False):
+def init_display(pclk=15_000_000, width=480, height=320, madctl=0x28, dimmable=False):
     """Bring up the panel in landscape by default and sync WIDTH/HEIGHT.
     Pass width=320, height=480, madctl=0x48 for portrait instead.
 
@@ -712,7 +712,7 @@ def window_close_animation_live(ops, duration=0.4, fps=60, origin=None, ease=Tru
     fill_rect(prev_x0, prev_y0, max(1, prev_x1 - prev_x0), max(1, prev_y1 - prev_y0), bg)
 
 
-def window_open_animation_live(ops, duration=0.4, fps=60, origin=None, ease=True, bg=None):
+def window_open_animation_live(ops, duration=0.1, fps=180, origin=None, ease=True, bg=None):
     """Content-aware open: grows the screen's actual content in from
     `origin` (default screen center) instead of a flat color block.
     Call this with the op list from UIScreen.snapshot() / end_capture()."""
@@ -899,7 +899,7 @@ class UIScreen:
             draw_bmp(self.background, 0, 0, max_w=WIDTH, max_h=HEIGHT)
 
     def openscreen(self):
-        window_open_animation(duration=0.4, fps=60, color=self.background, ease=True)
+        window_open_animation(duration=0.1, fps=144, color=self.background, ease=True)
 
     def closescreen(self, widgets=None, genie=True, origin=None):
         """Animate the screen away. By default this is the new "genie"
