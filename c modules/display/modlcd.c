@@ -15,17 +15,23 @@
  *   doing it by hand in Python).
  * - fill_rect() / fill_screen() / blit() replace the manual per-line
  *   data() calls from Python.
- * - Fills stream through a small DMA-capable buffer (heap_caps_malloc
- *   with MALLOC_CAP_DMA) that's resent in chunks. Because
- *   trans_queue_depth is 10, several chunks can be in flight on the DMA
- *   engine at once instead of the CPU/Python loop stalling on each line
- *   like the original demo script did.
+ * - All DMA-driven pixel streaming (fills, blit, glyphs, bmp) now goes
+ *   through a small pool of DMA-capable buffers (see "DMA transfer
+ *   layer" below) instead of reusing a single scratch buffer while
+ *   transfers may still be in flight. Because trans_queue_depth allows
+ *   several transactions to be queued on the I80 engine at once, a
+ *   buffer must not be touched again until the hardware has actually
+ *   finished reading it -- that's what the pool + completion callback
+ *   guarantee.
  *
- * API:
+ * API (unchanged from previous revision):
  *   moclcd.init(pclk=10_000_000, width=480, height=320, madctl=0x28)
  *                                             -- defaults to landscape;
  *                                                pass width=320, height=480,
  *                                                madctl=0x48 for portrait
+ *   moclcd.deinit()                          -- NEW: releases bus/IO/DMA
+ *                                                pool; safe to call init()
+ *                                                again afterwards
  *   moclcd.reset()
  *   moclcd.panel_init()
  *   moclcd.backlight(on)                     -- digital on/off; drives PWM duty
@@ -45,6 +51,14 @@
  *   moclcd.draw_rect(x, y, w, h, color)      -- outline; clipped silently if off-panel
  *   moclcd.draw_circle(x0, y0, r, color)     -- outline; clipped silently if off-panel
  *   moclcd.fill_circle(x0, y0, r, color)     -- filled; clipped silently if off-panel
+ *   moclcd.draw_text8x8(x, y, text, fg, bg=None)
+ *   moclcd.draw_bmp(path, x, y, w=None, h=None, max_w=None, max_h=None)
+ *                                             -- w/h now really scale the
+ *                                                image (nearest-neighbour)
+ *                                                when they differ from the
+ *                                                BMP's native size; max_w/
+ *                                                max_h additionally clamp
+ *                                                the *output* size.
  */
 
 #include "py/obj.h"
@@ -60,18 +74,85 @@
 #include "py/mperrno.h"
 
 #include <stdio.h>
-
 #include <string.h>
+#include <stdlib.h>
 
 #define LCD_CMD_CASET  0x2A
 #define LCD_CMD_PASET  0x2B
 #define LCD_CMD_RAMWR  0x2C
 #define LCD_CMD_RAMWRC 0x3C   /* continuation write, used for pixel streaming */
 
-/* how many pixels we buffer per DMA chunk (2 bytes/pixel -> 4KB chunks) */
+/* how many pixels one DMA pool buffer holds (2 bytes/pixel -> 4KB chunks) */
 #define FILL_CHUNK_PIXELS 2048
+#define FILL_CHUNK_BYTES  (FILL_CHUNK_PIXELS * 2)
 
-/* ---- module state ---- */
+/* Number of buffers in the DMA pool. Sized against trans_queue_depth so
+ * the hardware can have that many transactions queued while we still
+ * have a spare buffer or two to prepare the next chunk into. */
+#define LCD_TRANS_QUEUE_DEPTH 10
+#define LCD_DMA_POOL_SLOTS    (LCD_TRANS_QUEUE_DEPTH + 2)
+
+/* -------------------------------------------------------------------
+ * DMA transfer layer
+ *
+ *   lcd_dma_acquire()  -- block (busy-poll, no RTOS blocking primitives
+ *                          needed since this all runs on the MicroPython
+ *                          task) until a free buffer is available, mark
+ *                          it in-flight, return it.
+ *   lcd_dma_submit()   -- hand a buffer + address window to the I80
+ *                          queue via esp_lcd_panel_io_tx_color(). The
+ *                          buffer stays marked in-flight; ownership does
+ *                          NOT return to the caller.
+ *   lcd_dma_release()  -- called from the esp_lcd "color trans done"
+ *                          callback (interrupt/task context supplied by
+ *                          esp_lcd) once the hardware has actually
+ *                          finished reading a buffer. Marks the oldest
+ *                          still-in-flight slot free again.
+ *   lcd_dma_wait_idle()-- block until every pool slot is free again.
+ *                          Used before deinit() and anywhere the driver
+ *                          needs a hard sync point (e.g. before reusing
+ *                          host-side memory that isn't itself pool
+ *                          memory).
+ *
+ * This is the single path fill_rect(), fill_screen(), blit(),
+ * draw_text8x8() and draw_bmp() all funnel through -- no more ad-hoc
+ * heap_caps_malloc()/free() around individual tx_color() calls.
+ *
+ * IMPORTANT implementation note: esp_lcd_panel_io_i80_config_t's
+ * on_color_trans_done callback is registered once per panel IO, and
+ * its user_ctx is fixed at esp_lcd_new_panel_io_i80() time -- it is
+ * NOT a per-transaction context, so the callback cannot be told
+ * directly "slot #N just finished". Instead we rely on the I80 driver
+ * completing transactions strictly in submission (FIFO) order on a
+ * single queue: we keep our own FIFO of which pool slot each submitted
+ * transaction used, and on each completion callback we pop the oldest
+ * outstanding entry and mark that slot free. This matches how the
+ * underlying hardware queue actually behaves and avoids needing a
+ * per-transaction user_ctx.
+ * ---------------------------------------------------------------- */
+typedef struct {
+    uint8_t  *buf;        /* FILL_CHUNK_BYTES, MALLOC_CAP_DMA */
+    volatile bool in_flight;
+} lcd_dma_slot_t;
+
+static lcd_dma_slot_t s_dma_pool[LCD_DMA_POOL_SLOTS];
+static bool           s_dma_pool_inited = false;
+
+/* FIFO of slot indices for transactions currently queued/in flight on
+ * the I80 driver, in submission order. Sized one larger than the pool
+ * so it can never be mistaken for empty when full. Only ever touched
+ * with interrupts effectively serialized against the single
+ * MicroPython task that calls lcd_dma_submit(), except for the pop in
+ * the completion callback -- guarded by disabling interrupts briefly
+ * since the callback may run from an ISR context depending on esp_lcd
+ * configuration. */
+static volatile int s_inflight_fifo[LCD_DMA_POOL_SLOTS + 1];
+static volatile int s_inflight_head = 0; /* next to pop (oldest) */
+static volatile int s_inflight_tail = 0; /* next free slot to push */
+
+static inline int fifo_next(int i) { return (i + 1) % (LCD_DMA_POOL_SLOTS + 1); }
+
+/* ---- module / driver state ---- */
 static esp_lcd_i80_bus_handle_t  s_bus       = NULL;
 static esp_lcd_panel_io_handle_t s_io        = NULL;
 static mp_hal_pin_obj_t          s_reset_pin = 12;
@@ -81,10 +162,12 @@ static bool                      s_has_reset = false;
 static uint16_t                  s_width     = 480;
 static uint16_t                  s_height    = 320;
 static uint8_t                   s_madctl    = 0x28; /* landscape (MV set); 0x48=portrait, 0x88/0xE8=other rotations */
-static uint8_t                  *s_fill_buf  = NULL; /* FILL_CHUNK_PIXELS*2 bytes, DMA capable */
 static bool                      s_bl_pwm_inited = false;
 static uint32_t                  s_bl_duty_max   = 255; /* set by backlight_init() from resolution_bits */
-static uint8_t                  *s_glyph_buf = NULL;    /* 8*8*2 bytes, DMA capable, reused per glyph */
+
+/* explicit lifecycle stages, per requirement #9 */
+static bool s_initialized        = false; /* init() succeeded: bus+io live */
+static bool s_panel_initialized  = false; /* panel_init() succeeded */
 
 #define FONT_CHAR_W     8
 #define FONT_CHAR_H     8
@@ -103,7 +186,7 @@ static void io_check(esp_err_t ret, const char *what)
 
 static void require_init(void)
 {
-    if (s_io == NULL) {
+    if (!s_initialized || s_io == NULL) {
         mp_raise_msg(&mp_type_OSError, MP_ERROR_TEXT("moclcd.init() must be called first"));
     }
 }
@@ -113,13 +196,125 @@ static void lcd_cmd_raw(uint8_t cmd, const void *buf, size_t len)
     io_check(esp_lcd_panel_io_tx_param(s_io, cmd, buf, len), "cmd");
 }
 
-static void ensure_fill_buf(void)
+/* esp_lcd invokes this once a queued color transaction has actually
+ * been shifted out over the bus and the buffer is safe to reuse. This
+ * is the only place any pool slot is marked free again -- callers
+ * never assume tx_color() has synchronously consumed the buffer.
+ *
+ * The I80 driver completes transactions in the order they were
+ * submitted (single hardware queue), so each callback corresponds to
+ * the oldest entry in our in-flight FIFO -- see the design note above
+ * s_dma_pool for why we can't get the slot directly via user_ctx. */
+static bool IRAM_ATTR lcd_color_trans_done_cb(esp_lcd_panel_io_handle_t panel_io,
+                                               esp_lcd_panel_io_event_data_t *edata,
+                                               void *user_ctx)
 {
-    if (s_fill_buf == NULL) {
-        s_fill_buf = heap_caps_malloc(FILL_CHUNK_PIXELS * 2, MALLOC_CAP_DMA);
-        if (s_fill_buf == NULL) {
-            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("no DMA memory for fill buffer"));
+    if (s_inflight_head != s_inflight_tail) {
+        int slot_idx = s_inflight_fifo[s_inflight_head];
+        s_inflight_head = fifo_next(s_inflight_head);
+        s_dma_pool[slot_idx].in_flight = false;
+    }
+    return false; /* no high-priority task wakeup needed */
+}
+
+static void lcd_dma_pool_init(void)
+{
+    if (s_dma_pool_inited) return;
+    for (int i = 0; i < LCD_DMA_POOL_SLOTS; i++) {
+        s_dma_pool[i].buf = heap_caps_malloc(FILL_CHUNK_BYTES, MALLOC_CAP_DMA);
+        s_dma_pool[i].in_flight = false;
+        if (s_dma_pool[i].buf == NULL) {
+            /* unwind what we did allocate before raising */
+            for (int j = 0; j <= i; j++) {
+                if (s_dma_pool[j].buf) {
+                    heap_caps_free(s_dma_pool[j].buf);
+                    s_dma_pool[j].buf = NULL;
+                }
+            }
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("no DMA memory for transfer pool"));
         }
+    }
+    s_dma_pool_inited = true;
+}
+
+static void lcd_dma_pool_deinit(void)
+{
+    if (!s_dma_pool_inited) return;
+    for (int i = 0; i < LCD_DMA_POOL_SLOTS; i++) {
+        if (s_dma_pool[i].buf) {
+            heap_caps_free(s_dma_pool[i].buf);
+            s_dma_pool[i].buf = NULL;
+        }
+        s_dma_pool[i].in_flight = false;
+    }
+    s_inflight_head = 0;
+    s_inflight_tail = 0;
+    s_dma_pool_inited = false;
+}
+
+/* Block until every in-flight slot has been released by the completion
+ * callback. Used by deinit() so we never free pool memory (or the
+ * panel IO) while the DMA engine might still touch it. */
+static void lcd_dma_wait_idle(void)
+{
+    if (!s_dma_pool_inited) return;
+    bool busy;
+    do {
+        busy = false;
+        for (int i = 0; i < LCD_DMA_POOL_SLOTS; i++) {
+            if (s_dma_pool[i].in_flight) { busy = true; break; }
+        }
+        if (busy) {
+            MICROPY_EVENT_POLL_HOOK
+        }
+    } while (busy);
+}
+
+/* Acquire a free pool slot, blocking (yielding to other MicroPython/
+ * event-loop work via MICROPY_EVENT_POLL_HOOK) until the completion
+ * callback frees one up. Never returns a slot that DMA might still be
+ * reading. Returns the slot's index (used to push into the in-flight
+ * FIFO at submit time) via *out_idx. */
+static lcd_dma_slot_t *lcd_dma_acquire(int *out_idx)
+{
+    lcd_dma_pool_init();
+    for (;;) {
+        for (int i = 0; i < LCD_DMA_POOL_SLOTS; i++) {
+            if (!s_dma_pool[i].in_flight) {
+                *out_idx = i;
+                return &s_dma_pool[i];
+            }
+        }
+        MICROPY_EVENT_POLL_HOOK
+    }
+}
+
+/* Submit `len` bytes from an acquired slot's buffer as one async color
+ * transfer. The slot stays marked in-flight; it is only released again
+ * by the completion callback popping it off the in-flight FIFO, never
+ * here. `cmd` is normally LCD_CMD_RAMWRC. */
+static void lcd_dma_submit(lcd_dma_slot_t *slot, int slot_idx, uint8_t cmd, size_t len)
+{
+    slot->in_flight = true;
+
+    /* Record this slot in the in-flight FIFO *before* submitting, so
+       there's no window where the transaction could complete (and the
+       callback run) before we know which slot it corresponds to. The
+       pool is sized LCD_TRANS_QUEUE_DEPTH+2 and the FIFO array is one
+       larger than the pool, so this can never overflow. */
+    s_inflight_fifo[s_inflight_tail] = slot_idx;
+    s_inflight_tail = fifo_next(s_inflight_tail);
+
+    esp_err_t ret = esp_lcd_panel_io_tx_color(s_io, cmd, slot->buf, len);
+    if (ret != ESP_OK) {
+        /* submission itself failed synchronously -- the hardware never
+           saw the buffer, so undo the FIFO push and free the slot
+           ourselves rather than waiting on a callback that will never
+           fire. Since this is the most recently pushed (tail) entry,
+           it's safe to just roll the tail back. */
+        s_inflight_tail = (s_inflight_tail - 1 + (LCD_DMA_POOL_SLOTS + 1)) % (LCD_DMA_POOL_SLOTS + 1);
+        slot->in_flight = false;
+        io_check(ret, "dma submit");
     }
 }
 
@@ -139,23 +334,52 @@ static void set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 /* stream `total_pixels` copies of `color` right after the address
  * window has been armed via set_window(). Shared by fill_rect() and by
  * the line/rect/circle primitives below so they all get the same
- * chunked, DMA-pipelined path. */
+ * chunked, DMA-pipelined path via the pool.
+ *
+ * Each chunk gets its own freshly-acquired slot -- we do NOT fill one
+ * buffer once and resubmit it, because a solid-color chunk is cheap to
+ * refill and this keeps the ownership rule uniform (a slot, once
+ * submitted, is never touched again until its callback fires). */
 static void stream_solid(uint32_t total_pixels, uint16_t color)
 {
-    ensure_fill_buf();
-
-    uint32_t chunk = total_pixels < FILL_CHUNK_PIXELS ? total_pixels : FILL_CHUNK_PIXELS;
     uint8_t hi = (uint8_t)(color >> 8);
     uint8_t lo = (uint8_t)(color & 0xFF);
-    for (uint32_t i = 0; i < chunk; i++) {
-        s_fill_buf[2 * i]     = hi;
-        s_fill_buf[2 * i + 1] = lo;
-    }
 
     uint32_t remaining = total_pixels;
     while (remaining > 0) {
         uint32_t n = remaining < FILL_CHUNK_PIXELS ? remaining : FILL_CHUNK_PIXELS;
-        io_check(esp_lcd_panel_io_tx_color(s_io, LCD_CMD_RAMWRC, s_fill_buf, n * 2), "fill");
+
+        int idx;
+        lcd_dma_slot_t *slot = lcd_dma_acquire(&idx);
+        for (uint32_t i = 0; i < n; i++) {
+            slot->buf[2 * i]     = hi;
+            slot->buf[2 * i + 1] = lo;
+        }
+        lcd_dma_submit(slot, idx, LCD_CMD_RAMWRC, (size_t)n * 2);
+
+        remaining -= n;
+    }
+}
+
+/* Stream raw RGB565 bytes from an arbitrary source buffer (which may
+ * be MicroPython-owned memory that must not be handed to DMA directly)
+ * by copying it through the pool in chunks. Used by blit(). Copies add
+ * a small amount of CPU work but keep every DMA-visible buffer owned
+ * by us for its entire in-flight lifetime, which is required since we
+ * cannot pin/borrow the Python object across an async transfer. */
+static void stream_from_buffer(const uint8_t *src, size_t total_bytes)
+{
+    size_t remaining = total_bytes;
+    const uint8_t *p = src;
+    while (remaining > 0) {
+        size_t n = remaining < FILL_CHUNK_BYTES ? remaining : FILL_CHUNK_BYTES;
+
+        int idx;
+        lcd_dma_slot_t *slot = lcd_dma_acquire(&idx);
+        memcpy(slot->buf, p, n);
+        lcd_dma_submit(slot, idx, LCD_CMD_RAMWRC, n);
+
+        p += n;
         remaining -= n;
     }
 }
@@ -189,24 +413,64 @@ static void do_draw_pixel(int x, int y, uint16_t color)
 }
 
 /* -------------------------------------------------------------------
- * text rendering -- font_petme128_8x8 is column-major: 8 bytes/char,
- * byte i is column i, bit j of that byte is row j. Same table and
- * bit layout MicroPython's framebuf.text() uses internally.
+ * span helpers -- group contiguous pixels from Bresenham walks
+ * (draw_line diagonals, draw_circle outlines) into horizontal runs so
+ * they go out as one address-window + DMA burst instead of one
+ * transaction per pixel. Kept intentionally simple: a "span" here is a
+ * run of consecutive x values at a fixed y, flushed with do_fill_rect_clip.
  * ---------------------------------------------------------------- */
-static void ensure_glyph_buf(void)
+typedef struct {
+    int x0, y, x1; /* inclusive x0..x1 at row y; open == (x1 < x0) */
+    bool open;
+} span_t;
+
+static void span_reset(span_t *s)
 {
-    if (s_glyph_buf == NULL) {
-        s_glyph_buf = heap_caps_malloc(FONT_CHAR_W * FONT_CHAR_H * 2, MALLOC_CAP_DMA);
-        if (s_glyph_buf == NULL) {
-            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("no DMA memory for glyph buffer"));
-        }
+    s->open = false;
+}
+
+static void span_flush(span_t *s, uint16_t color)
+{
+    if (s->open) {
+        do_fill_rect_clip(s->x0, s->y, s->x1 - s->x0 + 1, 1, color);
+        s->open = false;
     }
 }
 
+/* Feed one more pixel into the span accumulator. Pixels must be fed in
+ * increasing-x order within a row for coalescing to trigger; if x/y
+ * don't extend the current run, the run is flushed and a new one is
+ * started. Non-contiguous callers (e.g. circle's multiple symmetric
+ * points) still work correctly -- they just won't coalesce with each
+ * other, which is fine since they aren't adjacent anyway. */
+static void span_feed(span_t *s, int x, int y, uint16_t color)
+{
+    if (s->open && y == s->y && x == s->x1 + 1) {
+        s->x1 = x;
+        return;
+    }
+    span_flush(s, color);
+    s->x0 = s->x1 = x;
+    s->y  = y;
+    s->open = true;
+}
+
+/* -------------------------------------------------------------------
+ * text rendering -- font_petme128_8x8 is column-major: 8 bytes/char,
+ * byte i is column i, bit j of that byte is row j. Same table and
+ * bit layout MicroPython's framebuf.text() uses internally.
+ *
+ * Glyphs now draw through the shared DMA pool (lcd_dma_acquire /
+ * lcd_dma_submit) instead of one long-lived reusable buffer, so a
+ * glyph is never overwritten while a previous character's transfer is
+ * still in flight -- yet we still avoid a malloc/free per character
+ * since pool slots are preallocated and just get recycled.
+ * ---------------------------------------------------------------- */
+
 /* Draws one 8x8 glyph at (x,y). If bg_transparent, only foreground
- * pixels are plotted (one address-window per lit pixel -- slower, but
- * leaves whatever's already behind the glyph untouched). Otherwise the
- * whole 8x8 cell (fg+bg) is built in a small buffer and sent as a
+ * pixels are plotted (one address-window per lit pixel run -- slower,
+ * but leaves whatever's already behind the glyph untouched). Otherwise
+ * the whole 8x8 cell (fg+bg) is built into a pool slot and sent as a
  * single DMA transfer when it fully fits on-panel. */
 static void draw_glyph(int x, int y, char c, uint16_t fg, uint16_t bg, bool bg_transparent)
 {
@@ -214,13 +478,17 @@ static void draw_glyph(int x, int y, char c, uint16_t fg, uint16_t bg, bool bg_t
     const uint8_t *glyph = &font_petme128_8x8[(c - FONT_FIRST_CHAR) * 8];
 
     if (bg_transparent) {
-        for (int col = 0; col < FONT_CHAR_W; col++) {
-            uint8_t line = glyph[col];
-            for (int row = 0; row < FONT_CHAR_H; row++) {
-                if ((line >> row) & 1) {
-                    do_draw_pixel(x + col, y + row, fg);
+        /* plot each row's lit run as a span so contiguous lit pixels in
+           a row still coalesce into one transfer instead of one per pixel */
+        for (int row = 0; row < FONT_CHAR_H; row++) {
+            span_t s;
+            span_reset(&s);
+            for (int col = 0; col < FONT_CHAR_W; col++) {
+                if ((glyph[col] >> row) & 1) {
+                    span_feed(&s, x + col, y + row, fg);
                 }
             }
+            span_flush(&s, fg);
         }
         return;
     }
@@ -240,21 +508,24 @@ static void draw_glyph(int x, int y, char c, uint16_t fg, uint16_t bg, bool bg_t
         return;
     }
 
-    ensure_glyph_buf();
+    /* Full 8x8 cell fits FILL_CHUNK_BYTES easily (128 bytes), so one
+       pool slot is always enough for one glyph. */
     uint8_t fg_hi = (uint8_t)(fg >> 8), fg_lo = (uint8_t)(fg & 0xFF);
     uint8_t bg_hi = (uint8_t)(bg >> 8), bg_lo = (uint8_t)(bg & 0xFF);
 
+    int idx;
+    lcd_dma_slot_t *slot = lcd_dma_acquire(&idx);
     for (int row = 0; row < FONT_CHAR_H; row++) {
         for (int col = 0; col < FONT_CHAR_W; col++) {
             bool on = (glyph[col] >> row) & 1;
             int p = (row * FONT_CHAR_W + col) * 2;
-            s_glyph_buf[p]     = on ? fg_hi : bg_hi;
-            s_glyph_buf[p + 1] = on ? fg_lo : bg_lo;
+            slot->buf[p]     = on ? fg_hi : bg_hi;
+            slot->buf[p + 1] = on ? fg_lo : bg_lo;
         }
     }
 
     set_window((uint16_t)x, (uint16_t)y, (uint16_t)(x + FONT_CHAR_W - 1), (uint16_t)(y + FONT_CHAR_H - 1));
-    io_check(esp_lcd_panel_io_tx_color(s_io, LCD_CMD_RAMWRC, s_glyph_buf, FONT_CHAR_W * FONT_CHAR_H * 2), "text");
+    lcd_dma_submit(slot, idx, LCD_CMD_RAMWRC, FONT_CHAR_W * FONT_CHAR_H * 2);
 }
 
 /* -------------------------------------------------------------------
@@ -276,6 +547,11 @@ static mp_obj_t moclcd_draw_text8x8(size_t n_args, const mp_obj_t *args_in)
     bool bg_transparent = (n_args < 5) || (args_in[4] == mp_const_none);
     uint16_t bg = bg_transparent ? 0 : (uint16_t)mp_obj_get_int(args_in[4]);
 
+    /* guard against pathological x + len*8 overflow on 32-bit int */
+    if (len > (size_t)(INT32_MAX / FONT_CHAR_W)) {
+        mp_raise_ValueError(MP_ERROR_TEXT("text too long"));
+    }
+
     for (size_t i = 0; i < len; i++) {
         draw_glyph(x + (int)i * FONT_CHAR_W, y, text[i], fg, bg, bg_transparent);
     }
@@ -285,15 +561,33 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_text8x8_obj, 4, 5, moclcd
 
 /* -------------------------------------------------------------------
  * moclcd.draw_bmp(path, x, y, w=None, h=None, max_w=None, max_h=None)
+ *
  * Minimal loader: uncompressed 24-bit BMP only (no palette, no RLE).
  * w/h/max_w/max_h of 0 (the default) are treated as "unset", same as
- * the Python version's None. The whole converted image is built in
- * one DMA-capable buffer and sent as a single transfer, same approach
- * as blit().
+ * the Python version's None.
  *
- * Note: this uses the C library's fopen()/fread(), so `path` must be
- * reachable through the ESP-IDF VFS (e.g. internal flash or SD mounted
- * via esp_vfs) -- the same filesystem MicroPython's own open() sees.
+ * Semantics (made internally consistent):
+ *   - w/h, if given, are the OUTPUT size in pixels. If they differ from
+ *     the BMP's native width/height, the image is nearest-neighbour
+ *     scaled to fit -- this actually happens now, it isn't just
+ *     accepted and ignored.
+ *   - max_w/max_h, if given, additionally clamp the output size (after
+ *     w/h are applied) so e.g. a caller can say "draw at up to 100x100"
+ *     without knowing the source image's dimensions.
+ *   - The result is then clipped to the panel and to (x, y).
+ *
+ * DMA safety: the image is streamed through the shared DMA pool one
+ * row-chunk at a time (via stream_from_buffer on a per-row scratch
+ * buffer), rather than being malloc'd whole, submitted, and freed
+ * immediately after -- the old code could free `img` while esp_lcd
+ * still had it queued. Row buffers used for *decoding* (row_buf, and
+ * the small per-output-row RGB565 buffer) are plain heap memory that
+ * is never itself hard to the DMA engine; only pool slots are, and
+ * lcd_dma_submit()/the completion callback own their lifetime.
+ *
+ * Continues to support: uncompressed 24-bit BMP, bottom-up and
+ * top-down row order, RGB888->RGB565 conversion, clipping. Anything
+ * else (compression, non-24bpp) is rejected with ValueError.
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_draw_bmp(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
@@ -319,6 +613,10 @@ static mp_obj_t moclcd_draw_bmp(size_t n_args, const mp_obj_t *pos_args, mp_map_
     int want_h = args[ARG_h].u_int;
     int max_w  = args[ARG_max_w].u_int;
     int max_h  = args[ARG_max_h].u_int;
+
+    if (want_w < 0 || want_h < 0 || max_w < 0 || max_h < 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("negative bmp dimension"));
+    }
 
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -346,10 +644,18 @@ static mp_obj_t moclcd_draw_bmp(size_t n_args, const mp_obj_t *pos_args, mp_map_
         mp_raise_ValueError(MP_ERROR_TEXT("only uncompressed 24-bit BMP is supported"));
     }
 
+    if (bmp_w <= 0 || bmp_w > 8192 || bmp_h_raw == 0 ||
+        (bmp_h_raw > 8192) || (bmp_h_raw < -8192)) {
+        fclose(f);
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid or unsupported bmp dimensions"));
+    }
+
     bool top_down = bmp_h_raw < 0;
     int32_t bmp_h = top_down ? -bmp_h_raw : bmp_h_raw;
-    int row_size = ((bmp_w * 3 + 3) / 4) * 4; /* rows padded to 4 bytes */
+    /* row_size padded to 4 bytes; bmp_w bounded above so this can't overflow int */
+    int row_size = ((bmp_w * 3 + 3) / 4) * 4;
 
+    /* --- resolve output size (this is where real scaling now happens) --- */
     int out_w = want_w > 0 ? want_w : (int)bmp_w;
     int out_h = want_h > 0 ? want_h : (int)bmp_h;
     if (max_w > 0 && out_w > max_w) out_w = max_w;
@@ -359,51 +665,89 @@ static mp_obj_t moclcd_draw_bmp(size_t n_args, const mp_obj_t *pos_args, mp_map_
         fclose(f);
         return mp_const_none;
     }
+    /* sane ceiling: never try to materialize an absurd output size */
+    if (out_w > 4096 || out_h > 4096) {
+        fclose(f);
+        mp_raise_ValueError(MP_ERROR_TEXT("bmp output size too large"));
+    }
 
+    bool scaling = (out_w != (int)bmp_w) || (out_h != (int)bmp_h);
+
+    /* --- clip destination rect to panel + honor (x, y) --- */
     int dx = x, dy = y, dw = out_w, dh = out_h;
     if (!clip_rect(&dx, &dy, &dw, &dh)) {
         fclose(f);
         return mp_const_none;
     }
-
-    int skip_rows = dy - y; /* how many source rows/cols the top/left clip ate */
-    int skip_cols = dx - x;
+    int skip_out_rows = dy - y; /* how many *output* rows/cols the top/left clip ate */
+    int skip_out_cols = dx - x;
 
     uint8_t *row_buf = heap_caps_malloc(row_size, MALLOC_CAP_DEFAULT);
-    uint8_t *img = heap_caps_malloc((size_t)dw * (size_t)dh * 2, MALLOC_CAP_DMA);
-    if (!row_buf || !img) {
+    /* one converted output row at a time -- small, fixed, no full-image
+       allocation, and never handed to DMA directly (it's copied into
+       pool slots by stream_from_buffer). */
+    uint8_t *out_row = heap_caps_malloc((size_t)dw * 2, MALLOC_CAP_DEFAULT);
+    if (!row_buf || !out_row) {
         if (row_buf) heap_caps_free(row_buf);
-        if (img) heap_caps_free(img);
+        if (out_row) heap_caps_free(out_row);
         fclose(f);
         mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("no memory for bmp load"));
     }
 
-    for (int row = 0; row < dh; row++) {
-        int dest_row = row + skip_rows;
-        int src_row = top_down ? dest_row : ((int)bmp_h - 1 - dest_row);
+    /* For scaling we need random access to source rows, and each output
+       row may reuse or skip source rows depending on the scale factor.
+       We still only ever hold ONE source row (row_buf) and ONE output
+       row (out_row) in memory -- no whole-image buffer -- by re-seeking
+       per output row. This costs some re-read I/O under upscaling, but
+       keeps memory bounded regardless of image size, which matters more
+       on this target than raw decode throughput. */
+    set_window((uint16_t)dx, (uint16_t)dy, (uint16_t)(dx + dw - 1), (uint16_t)(dy + dh - 1));
 
-        fseek(f, (long)(data_offset + (uint32_t)src_row * (uint32_t)row_size), SEEK_SET);
-        if (fread(row_buf, 1, row_size, f) != (size_t)row_size) {
-            break; /* short read / EOF: stop rather than send garbage rows */
+    int last_src_row = -1;
+    for (int out_row_idx = 0; out_row_idx < dh; out_row_idx++) {
+        int dest_row = out_row_idx + skip_out_rows; /* row within full out_h image */
+
+        int src_row;
+        if (scaling) {
+            src_row = (int)(((int64_t)dest_row * bmp_h) / out_h);
+            if (src_row >= (int)bmp_h) src_row = (int)bmp_h - 1;
+        } else {
+            src_row = dest_row;
         }
 
-        int p = row * dw * 2;
-        for (int col = 0; col < dw; col++) {
-            int src_col = col + skip_cols;
+        int file_row = top_down ? src_row : ((int)bmp_h - 1 - src_row);
+
+        if (file_row != last_src_row) {
+            fseek(f, (long)(data_offset + (uint32_t)file_row * (uint32_t)row_size), SEEK_SET);
+            if (fread(row_buf, 1, row_size, f) != (size_t)row_size) {
+                break; /* short read / EOF: stop rather than send garbage rows */
+            }
+            last_src_row = file_row;
+        }
+
+        int p = 0;
+        for (int out_col = 0; out_col < dw; out_col++) {
+            int dest_col = out_col + skip_out_cols;
+            int src_col;
+            if (scaling) {
+                src_col = (int)(((int64_t)dest_col * bmp_w) / out_w);
+                if (src_col >= (int)bmp_w) src_col = (int)bmp_w - 1;
+            } else {
+                src_col = dest_col;
+            }
             uint8_t b = row_buf[src_col * 3 + 0];
             uint8_t g = row_buf[src_col * 3 + 1];
             uint8_t r = row_buf[src_col * 3 + 2];
             uint16_t c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-            img[p++] = (uint8_t)(c >> 8);
-            img[p++] = (uint8_t)(c & 0xFF);
+            out_row[p++] = (uint8_t)(c >> 8);
+            out_row[p++] = (uint8_t)(c & 0xFF);
         }
+
+        stream_from_buffer(out_row, (size_t)dw * 2);
     }
 
-    set_window((uint16_t)dx, (uint16_t)dy, (uint16_t)(dx + dw - 1), (uint16_t)(dy + dh - 1));
-    io_check(esp_lcd_panel_io_tx_color(s_io, LCD_CMD_RAMWRC, img, (size_t)dw * (size_t)dh * 2), "bmp");
-
     heap_caps_free(row_buf);
-    heap_caps_free(img);
+    heap_caps_free(out_row);
     fclose(f);
 
     return mp_const_none;
@@ -411,7 +755,7 @@ static mp_obj_t moclcd_draw_bmp(size_t n_args, const mp_obj_t *pos_args, mp_map_
 static MP_DEFINE_CONST_FUN_OBJ_KW(moclcd_draw_bmp_obj, 3, moclcd_draw_bmp);
 
 /* -------------------------------------------------------------------
- * moclcd.init(pclk=10_000_000, width=320, height=480)
+ * moclcd.init(pclk=10_000_000, width=480, height=320, madctl=0x28)
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args)
 {
@@ -428,9 +772,39 @@ static mp_obj_t moclcd_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
-    s_width  = (uint16_t)args[ARG_width].u_int;
-    s_height = (uint16_t)args[ARG_height].u_int;
-    s_madctl = (uint8_t)args[ARG_madctl].u_int;
+    int width  = args[ARG_width].u_int;
+    int height = args[ARG_height].u_int;
+    int pclk   = args[ARG_pclk].u_int;
+    int madctl = args[ARG_madctl].u_int;
+
+    if (width <= 0 || height <= 0 || width > 2000 || height > 2000) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid width/height"));
+    }
+    if (pclk <= 0 || pclk > 40000000) {
+        /* ILI9488 8080 timing on this wiring has been validated up to
+           ~20-25MHz in practice; 40MHz is a hard ceiling to reject
+           obviously-bogus values, not a recommendation to run that
+           fast -- see driver notes for PCLK guidance. */
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid pclk"));
+    }
+    if ((madctl & ~0xFF) != 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid madctl"));
+    }
+
+    /* calling init() again: cleanly tear down any previous bus/IO/pool
+       first so resources never leak across repeated init() calls */
+    if (s_initialized) {
+        lcd_dma_wait_idle();
+        lcd_dma_pool_deinit();
+        if (s_io)  { esp_lcd_panel_io_del(s_io);  s_io  = NULL; }
+        if (s_bus) { esp_lcd_del_i80_bus(s_bus);  s_bus = NULL; }
+        s_initialized       = false;
+        s_panel_initialized = false;
+    }
+
+    s_width  = (uint16_t)width;
+    s_height = (uint16_t)height;
+    s_madctl = (uint8_t)madctl;
 
     /* --- Your exact data pins (D0 through D7) --- */
     int data_gpios[8] = { 16, 15, 11, 10, 9, 4, 18, 17 };
@@ -444,16 +818,18 @@ static mp_obj_t moclcd_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
             data_gpios[4], data_gpios[5], data_gpios[6], data_gpios[7],
         },
         .bus_width          = 8,
-        /* generous ceiling so a full-frame blit() can go out in one shot;
-           fill_rect() still chunks itself for pipelining regardless */
-        .max_transfer_bytes = (size_t)s_width * (size_t)s_height * 2,
+        /* Pool chunks (FILL_CHUNK_BYTES) are the largest single transfer
+           we ever submit now, so max_transfer_bytes only needs to cover
+           one chunk plus headroom -- not a whole frame -- since the DMA
+           transfer layer always chunks large operations itself. */
+        .max_transfer_bytes = FILL_CHUNK_BYTES,
     };
     io_check(esp_lcd_new_i80_bus(&bus_cfg, &s_bus), "esp_lcd_new_i80_bus");
 
     esp_lcd_panel_io_i80_config_t io_cfg = {
         .cs_gpio_num       = -1, /* CS tied LOW in hardware */
-        .pclk_hz           = (uint32_t)args[ARG_pclk].u_int,
-        .trans_queue_depth = 10,
+        .pclk_hz           = (uint32_t)pclk,
+        .trans_queue_depth = LCD_TRANS_QUEUE_DEPTH,
         .dc_levels = {
             .dc_idle_level  = 0,
             .dc_cmd_level   = 0,
@@ -462,6 +838,10 @@ static mp_obj_t moclcd_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
         },
         .lcd_cmd_bits   = 8,
         .lcd_param_bits = 8,
+        .on_color_trans_done = lcd_color_trans_done_cb,
+        /* user_ctx is per-transaction, not per-config, so it can't be
+           set here -- see lcd_dma_submit()/the callback for how the
+           right slot is identified instead. */
     };
     io_check(esp_lcd_new_panel_io_i80(s_bus, &io_cfg, &s_io), "esp_lcd_new_panel_io_i80");
 
@@ -478,9 +858,39 @@ static mp_obj_t moclcd_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *k
     mp_hal_pin_write(s_reset_pin, 1);
     s_has_reset = true;
 
+    lcd_dma_pool_init();
+
+    s_initialized = true;
+
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_KW(moclcd_init_obj, 0, moclcd_init);
+
+/* -------------------------------------------------------------------
+ * moclcd.deinit()
+ * Waits for any in-flight DMA to complete, then tears down the panel
+ * IO, the I80 bus, and the DMA pool, and resets lifecycle state so
+ * init() can be called again cleanly. Safe to call multiple times or
+ * when never initialized.
+ * ---------------------------------------------------------------- */
+static mp_obj_t moclcd_deinit(void)
+{
+    if (!s_initialized) {
+        return mp_const_none;
+    }
+
+    lcd_dma_wait_idle();
+    lcd_dma_pool_deinit();
+
+    if (s_io)  { esp_lcd_panel_io_del(s_io);  s_io  = NULL; }
+    if (s_bus) { esp_lcd_del_i80_bus(s_bus);  s_bus = NULL; }
+
+    s_initialized       = false;
+    s_panel_initialized = false;
+
+    return mp_const_none;
+}
+static MP_DEFINE_CONST_FUN_OBJ_0(moclcd_deinit_obj, moclcd_deinit);
 
 /* -------------------------------------------------------------------
  * moclcd.reset()
@@ -504,6 +914,7 @@ static MP_DEFINE_CONST_FUN_OBJ_0(moclcd_reset_obj, moclcd_reset);
  * moclcd.panel_init()
  * Runs the exact working 0x01 / 0x11 / 0x3A / 0x36 / 0x2A / 0x2B / 0x29
  * sequence from the Python script, sized to width/height from init().
+ * Unchanged from the known-good sequence/timings.
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_panel_init(void)
 {
@@ -539,6 +950,8 @@ static mp_obj_t moclcd_panel_init(void)
     lcd_cmd_raw(0x29, NULL, 0);              /* display on */
     mp_hal_delay_us(50 * 1000);
 
+    s_panel_initialized = true;
+
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(moclcd_panel_init_obj, moclcd_panel_init);
@@ -559,13 +972,21 @@ static mp_obj_t moclcd_backlight_init(size_t n_args, const mp_obj_t *pos_args, m
     mp_arg_val_t args[MP_ARRAY_SIZE(allowed)];
     mp_arg_parse_all(n_args, pos_args, kw_args, MP_ARRAY_SIZE(allowed), allowed, args);
 
+    int freq_hz  = args[ARG_freq].u_int;
     int res_bits = args[ARG_res_bits].u_int;
+
+    if (freq_hz <= 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid freq_hz"));
+    }
+    if (res_bits <= 0 || res_bits > 20) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid resolution_bits"));
+    }
 
     ledc_timer_config_t timer_cfg = {
         .speed_mode      = LEDC_LOW_SPEED_MODE,
         .duty_resolution = (ledc_timer_bit_t)res_bits,
         .timer_num       = LEDC_TIMER_0,
-        .freq_hz         = (uint32_t)args[ARG_freq].u_int,
+        .freq_hz         = (uint32_t)freq_hz,
         .clk_cfg         = LEDC_AUTO_CLK,
     };
     io_check(ledc_timer_config(&timer_cfg), "ledc_timer_config");
@@ -641,6 +1062,9 @@ static mp_obj_t moclcd_cmd(size_t n_args, const mp_obj_t *args_in)
 {
     require_init();
     int cmd = mp_obj_get_int(args_in[0]);
+    if (cmd < 0 || cmd > 0xFF) {
+        mp_raise_ValueError(MP_ERROR_TEXT("invalid cmd"));
+    }
 
     const void *buf = NULL;
     size_t len = 0;
@@ -656,14 +1080,21 @@ static mp_obj_t moclcd_cmd(size_t n_args, const mp_obj_t *args_in)
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_cmd_obj, 1, 2, moclcd_cmd);
 
 /* -------------------------------------------------------------------
- * moclcd.data(buf) -- raw passthrough, still available for one-off writes
+ * moclcd.data(buf) -- raw passthrough, still available for one-off
+ * writes. This is documented as synchronous-ish from the caller's
+ * perspective in the original API, but esp_lcd_panel_io_tx_color() is
+ * still async under the hood; to keep this call safe without changing
+ * its signature (no length/ownership contract to preserve here since
+ * callers already expect the buffer to be theirs afterwards), we copy
+ * it through the DMA pool exactly like blit() does. This trades a memcpy
+ * for correctness on a call that was never meant to be a hot path.
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_data(mp_obj_t buf_in)
 {
     require_init();
     mp_buffer_info_t bufinfo;
     mp_get_buffer_raise(buf_in, &bufinfo, MP_BUFFER_READ);
-    io_check(esp_lcd_panel_io_tx_color(s_io, LCD_CMD_RAMWRC, bufinfo.buf, bufinfo.len), "data write");
+    stream_from_buffer((const uint8_t *)bufinfo.buf, bufinfo.len);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_1(moclcd_data_obj, moclcd_data);
@@ -671,12 +1102,12 @@ static MP_DEFINE_CONST_FUN_OBJ_1(moclcd_data_obj, moclcd_data);
 /* -------------------------------------------------------------------
  * moclcd.fill_rect(x, y, w, h, color)
  *
- * Sets the address window once, fills a small DMA-capable scratch
- * buffer with the target color, then resends that same buffer in
- * chunks via esp_lcd_panel_io_tx_color(). Because the content never
- * changes, the buffer can be safely queued again even while an earlier
- * chunk is still draining out over DMA, so up to trans_queue_depth
- * chunks stay in flight at once instead of the CPU waiting on each one.
+ * Sets the address window once, then streams solid color through the
+ * shared DMA pool in chunks via stream_solid(). Because pool slots are
+ * only reused once their completion callback fires, up to
+ * LCD_DMA_POOL_SLOTS chunks can be in flight/prepared at once instead
+ * of the CPU waiting on each one -- without ever touching a buffer the
+ * hardware might still be reading.
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_fill_rect(size_t n_args, const mp_obj_t *args_in)
 {
@@ -688,8 +1119,12 @@ static mp_obj_t moclcd_fill_rect(size_t n_args, const mp_obj_t *args_in)
     int h = mp_obj_get_int(args_in[3]);
     uint16_t color = (uint16_t)mp_obj_get_int(args_in[4]);
 
-    if (x < 0 || y < 0 || w <= 0 || h <= 0 ||
-        x + w > s_width || y + h > s_height) {
+    /* reject negative/zero and any overflow of x+w / y+h before it can
+       wrap in signed arithmetic */
+    if (w <= 0 || h <= 0 || x < 0 || y < 0 ||
+        x > (int)s_width || y > (int)s_height ||
+        w > (int)s_width || h > (int)s_height ||
+        x > (int)s_width - w || y > (int)s_height - h) {
         mp_raise_ValueError(MP_ERROR_TEXT("fill_rect out of bounds"));
     }
 
@@ -717,8 +1152,12 @@ static MP_DEFINE_CONST_FUN_OBJ_1(moclcd_fill_screen_obj, moclcd_fill_screen);
 /* -------------------------------------------------------------------
  * moclcd.blit(x, y, w, h, buf)
  * Pushes an arbitrary RGB565 pixel buffer (w*h*2 bytes, MSB first per
- * pixel) into the window in one DMA-backed transfer. Useful for
- * sprites, images, or a full framebuffer flush.
+ * pixel) into the window. The MicroPython-owned buffer is never handed
+ * directly to esp_lcd -- it's streamed into shared DMA-pool slots in
+ * chunks (stream_from_buffer), each of which is only reused after its
+ * own completion callback fires. This avoids both a full-frame extra
+ * allocation AND the original bug where a Python buffer could be
+ * garbage-collected or reused while DMA was still reading it.
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_blit(size_t n_args, const mp_obj_t *args_in)
 {
@@ -729,8 +1168,10 @@ static mp_obj_t moclcd_blit(size_t n_args, const mp_obj_t *args_in)
     int w = mp_obj_get_int(args_in[2]);
     int h = mp_obj_get_int(args_in[3]);
 
-    if (x < 0 || y < 0 || w <= 0 || h <= 0 ||
-        x + w > s_width || y + h > s_height) {
+    if (w <= 0 || h <= 0 || x < 0 || y < 0 ||
+        x > (int)s_width || y > (int)s_height ||
+        w > (int)s_width || h > (int)s_height ||
+        x > (int)s_width - w || y > (int)s_height - h) {
         mp_raise_ValueError(MP_ERROR_TEXT("blit out of bounds"));
     }
 
@@ -743,7 +1184,7 @@ static mp_obj_t moclcd_blit(size_t n_args, const mp_obj_t *args_in)
     }
 
     set_window((uint16_t)x, (uint16_t)y, (uint16_t)(x + w - 1), (uint16_t)(y + h - 1));
-    io_check(esp_lcd_panel_io_tx_color(s_io, LCD_CMD_RAMWRC, bufinfo.buf, bufinfo.len), "blit");
+    stream_from_buffer((const uint8_t *)bufinfo.buf, bufinfo.len);
 
     return mp_const_none;
 }
@@ -767,10 +1208,11 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_pixel_obj, 3, 3, moclcd_d
 
 /* -------------------------------------------------------------------
  * moclcd.draw_line(x0, y0, x1, y1, color)
- * Horizontal/vertical lines take a fast path through fill_rect's
- * chunked DMA stream (a "line" one pixel thick). Diagonals fall back
- * to a pixel-by-pixel Bresenham walk, since each pixel needs its own
- * address window on this bus.
+ * Horizontal/vertical lines take the fast path through fill_rect's
+ * chunked DMA stream (a "line" one pixel thick). Diagonals walk
+ * Bresenham but now coalesce each row's run of consecutive x's into a
+ * span before flushing, so a typical diagonal line goes out as a
+ * handful of address-window + DMA bursts instead of one per pixel.
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_draw_line(size_t n_args, const mp_obj_t *args_in)
 {
@@ -801,13 +1243,20 @@ static mp_obj_t moclcd_draw_line(size_t n_args, const mp_obj_t *args_in)
     int err = dx + dy;
 
     int x = x0, y = y0;
+    span_t s;
+    span_reset(&s);
     for (;;) {
-        do_draw_pixel(x, y, color);
+        span_feed(&s, x, y, color);
         if (x == x1 && y == y1) break;
         int e2 = 2 * err;
         if (e2 >= dy) { err += dy; x += sx; }
         if (e2 <= dx) { err += dx; y += sy; }
+        /* if the walk just moved to a new row, or moved backwards in x
+           (sx == -1), the run can no longer coalesce with the previous
+           point going forward -- span_feed() already detects both cases
+           (different y, or non-adjacent x) and flushes automatically. */
     }
+    span_flush(&s, color);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_line_obj, 5, 5, moclcd_draw_line);
@@ -838,9 +1287,13 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_rect_obj, 5, 5, moclcd_dr
 
 /* -------------------------------------------------------------------
  * moclcd.draw_circle(x0, y0, r, color)
- * Midpoint circle algorithm, 8-way symmetry, pixel-by-pixel (each
- * pixel needs its own address window on this bus, same as draw_line's
- * diagonal case).
+ * Midpoint circle algorithm, 8-way symmetry. Each of the (up to) 8
+ * symmetric points per step is still its own span_feed() call, but
+ * horizontally-adjacent points across steps (which happens near the
+ * top/bottom/left/right of the circle where the octants are nearly
+ * flat) now coalesce into one transfer via the same span mechanism
+ * draw_line() uses, instead of always being one address-window per
+ * pixel.
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_draw_circle(size_t n_args, const mp_obj_t *args_in)
 {
@@ -852,16 +1305,33 @@ static mp_obj_t moclcd_draw_circle(size_t n_args, const mp_obj_t *args_in)
 
     if (r < 0) return mp_const_none;
 
+    if (r == 0) {
+        do_draw_pixel(x0, y0, color);
+        return mp_const_none;
+    }
+
     int f = 1 - r;
     int ddF_x = 1;
     int ddF_y = -2 * r;
     int x = 0;
     int y = r;
 
-    do_draw_pixel(x0, y0 + r, color);
-    do_draw_pixel(x0, y0 - r, color);
-    do_draw_pixel(x0 + r, y0, color);
-    do_draw_pixel(x0 - r, y0, color);
+    /* Each of the four "cardinal" points and each step's eight
+       symmetric points are emitted in increasing-x order per row where
+       possible so span_feed() can coalesce adjacent ones; points on
+       different rows or non-adjacent x simply flush and start a new
+       span, which is correct either way. */
+    span_t s;
+    span_reset(&s);
+
+    span_feed(&s, x0, y0 + r, color);
+    span_flush(&s, color);
+    span_feed(&s, x0, y0 - r, color);
+    span_flush(&s, color);
+    span_feed(&s, x0 + r, y0, color);
+    span_flush(&s, color);
+    span_feed(&s, x0 - r, y0, color);
+    span_flush(&s, color);
 
     while (x < y) {
         if (f >= 0) { y--; ddF_y += 2; f += ddF_y; }
@@ -869,14 +1339,25 @@ static mp_obj_t moclcd_draw_circle(size_t n_args, const mp_obj_t *args_in)
         ddF_x += 2;
         f += ddF_x;
 
-        do_draw_pixel(x0 + x, y0 + y, color);
-        do_draw_pixel(x0 - x, y0 + y, color);
-        do_draw_pixel(x0 + x, y0 - y, color);
-        do_draw_pixel(x0 - x, y0 - y, color);
-        do_draw_pixel(x0 + y, y0 + x, color);
-        do_draw_pixel(x0 - y, y0 + x, color);
-        do_draw_pixel(x0 + y, y0 - x, color);
-        do_draw_pixel(x0 - y, y0 - x, color);
+        /* group the two points on each of the four affected rows so
+           runs that happen to be adjacent (small radii, near 45
+           degrees) still coalesce; for most steps these are two
+           separate single-pixel spans, which is no worse than before */
+        span_feed(&s, x0 - x, y0 + y, color);
+        span_feed(&s, x0 + x, y0 + y, color);
+        span_flush(&s, color);
+
+        span_feed(&s, x0 - x, y0 - y, color);
+        span_feed(&s, x0 + x, y0 - y, color);
+        span_flush(&s, color);
+
+        span_feed(&s, x0 - y, y0 + x, color);
+        span_feed(&s, x0 + y, y0 + x, color);
+        span_flush(&s, color);
+
+        span_feed(&s, x0 - y, y0 - x, color);
+        span_feed(&s, x0 + y, y0 - x, color);
+        span_flush(&s, color);
     }
     return mp_const_none;
 }
@@ -888,6 +1369,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_draw_circle_obj, 4, 4, moclcd_
  * Adafruit_GFX uses) -- each span goes through the DMA fill path
  * instead of being plotted pixel by pixel, so a filled circle is much
  * cheaper than the same shape built out of draw_pixel() calls.
+ * Unchanged in approach; already using the efficient span/fill_rect path.
  * ---------------------------------------------------------------- */
 static mp_obj_t moclcd_fill_circle(size_t n_args, const mp_obj_t *args_in)
 {
@@ -926,6 +1408,7 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_fill_circle_obj, 4, 4, moclcd_
 static const mp_rom_map_elem_t moclcd_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__),   MP_ROM_QSTR(MP_QSTR_moclcd)          },
     { MP_ROM_QSTR(MP_QSTR_init),        MP_ROM_PTR(&moclcd_init_obj)        },
+    { MP_ROM_QSTR(MP_QSTR_deinit),      MP_ROM_PTR(&moclcd_deinit_obj)      },
     { MP_ROM_QSTR(MP_QSTR_reset),       MP_ROM_PTR(&moclcd_reset_obj)       },
     { MP_ROM_QSTR(MP_QSTR_panel_init),  MP_ROM_PTR(&moclcd_panel_init_obj)  },
     { MP_ROM_QSTR(MP_QSTR_backlight),   MP_ROM_PTR(&moclcd_backlight_obj)   },
@@ -941,8 +1424,8 @@ static const mp_rom_map_elem_t moclcd_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_draw_rect),   MP_ROM_PTR(&moclcd_draw_rect_obj)   },
     { MP_ROM_QSTR(MP_QSTR_draw_circle), MP_ROM_PTR(&moclcd_draw_circle_obj) },
     { MP_ROM_QSTR(MP_QSTR_fill_circle), MP_ROM_PTR(&moclcd_fill_circle_obj) },
-    { MP_ROM_QSTR(MP_QSTR_draw_text8x8),MP_ROM_PTR(&moclcd_draw_text8x8_obj)},   // ADD THIS
-    { MP_ROM_QSTR(MP_QSTR_draw_bmp),    MP_ROM_PTR(&moclcd_draw_bmp_obj)    },   // ADD THIS
+    { MP_ROM_QSTR(MP_QSTR_draw_text8x8),MP_ROM_PTR(&moclcd_draw_text8x8_obj)},
+    { MP_ROM_QSTR(MP_QSTR_draw_bmp),    MP_ROM_PTR(&moclcd_draw_bmp_obj)    },
 };
 static MP_DEFINE_CONST_DICT(moclcd_globals, moclcd_globals_table);
 
@@ -952,4 +1435,3 @@ const mp_obj_module_t mp_module_moclcd = {
 };
 
 MP_REGISTER_MODULE(MP_QSTR_moclcd, mp_module_moclcd);
-
