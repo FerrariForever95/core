@@ -426,6 +426,7 @@ typedef struct {
 
 static void span_reset(span_t *s)
 {
+    s->x0 = s->y = s->x1 = 0;
     s->open = false;
 }
 
