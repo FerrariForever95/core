@@ -90,7 +90,7 @@ def enable_dimming(freq_hz=5000, resolution_bits=8):
     _dimmable = True
 
 
-def init_display(pclk=15_000_000, width=480, height=320, madctl=0x28, dimmable=False):
+def init_display(pclk=10_000_000, width=480, height=320, madctl=0x28, dimmable=False):
     """Bring up the panel in landscape by default and sync WIDTH/HEIGHT.
     Pass width=320, height=480, madctl=0x48 for portrait instead.
 
