@@ -1,20 +1,18 @@
 """
-zenobench_bars_only.py — Extreme 240 MHz Silicon Engine with Pure Progress Bars.
+zenobench_bubbles.py — 240 MHz Silicon Stress Engine with Bubble/Loading Bars.
 
-Design:
-  - Zero line-graphs to guarantee 100% boundary safety and zero render freeze
-  - Bar 1: Total Operations Milestone Progress (0 -> 100 Million Operations)
-  - Bar 2: 120 KB GC Memory Spool Buffer (0 -> 120 KB sweep cycle)
+Zero line-drawing or coordinate-math to prevent out-of-bounds freezing:
+  - 10-Cell Pulsing Bubble Activity Loader (chasing animated dot array)
+  - Bar 1: Million Operations Sweep Progress Bar (0 -> 100M Ops)
+  - Bar 2: 120 KB GC Memory Spool Buffer (0 -> 120 KB clean cycle)
   - Bar 3: Total Board RAM / PSRAM Utilization
   - Full unabbreviated unit text:
       * "Billion Operations Per Second" (>= 1.0 BOPS)
       * "Million Operations Per Second" (>= 1.0 MOPS)
       * "Thousand Operations Per Second" (< 1.0 MOPS)
-  - Rotating hardware thrash radar spinner
 """
 
 import gc
-import math
 import time
 import machine
 import moclcd
@@ -42,7 +40,7 @@ def format_ops_components(kops_val):
     return val_str, unit_str
 
 
-def run_pure_bars_stress():
+def run_bubble_bars_stress():
     # 1. Lock CPU Clock to 240 MHz
     machine.freq(240_000_000)
 
@@ -64,7 +62,7 @@ def run_pure_bars_stress():
     # -------------------------------------------------------------------------
     center_x = Graphics.WIDTH // 2
     banner_y = 12
-    rate_val_y = 38
+    rate_val_y = 36
     unit_text_y = 74
 
     bar_x = 36
@@ -72,29 +70,37 @@ def run_pure_bars_stress():
     bar_h = 8
 
     # Bar 1: Total Operations Milestone (0 -> 100 Million Ops)
-    label1_y = 104
-    bar1_y = 118
+    label1_y = 98
+    bar1_y = 112
 
     # Bar 2: 120 KB Memory Spool Buffer
-    label2_y = 146
-    bar2_y = 160
+    label2_y = 138
+    bar2_y = 152
 
     # Bar 3: Total Board RAM (PSRAM Pool)
-    label3_y = 188
-    bar3_y = 202
+    label3_y = 178
+    bar3_y = 192
 
-    # Bottom Radar Center
-    radar_cx = center_x
-    radar_cy = 260
-    radar_r = 18
+    # Bubble Array Geometry
+    bubble_count = 10
+    bubble_spacing = 34
+    bubble_start_x = center_x - ((bubble_count - 1) * bubble_spacing) // 2
+    bubble_y = 250
+    bubble_label_y = 226
 
-    # Static elements
+    # Draw static screen chrome
     Graphics.draw_text_centered(center_x, banner_y, "240 MHz EXTREME SILICON STRESS ENGINE", Graphics.RED, Graphics.BLACK, scale=1)
 
-    # Static bar background tracks
+    # Draw static bar background tracks
     Graphics.draw_rounded_rect(bar_x, bar1_y, bar_w, bar_h, 3, Graphics.SURFACE_ALT)
     Graphics.draw_rounded_rect(bar_x, bar2_y, bar_w, bar_h, 3, Graphics.SURFACE_ALT)
     Graphics.draw_rounded_rect(bar_x, bar3_y, bar_w, bar_h, 3, Graphics.SURFACE_ALT)
+
+    # Draw static bubble loader background track
+    Graphics.draw_text_centered(center_x, bubble_label_y, "HARDWARE SILICON PIPELINE", Graphics.TEXT_MUTED, Graphics.BLACK, scale=1)
+    for i in range(bubble_count):
+        bx = bubble_start_x + (i * bubble_spacing)
+        Graphics.draw_circle(bx, bubble_y, 7, Graphics.DARK_GRAY)
 
     # Pre-allocated memory thrash table (32 KB active sliding window)
     thrash_buffer = bytearray(32768)
@@ -104,7 +110,7 @@ def run_pure_bars_stress():
     memory_pages = []
     total_ops_completed = 0
     peak_kops = 0.0
-    rot_angle = 0.0
+    active_bubble_idx = 0
 
     last_fill1_w = -1
     last_fill2_w = -1
@@ -114,9 +120,8 @@ def run_pure_bars_stress():
     fill_rect_fn = Graphics.fill_rect
     draw_text_fn = Graphics.draw_text_centered
     draw_rect_fn = Graphics.draw_rounded_rect
-    draw_line_fn = Graphics.draw_line
-    draw_circle_fn = Graphics.draw_circle
     fill_circle_fn = Graphics.fill_circle
+    draw_circle_fn = Graphics.draw_circle
     mem_alloc_fn = gc.mem_alloc
     mem_free_fn = gc.mem_free
     collect_fn = gc.collect
@@ -210,7 +215,7 @@ def run_pure_bars_stress():
         fill_rect_fn(0, label1_y - 1, Graphics.WIDTH, 11, Graphics.BLACK)
         draw_text_fn(center_x, label1_y, ops_bar_text, Graphics.WHITE, Graphics.BLACK, scale=1)
 
-        # Strict clamping within bar boundaries: max 0, min bar_w
+        # Strictly clamped within [0, bar_w]
         cur_fill1_w = max(0, min(bar_w, int(bar_w * (milestone_pct / 100.0))))
         if cur_fill1_w != last_fill1_w:
             fill_rect_fn(bar_x, bar1_y, bar_w, bar_h, Graphics.SURFACE_ALT)
@@ -259,28 +264,37 @@ def run_pure_bars_stress():
             last_fill3_w = cur_fill3_w
 
         # ---------------------------------------------------------------------
-        # 6. Animated Hardware Radar Spinner (Strictly Clamped Circular Sweep)
+        # 6. High-Speed Pulsing Loading Bubbles Array
         # ---------------------------------------------------------------------
-        rot_angle += 0.28
-        if rot_angle > (2.0 * math.pi):
-            rot_angle -= (2.0 * math.pi)
+        # Erase previous bubbles
+        for i in range(bubble_count):
+            bx = bubble_start_x + (i * bubble_spacing)
+            fill_circle_fn(bx, bubble_y, 6, Graphics.BLACK)
+            draw_circle_fn(bx, bubble_y, 7, Graphics.DARK_GRAY)
 
-        # Clear spinner area only
-        fill_rect_fn(radar_cx - radar_r - 4, radar_cy - radar_r - 4, (radar_r + 4) * 2, (radar_r + 4) * 2, Graphics.BLACK)
+        # Highlight trailing wave of bubbles
+        active_bubble_idx = (active_bubble_idx + 1) % bubble_count
         
-        # Outer ring and crosshairs
-        draw_circle_fn(radar_cx, radar_cy, radar_r, Graphics.DARK_GRAY)
-        draw_circle_fn(radar_cx, radar_cy, radar_r // 2, Graphics.DARK_GRAY)
+        # Lead bubble
+        lead_x = bubble_start_x + (active_bubble_idx * bubble_spacing)
+        fill_circle_fn(lead_x, bubble_y, 5, Graphics.WHITE)
+        draw_circle_fn(lead_x, bubble_y, 7, Graphics.GREEN)
 
-        # Sweeping pointer line
-        sp_x = int(radar_cx + (radar_r - 2) * math.cos(rot_angle))
-        sp_y = int(radar_cy + (radar_r - 2) * math.sin(rot_angle))
-        draw_line_fn(radar_cx, radar_cy, sp_x, sp_y, Graphics.GREEN)
-        fill_circle_fn(radar_cx, radar_cy, 3, Graphics.WHITE)
+        # Trail 1 bubble
+        trail1_idx = (active_bubble_idx - 1) % bubble_count
+        trail1_x = bubble_start_x + (trail1_idx * bubble_spacing)
+        fill_circle_fn(trail1_x, bubble_y, 4, Graphics.GREEN)
 
-        # Status text beside radar
-        draw_text_fn(center_x, radar_cy + radar_r + 14, "L1 CACHE & BUS RUNNING (240 MHz)", Graphics.TEXT_MUTED, Graphics.BLACK, scale=1)
+        # Trail 2 bubble
+        trail2_idx = (active_bubble_idx - 2) % bubble_count
+        trail2_x = bubble_start_x + (trail2_idx * bubble_spacing)
+        fill_circle_fn(trail2_x, bubble_y, 3, Graphics.BLUE)
+
+        # Trail 3 bubble
+        trail3_idx = (active_bubble_idx - 3) % bubble_count
+        trail3_x = bubble_start_x + (trail3_idx * bubble_spacing)
+        fill_circle_fn(trail3_x, bubble_y, 2, Graphics.BORDER)
 
 
 if __name__ == "__main__":
-    run_pure_bars_stress()
+    run_bubble_bars_stress()
