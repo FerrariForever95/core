@@ -1,7 +1,7 @@
 /*
  * moclcd.c — Higher-level 8080 8-bit parallel LCD module for MicroPython,
  * built on top of ESP-IDF's esp_lcd i80 driver.
- *
+ *  v2.3 beta
  * Hardware Pin Mapping:
  * - RST: GPIO 12
  * - RS (DC): GPIO 13
@@ -10,7 +10,7 @@
  * - BL (Backlight): GPIO 38
  * - D0-D7: GPIOs 16, 15, 11, 10, 9, 4, 18, 17
  */
-
+V2.3 
 #include "py/obj.h"
 #include "py/runtime.h"
 #include "py/mphal.h"
