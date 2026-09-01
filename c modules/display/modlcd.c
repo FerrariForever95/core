@@ -1,14 +1,18 @@
 /*
- * moclcd.c — Robust 8080 8-bit parallel LCD driver for MicroPython.
- * Engineered for ESP32-S3 with glitch-free bus initialization & strict timing.
+ * ===================================================================
+ * MODULE VERSION: 1.0.0
+ * DRIVER: moclcd (8080 8-Bit Parallel LCD Driver for MicroPython)
+ * TARGET: ESP32-S3 (GDMA Engine, esp_lcd i80)
+ * ===================================================================
  *
- * Pin Map:
+ * Hardware Pin Mapping:
  * - RST: GPIO 12
  * - RS (DC): GPIO 13
  * - WR: GPIO 14
  * - RD: GPIO 41
  * - BL (Backlight): GPIO 38
  * - D0-D7: GPIOs 16, 15, 11, 10, 9, 4, 18, 17
+ * - CS: Tied to GND in hardware (cs_gpio_num = -1)
  */
 
 #include "py/obj.h"
@@ -21,6 +25,8 @@
 #include "esp_heap_caps.h"
 
 #include <string.h>
+
+#define MODULE_VERSION_STR "1.0.0"
 
 #define LCD_CMD_NOP     0x00
 #define LCD_CMD_SWRESET 0x01
@@ -288,7 +294,7 @@ static mp_obj_t moclcd_panel_init(void)
 
     /* 7. Display ON */
     lcd_cmd_raw(LCD_CMD_DISPON, NULL, 0);
-    mp_hal_delay_ms(120); /* Allow gate drivers to activate */
+    mp_hal_delay_ms(150); /* Allow gate drivers to activate */
 
     /* 8. Enable Backlight once display pipeline is solid */
     mp_hal_pin_write(s_bl_pin, 1);
@@ -550,21 +556,22 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_fill_circle_obj, 4, 4, moclcd_
 
 /* ---- Module Globals & Registration ---- */
 static const mp_rom_map_elem_t moclcd_globals_table[] = {
-    { MP_ROM_QSTR(MP_QSTR___name__),    MP_ROM_QSTR(MP_QSTR_moclcd)          },
-    { MP_ROM_QSTR(MP_QSTR_init),        MP_ROM_PTR(&moclcd_init_obj)        },
-    { MP_ROM_QSTR(MP_QSTR_reset),       MP_ROM_PTR(&moclcd_reset_obj)       },
-    { MP_ROM_QSTR(MP_QSTR_panel_init),  MP_ROM_PTR(&moclcd_panel_init_obj)  },
-    { MP_ROM_QSTR(MP_QSTR_backlight),   MP_ROM_PTR(&moclcd_backlight_obj)   },
-    { MP_ROM_QSTR(MP_QSTR_cmd),         MP_ROM_PTR(&moclcd_cmd_obj)         },
-    { MP_ROM_QSTR(MP_QSTR_data),        MP_ROM_PTR(&moclcd_data_obj)        },
-    { MP_ROM_QSTR(MP_QSTR_fill_rect),   MP_ROM_PTR(&moclcd_fill_rect_obj)   },
-    { MP_ROM_QSTR(MP_QSTR_fill_screen), MP_ROM_PTR(&moclcd_fill_screen_obj) },
-    { MP_ROM_QSTR(MP_QSTR_blit),        MP_ROM_PTR(&moclcd_blit_obj)        },
-    { MP_ROM_QSTR(MP_QSTR_draw_pixel),  MP_ROM_PTR(&moclcd_draw_pixel_obj)  },
-    { MP_ROM_QSTR(MP_QSTR_draw_line),   MP_ROM_PTR(&moclcd_draw_line_obj)   },
-    { MP_ROM_QSTR(MP_QSTR_draw_rect),   MP_ROM_PTR(&moclcd_draw_rect_obj)   },
-    { MP_ROM_QSTR(MP_QSTR_draw_circle), MP_ROM_PTR(&moclcd_draw_circle_obj) },
-    { MP_ROM_QSTR(MP_QSTR_fill_circle), MP_ROM_PTR(&moclcd_fill_circle_obj) },
+    { MP_ROM_QSTR(MP_QSTR___name__),    MP_ROM_QSTR(MP_QSTR_moclcd)           },
+    { MP_ROM_QSTR(MP_QSTR_version),     MP_ROM_QSTR(MP_QSTR_1_0_0)            },
+    { MP_ROM_QSTR(MP_QSTR_init),        MP_ROM_PTR(&moclcd_init_obj)          },
+    { MP_ROM_QSTR(MP_QSTR_reset),       MP_ROM_PTR(&moclcd_reset_obj)         },
+    { MP_ROM_QSTR(MP_QSTR_panel_init),  MP_ROM_PTR(&moclcd_panel_init_obj)     },
+    { MP_ROM_QSTR(MP_QSTR_backlight),   MP_ROM_PTR(&moclcd_backlight_obj)      },
+    { MP_ROM_QSTR(MP_QSTR_cmd),         MP_ROM_PTR(&moclcd_cmd_obj)            },
+    { MP_ROM_QSTR(MP_QSTR_data),        MP_ROM_PTR(&moclcd_data_obj)           },
+    { MP_ROM_QSTR(MP_QSTR_fill_rect),   MP_ROM_PTR(&moclcd_fill_rect_obj)      },
+    { MP_ROM_QSTR(MP_QSTR_fill_screen), MP_ROM_PTR(&moclcd_fill_screen_obj)    },
+    { MP_ROM_QSTR(MP_QSTR_blit),        MP_ROM_PTR(&moclcd_blit_obj)           },
+    { MP_ROM_QSTR(MP_QSTR_draw_pixel),  MP_ROM_PTR(&moclcd_draw_pixel_obj)     },
+    { MP_ROM_QSTR(MP_QSTR_draw_line),   MP_ROM_PTR(&moclcd_draw_line_obj)      },
+    { MP_ROM_QSTR(MP_QSTR_draw_rect),   MP_ROM_PTR(&moclcd_draw_rect_obj)      },
+    { MP_ROM_QSTR(MP_QSTR_draw_circle), MP_ROM_PTR(&moclcd_draw_circle_obj)    },
+    { MP_ROM_QSTR(MP_QSTR_fill_circle), MP_ROM_PTR(&moclcd_fill_circle_obj)    },
 };
 static MP_DEFINE_CONST_DICT(moclcd_globals, moclcd_globals_table);
 
