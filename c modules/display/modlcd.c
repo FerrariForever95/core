@@ -1,18 +1,23 @@
 /*
  * ===================================================================
  * MODULE VERSION: 1.0.0
+ * STATUS: DEV (Pending User Stability Confirmation)
  * DRIVER: moclcd (8080 8-Bit Parallel LCD Driver for MicroPython)
  * TARGET: ESP32-S3 (GDMA Engine, esp_lcd i80)
  * ===================================================================
- *
- * Hardware Pin Mapping:
- * - RST: GPIO 12
- * - RS (DC): GPIO 13
- * - WR: GPIO 14
- * - RD: GPIO 41
- * - BL (Backlight): GPIO 38
- * - D0-D7: GPIOs 16, 15, 11, 10, 9, 4, 18, 17
- * - CS: Tied to GND in hardware (cs_gpio_num = -1)
+ * CHANGELOG (v1.0.0):
+ * - Fixed preprocessor line-wrap formatting issues causing QSTR build errors.
+ * - Restored clean single-line #include, #define, and string literals.
+ * - Maintained glitch-free CS-to-GND bus init sequence with NOP flushes.
+ * - Hardware Pin Mapping:
+ *   - RST: GPIO 12
+ *   - RS (DC): GPIO 13
+ *   - WR: GPIO 14
+ *   - RD: GPIO 41
+ *   - BL (Backlight): GPIO 38
+ *   - D0-D7: GPIOs 16, 15, 11, 10, 9, 4, 18, 17
+ *   - CS: Tied to GND in hardware (cs_gpio_num = -1)
+ * ===================================================================
  */
 
 #include "py/obj.h"
