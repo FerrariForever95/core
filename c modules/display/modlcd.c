@@ -5,7 +5,7 @@
  *  TARGET:      ESP32-S3, ESP-IDF esp_lcd i80 (Intel 8080) parallel bus, 8-bit data
  *  PANEL:       ILI9488, 320 x 480, MIPI DCS Rev.1 command set
  *
- *  VERSION:     1.2.0-dev
+ *  VERSION:     1.3.0-dev
  *  BUILD STATUS: UNVERIFIED / DEV  <-- has NOT been confirmed working on real hardware
  *               (Per project rule: this string only changes to "STABLE" after the
  *                developer explicitly tests on the target board and confirms it.)
@@ -39,7 +39,29 @@
  *  -------------------------------------------------------------------------------
  *  CHANGELOG
  *  -------------------------------------------------------------------------------
- *  v1.2.0-dev (this file)
+ *  v1.3.0-dev (this file)
+ *    - BUILD FIX: set_window() failed to compile against real MicroPython headers
+ *      with:
+ *        error: type defaults to 'int' in declaration of 'MP_DEFINE_CONST_FUN_OBJ_4'
+ *        error: parameter names (without types) in function declaration
+ *        error: 'moclcd_set_window_obj' undeclared here
+ *      Root cause: py/obj.h only defines fixed-arity helpers for 0/1/2/3 args
+ *      (MP_DEFINE_CONST_FUN_OBJ_0/_1/_2/_3) plus MP_DEFINE_CONST_FUN_OBJ_KW for
+ *      keyword-arg functions -- there is no _OBJ_4 macro. set_window() takes 4
+ *      fixed positional args (x0,y0,x1,y1) and was incorrectly written in the
+ *      4-separate-mp_obj_t-parameters style with a nonexistent _OBJ_4 registration.
+ *      Every other 4+-arg function in this file (hline, vline, draw_rect, etc.)
+ *      already used the correct pattern -- size_t n_args + const mp_obj_t *args,
+ *      registered via MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(name, min, max, fn) -- so
+ *      set_window() has been rewritten to match that same pattern. This was missed
+ *      in earlier versions because no MicroPython source tree was available in the
+ *      environment those versions were written in to compile-check against; this
+ *      fix was verified directly against the real compiler error output.
+ *    - Audited every other MP_DEFINE_CONST_FUN_OBJ_* call in the file against its
+ *      function's actual parameter count/signature; no other mismatches found.
+ *    - No other functional changes from v1.2.0-dev.
+ *
+ *  v1.2.0-dev
  *    - Fixed a latent bus-corruption bug in read_reg(): the previous implementation
  *      flipped D0-D7 between esp_lcd-owned output and plain GPIO input using
  *      gpio_config() and expected esp_lcd's GPIO-matrix routing to "come back" when
@@ -187,7 +209,7 @@ static const char *TAG = "moclcd";
  *  on real hardware and explicitly confirmed it. Leave at 0 ("dev/unverified") for
  *  every iteration until that happens.
  * =================================================================================== */
-#define MOCLCD_VERSION_STRING   "1.2.0-dev"
+#define MOCLCD_VERSION_STRING   "1.3.0-dev"
 #define MOCLCD_BUILD_STABLE     0   /* 0 = dev/unverified, 1 = STABLE (only after user confirms) */
 
 #if MOCLCD_BUILD_STABLE
@@ -864,14 +886,25 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_read_reg_obj, 1, 2, moclcd_rea
  *  MICROPYTHON: set_window(x0, y0, x1, y1)
  * =================================================================================== */
 
-static mp_obj_t moclcd_set_window_py(mp_obj_t x0_o, mp_obj_t y0_o, mp_obj_t x1_o, mp_obj_t y1_o)
+/* NOTE (v1.3.0-dev fix): MicroPython's py/obj.h only provides fixed-arity
+ * MP_DEFINE_CONST_FUN_OBJ_{0,1,2,3} helpers -- there is no _OBJ_4. Any function
+ * taking 4 or more fixed positional args (like this one) must be declared with
+ * the size_t n_args / const mp_obj_t *args signature and registered via
+ * MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(name, min_args, max_args, fn), exactly
+ * like hline/vline/draw_rect/etc. elsewhere in this file. The previous draft
+ * used the 4-mp_obj_t-parameter style (correct only for arities 0-3) and a
+ * nonexistent _OBJ_4 macro, which fails to compile against real MicroPython
+ * headers -- this was missed because no MicroPython source tree was available
+ * to compile-check against at the time it was written. */
+static mp_obj_t moclcd_set_window_py(size_t n_args, const mp_obj_t *args)
 {
+    (void)n_args;
     moclcd_check_ready();
-    moclcd_set_window((uint16_t)mp_obj_get_int(x0_o), (uint16_t)mp_obj_get_int(y0_o),
-                       (uint16_t)mp_obj_get_int(x1_o), (uint16_t)mp_obj_get_int(y1_o));
+    moclcd_set_window((uint16_t)mp_obj_get_int(args[0]), (uint16_t)mp_obj_get_int(args[1]),
+                       (uint16_t)mp_obj_get_int(args[2]), (uint16_t)mp_obj_get_int(args[3]));
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_4(moclcd_set_window_obj, moclcd_set_window_py);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_set_window_obj, 4, 4, moclcd_set_window_py);
 
 /* ===================================================================================
  *  DRAWING PRIMITIVES
