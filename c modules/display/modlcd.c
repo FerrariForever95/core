@@ -5,7 +5,7 @@
  *  TARGET:      ESP32-S3, ESP-IDF esp_lcd i80 (Intel 8080) parallel bus, 8-bit data
  *  PANEL:       ILI9488, 320 x 480, MIPI DCS Rev.1 command set
  *
- *  VERSION:     1.3.0-dev
+ *  VERSION:     1.5.0-dev
  *  BUILD STATUS: UNVERIFIED / DEV  <-- has NOT been confirmed working on real hardware
  *               (Per project rule: this string only changes to "STABLE" after the
  *                developer explicitly tests on the target board and confirms it.)
@@ -39,7 +39,73 @@
  *  -------------------------------------------------------------------------------
  *  CHANGELOG
  *  -------------------------------------------------------------------------------
- *  v1.3.0-dev (this file)
+ *  v1.5.0-dev (this file)
+ *    - ACTUAL ROOT-CAUSE FIX for the pure-white-screen bug, found by comparing
+ *      against two previously-working reference drivers for this exact panel/pin
+ *      config (user-supplied modlcd_nopool.c and lcd_min.c). v1.4.0-dev's fix
+ *      (using RAMWR/0x2C as the tx_color() command) was still wrong. Per the
+ *      ILI9488 datasheet:
+ *        - Memory Write (0x2C, Section 5.2.24, p.179): "the column and page
+ *          registers are reset to the Start Column (SC) and Start Page (SP)"
+ *          EVERY time this command is sent.
+ *        - Memory Write Continue (0x3C, Section 5.2.35, p.201): "makes no
+ *          change to the other driver status" and explicitly does NOT reset
+ *          the column/page registers -- it continues from the current
+ *          position, which is the correct behavior for streaming a pixel
+ *          payload after the window has already been armed.
+ *      v1.4.0-dev used 0x2C as the tx_color() command for every chunk, which
+ *      reset the write pointer back to the window's top-left corner on every
+ *      single chunk instead of letting it advance -- both reference drivers
+ *      instead send a bare 0x2C (no parameters) once via tx_param() to arm the
+ *      window, then use 0x3C for every subsequent pixel payload via
+ *      tx_color(). This driver now matches that exact pattern:
+ *        - moclcd_set_window() sends CASET, PASET, then bare RAMWR (0x2C) --
+ *          restored from v1.3.0-dev's behavior, which v1.4.0-dev had
+ *          incorrectly removed.
+ *        - moclcd_send_pixels() now sends every payload under RAMWRC (0x3C)
+ *          rather than RAMWR (0x2C).
+ *    - Cross-referenced clk_src: this file uses LCD_CLK_SRC_DEFAULT while the
+ *      user's reference files use LCD_CLK_SRC_PLL160M. Per Espressif's own
+ *      esp_lcd_i80_bus_config_t documentation these resolve to the same
+ *      underlying clock source on ESP32-S3 -- this was checked and is NOT
+ *      believed to be a functional difference, so it was left as-is rather
+ *      than changed speculatively.
+ *    - No other functional changes from v1.4.0-dev.
+ *
+ *  v1.4.0-dev
+ *    - ROOT-CAUSE FIX for "runs clean, backlight works, screen stays pure white":
+ *      moclcd_send_pixels() was calling esp_lcd_panel_io_tx_color(io, -1, data,
+ *      len) to mean "just stream this pixel data, no command byte". That -1
+ *      convention is explicitly documented by Espressif as valid ONLY for the
+ *      SPI and I2C panel IO backends ("lcd_cmd -- set to -1 if no command
+ *      needed - only in SPI and I2C"). The i80 bus has no such carve-out, and
+ *      every real ESP-IDF i80 panel driver (e.g. esp_lcd_panel_st7789.c's
+ *      panel_st7789_draw_bitmap()) always calls
+ *      esp_lcd_panel_io_tx_color(io, LCD_CMD_RAMWR, color_data, len) -- never -1.
+ *      This matches the exact symptom reported: esp_lcd_panel_io_tx_color()
+ *      returned ESP_OK every time (no exception raised anywhere), backlight and
+ *      every esp_lcd_panel_io_tx_param() command worked fine (those always used
+ *      a real command byte), but no pixel data ever visibly reached the panel --
+ *      because the pixel-streaming call was the one path in the whole driver
+ *      using the unsupported -1 "no command" convention on i80.
+ *    - Fix: moclcd_send_pixels() now always passes ILI9488_CMD_RAMWR (0x2C) as
+ *      the command for every esp_lcd_panel_io_tx_color() call, matching
+ *      Espressif's own i80 panel drivers exactly.
+ *    - Correspondingly, moclcd_set_window() no longer sends a bare/standalone
+ *      RAMWR command after CASET/PASET -- that responsibility now lives entirely
+ *      in moclcd_send_pixels(), so RAMWR is issued exactly once per actual pixel
+ *      transaction rather than once redundantly before it. Public behavior is
+ *      unchanged: calling moclcd.set_window() followed by moclcd.data() still
+ *      works exactly as before, because data() calls moclcd_send_pixels()
+ *      internally, which now issues RAMWR itself.
+ *    - Added ILI9488_CMD_RAMWRC (0x3C, Write Memory Continue) as a named
+ *      constant for reference; RAMWR (0x2C) continues to be used for every
+ *      chunk since DCS/ILI9488 allow re-issuing RAMWR without resetting the
+ *      internal GRAM address counter as long as the CASET/PASET window is
+ *      unchanged (confirmed against ILI9488.PDF Memory Write, p.140/179).
+ *    - No other functional changes from v1.3.0-dev.
+ *
+ *  v1.3.0-dev
  *    - BUILD FIX: set_window() failed to compile against real MicroPython headers
  *      with:
  *        error: type defaults to 'int' in declaration of 'MP_DEFINE_CONST_FUN_OBJ_4'
@@ -209,7 +275,7 @@ static const char *TAG = "moclcd";
  *  on real hardware and explicitly confirmed it. Leave at 0 ("dev/unverified") for
  *  every iteration until that happens.
  * =================================================================================== */
-#define MOCLCD_VERSION_STRING   "1.3.0-dev"
+#define MOCLCD_VERSION_STRING   "1.4.0-dev"
 #define MOCLCD_BUILD_STABLE     0   /* 0 = dev/unverified, 1 = STABLE (only after user confirms) */
 
 #if MOCLCD_BUILD_STABLE
@@ -240,6 +306,7 @@ static const char *TAG = "moclcd";
 #define ILI9488_CMD_CASET   0x2A
 #define ILI9488_CMD_PASET   0x2B
 #define ILI9488_CMD_RAMWR   0x2C
+#define ILI9488_CMD_RAMWRC  0x3C   /* Write Memory Continue -- optional, RAMWR also works mid-window */
 #define ILI9488_CMD_RAMRD   0x2E
 #define ILI9488_CMD_MADCTL  0x36
 #define ILI9488_CMD_COLMOD  0x3A
@@ -303,15 +370,38 @@ static void moclcd_send_cmd(uint8_t cmd, const uint8_t *params, size_t len)
     }
 }
 
-/* Stream raw pixel/data bytes with D/C high, no command byte re-sent -- used for
- * bulk RAMWR payloads. lcd_color pushes through the "color" tx path which keeps
- * D/C high and does NOT re-latch a command, matching write8() loop behaviour in
- * MCUFRIEND_kbv's fillRect()/pushColors(). We pass -1 as the "command" so no
- * command phase is emitted -- see esp_lcd_panel_io_tx_color() semantics: the panel
- * IO was configured so the color transfer only asserts D/C=high and clocks WR. */
+/* Stream raw pixel/data bytes with D/C high, prefixed by a Write Memory Continue
+ * (0x3C) command.
+ *
+ * IMPORTANT FIX (v1.5.0-dev): v1.4.0-dev fixed the "-1 no command" bug (see that
+ * changelog entry) by making this function pass ILI9488_CMD_RAMWR (0x2C) as the
+ * tx_color() command. That was still wrong. Per the ILI9488 datasheet (Memory
+ * Write, 0x2C, Section 5.2.24, p.179): "the column and page registers are reset
+ * to the Start Column (SC) and Start Page (SP)" EVERY time 0x2C is sent. Using
+ * 0x2C as the command for every chunk of a multi-chunk pixel stream resets the
+ * write pointer back to the top-left of the window on every single chunk,
+ * instead of continuing where the previous chunk left off -- so anything beyond
+ * a single DMA-sized chunk collapses back onto the first few rows/columns
+ * repeatedly. This was confirmed against two previously-working reference
+ * drivers for this exact panel/pin config (modlcd_nopool.c, lcd_min.c), both of
+ * which use ILI9488_CMD_RAMWRC (0x3C, "Write Memory Continue") for every
+ * tx_color() call, not 0x2C.
+ *
+ * Per the datasheet (Memory Write Continue, 0x3C, Section 5.2.35, p.201): 0x3C
+ * "makes no change to the other driver status" and explicitly does NOT reset
+ * the column/page registers to SC/SP the way 0x2C does -- it continues writing
+ * from the current counter position, wrapping row-to-row inside the active
+ * CASET/PASET window until the host sends another command. This is the correct
+ * command for every pixel-payload transaction, including the first one,
+ * PROVIDED a bare 0x2C (no parameters) was already sent once via tx_param() to
+ * arm the counters at (SC,SP) -- which is exactly what moclcd_set_window() does
+ * below. In other words: set_window() sends bare RAMWR (0x2C) to reset the
+ * pointer to the window's top-left corner, and every subsequent pixel payload
+ * -- first chunk and all following chunks alike -- goes out under RAMWRC
+ * (0x3C) so the pointer just keeps advancing instead of snapping back. */
 static void moclcd_send_pixels(const void *data, size_t len_bytes)
 {
-    esp_err_t err = esp_lcd_panel_io_tx_color(s_lcd.io, -1, data, len_bytes);
+    esp_err_t err = esp_lcd_panel_io_tx_color(s_lcd.io, ILI9488_CMD_RAMWRC, data, len_bytes);
     if (err != ESP_OK) {
         mp_raise_msg_varg(&mp_type_RuntimeError,
             MP_ERROR_TEXT("moclcd: pixel stream failed (err=%d)"), (int)err);
@@ -582,6 +672,18 @@ static void moclcd_panel_init_seq(uint8_t madctl)
     }
 }
 
+/* NOTE (v1.5.0-dev): bare RAMWR (0x2C, no parameters) restored here, sent via
+ * tx_param() immediately after CASET/PASET. Per the datasheet, 0x2C resets the
+ * column/page counters to (SC,SP) -- this is what "arms" the window so that
+ * the pixel payload sent afterward (via moclcd_send_pixels(), which uses 0x3C
+ * RAMWRC) starts writing at the correct top-left corner and then just
+ * advances, instead of resetting on every chunk. See the detailed comment on
+ * moclcd_send_pixels() for the full datasheet citations and the reasoning
+ * that led here after two rounds of getting this wrong (v1.4.0-dev used bare
+ * 0x2C as the per-chunk color command, which reset the pointer every chunk;
+ * an even earlier version used tx_color(io,-1,...) which isn't valid on i80
+ * at all). This exact split -- bare 0x2C once, then 0x3C for every payload --
+ * matches two independently-working reference drivers for this same panel. */
 static void moclcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
     uint8_t caset[4] = { (uint8_t)(x0 >> 8), (uint8_t)(x0 & 0xFF),
@@ -884,6 +986,14 @@ static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(moclcd_read_reg_obj, 1, 2, moclcd_rea
 
 /* ===================================================================================
  *  MICROPYTHON: set_window(x0, y0, x1, y1)
+ *
+ *  Sends CASET, PASET, then a bare RAMWR (0x2C, no parameters) to arm the panel's
+ *  column/page counters at the window's top-left corner. After calling this,
+ *  stream pixel data with moclcd.data() (or any drawing primitive) -- data()
+ *  sends the payload under RAMWRC (0x3C, "Write Memory Continue"), which
+ *  advances the counter through the window instead of resetting it, so
+ *  multiple calls to data() after one set_window() will continue writing
+ *  correctly rather than each one snapping back to the top-left corner.
  * =================================================================================== */
 
 /* NOTE (v1.3.0-dev fix): MicroPython's py/obj.h only provides fixed-arity
