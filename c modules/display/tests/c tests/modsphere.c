@@ -3,9 +3,9 @@
  *  FILE:         modsphere.c
  *  MODULE:       sphere (MicroPython native C module)
  *  TARGET:       ESP32-S3, ILI9488 8-bit Parallel i80 (moclcd v1.5.0-STABLE)
- *  DESCRIPTION:  Native C implementation of the 3D bouncing sphere with increased
- *                peak bounce height, dynamic shadow dispersion, and clean Ctrl+C
- *                exit via mp_handle_pending(true).
+ *  DESCRIPTION:  Native C implementation of the 3D bouncing sphere capped precisely
+ *                at 72 FPS using esp_rom_delay_us frame-pacing. Includes top-left
+ *                corner readout displaying current FPS alongside "Capped to 72".
  * =====================================================================================
  */
 
@@ -21,6 +21,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 
 /* -------------------------------------------------------------------------
  * Direct C-linkage exports matching modlcd.c
@@ -55,6 +56,9 @@ extern void moclcd_draw_text_internal(uint16_t x, uint16_t y, const char *str, u
 
 #define VIRTUAL_FLOOR_Y    (-1.45f)
 #define SPHERE_RADIUS      (0.70f)
+
+/* Target 72 FPS (13888 microseconds per frame) */
+#define TARGET_FRAME_TIME_US  13888
 
 static uint8_t *s_frame_buf = NULL;
 
@@ -170,7 +174,7 @@ static void render_sphere_squash(int cx, int cy, int r_screen, float sx, float s
 
                     float r = 0.10f + 0.38f * diff_k + 0.10f * diff_f + spec * 1.35f;
                     float g = 0.35f + 1.05f * diff_k + 0.25f * diff_f + spec * 1.35f;
-                    b = 0.72f + 1.25f * diff_k + 0.50f * diff_f + spec * 1.45f;
+                    float b = 0.72f + 1.25f * diff_k + 0.50f * diff_f + spec * 1.45f;
 
                     if (r > 1.0f) r = 1.0f;
                     if (g > 1.0f) g = 1.0f;
@@ -212,7 +216,6 @@ static mp_obj_t sphere_start(size_t n_args, const mp_obj_t *args)
 
     memset(s_frame_buf, 0xFF, BB_W * BB_H * 2);
 
-    /* Higher apex launch & tuned physics */
     float pos_y = 1.15f;
     float vel_y = 0.0f;
     const float gravity = -0.012f;
@@ -234,12 +237,14 @@ static mp_obj_t sphere_start(size_t n_args, const mp_obj_t *args)
     int frame_count = 0;
     int fps_frame_count = 0;
     int64_t t_last_fps = esp_timer_get_time();
-    char fps_str[16] = "FPS: --";
+    char fps_str[36] = "FPS: -- | Capped to 72";
 
-    moclcd_fill_rect_internal(10, 10, 75, 12, COLOR_WHITE);
+    moclcd_fill_rect_internal(10, 10, 160, 12, COLOR_WHITE);
     moclcd_draw_text_internal(10, 10, fps_str, COLOR_BLACK, COLOR_WHITE);
 
     while (max_frames < 0 || frame_count < max_frames) {
+        int64_t frame_start = esp_timer_get_time();
+
         mp_handle_pending(true);
 
         clear_dirty_rows(s_frame_buf, prev_min_y, prev_max_y);
@@ -252,7 +257,6 @@ static mp_obj_t sphere_start(size_t n_args, const mp_obj_t *args)
             float impact_energy = fabsf(vel_y);
             vel_y *= restitution;
 
-            /* Ground rest threshold with continuous bounce kick */
             if (fabsf(vel_y) < 0.05f) {
                 vel_y = 0.19f;
             }
@@ -266,7 +270,6 @@ static mp_obj_t sphere_start(size_t n_args, const mp_obj_t *args)
             squash_y += (1.0f - squash_y) * 0.22f;
         }
 
-        /* Altitude-linked shadow width and fade */
         float altitude = pos_y - floor_contact_y;
         int shadow_rx = (int)((float)sphere_r * (0.80f + altitude * 0.40f) * squash_x);
         int shadow_ry = (int)((float)shadow_rx * 0.30f);
@@ -296,14 +299,19 @@ static mp_obj_t sphere_start(size_t n_args, const mp_obj_t *args)
         prev_min_y = frame_min_y;
         prev_max_y = frame_max_y;
 
+        int64_t elapsed_us = esp_timer_get_time() - frame_start;
+        if (elapsed_us < TARGET_FRAME_TIME_US) {
+            esp_rom_delay_us((uint32_t)(TARGET_FRAME_TIME_US - elapsed_us));
+        }
+
         fps_frame_count++;
         if (fps_frame_count >= 20) {
             int64_t now = esp_timer_get_time();
             int64_t dt = now - t_last_fps;
             if (dt > 0) {
                 float fps = (fps_frame_count * 1000000.0f) / (float)dt;
-                snprintf(fps_str, sizeof(fps_str), "FPS: %.1f", fps);
-                moclcd_fill_rect_internal(10, 10, 75, 10, COLOR_WHITE);
+                snprintf(fps_str, sizeof(fps_str), "FPS: %.1f | Capped to 72", fps);
+                moclcd_fill_rect_internal(10, 10, 160, 10, COLOR_WHITE);
                 moclcd_draw_text_internal(10, 10, fps_str, COLOR_BLACK, COLOR_WHITE);
             }
             t_last_fps = now;
