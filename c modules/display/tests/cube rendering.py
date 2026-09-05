@@ -1,5 +1,10 @@
 import math
+import machine
 import moclcd
+import micropython
+#wokring cube rendering mechanism for v1.5.0 stable driver
+# Lock CPU to 240MHz for peak 3D vector math performance
+machine.freq(240_000_000)
 
 WIDTH = 480
 HEIGHT = 320
@@ -8,12 +13,18 @@ CY = 160
 FOV = 250.0
 CAM_Z = 3.6
 
-moclcd.init(pclk=20_000_000, width=WIDTH, height=HEIGHT, madctl=0x28)
-moclcd.reset()
-moclcd.panel_init()
-moclcd.backlight(True)
+# -------------------------------------------------------------------------
+# EXACT WORKING HARDWARE STARTUP SEQUENCE
+# -------------------------------------------------------------------------
+moclcd.init()                # Defaults: pclk=10MHz, width=480, height=320, madctl=0x28
+moclcd.panel_init()          # Sends the MCUFRIEND-derived ILI9488 register sequence
+moclcd.backlight(1)          # Backlight ON strictly after panel_init()
+moclcd.fill_screen(0xF800)   # Immediate solid RED fill (hardware confirmation)
+
+# Clear to black for the 3D scene
 moclcd.fill_screen(0x0000)
 
+# Directional Light Vector (Normalized)
 LX, LY, LZ = 0.57735, -0.57735, -0.57735
 
 CUBE_VERTS = [
@@ -41,6 +52,7 @@ BB_H = 240
 BB_X = CX - 120
 BB_Y = CY - 120
 
+# 240x240 RGB565 Bounding Box Framebuffer (115,200 bytes)
 FRAME_BUF = bytearray(BB_W * BB_H * 2)
 
 EDGE_MIN = [0] * BB_H
@@ -179,6 +191,7 @@ def run():
                     if rz < 0.0:
                         spec = (-rz) ** 16
 
+                # Cyan base hue with diffuse + specular highlights
                 r = 0.15 * 0.18 + 0.15 * diff * 0.82 + spec * 0.95
                 g = 0.75 * 0.18 + 0.75 * diff * 0.82 + spec * 0.95
                 b = 1.00 * 0.18 + 1.00 * diff * 0.82 + spec * 0.95
@@ -199,10 +212,12 @@ def run():
         for item in faces:
             raster_quad(item[1], item[2], item[3], item[4], item[5], item[6])
 
+        # DMA transfer of 240x240 buffer to center of display
         moclcd.blit(BB_X, BB_Y, BB_W, BB_H, FRAME_BUF)
 
-        ax += 0.22
-        ay += 0.31
-        az += 0.14
+        ax += 0.08
+        ay += 0.12
+        az += 0.05
 
-run()
+if __name__ == "__main__":
+    run()
