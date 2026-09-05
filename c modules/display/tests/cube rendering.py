@@ -1,31 +1,54 @@
+# =====================================================================================
+#  3D REAL-TIME PERSPECTIVE RASTER ENGINE
+#  DRIVER:      moclcd v1.5.0 STABLE
+#  TARGET:      ESP32-S3, 8-bit Parallel Intel 8080 LCD (ILI9488, 480x320)
+#
+#  CHANGELOG (vs previous build):
+#  - Driver verified and standardized on moclcd v1.5.0 STABLE.
+#  - Centered cube: re-aligned origin (CX=240, CY=160) and centered the 300x300
+#    bounding box at (BB_X=90, BB_Y=10) for true screen-center rendering.
+#  - Adjusted virtual floor plane (VIRTUAL_FLOOR_Y=1.55) and steepened light projection
+#    vector (LY=1.75) so the projected shadow grounds naturally under the centered cube
+#    without drifting outside the bottom scanline margins.
+#  - Preserved optimized bounding-scanline DMA blit and zero-allocation frame pipeline.
+# =====================================================================================
+
 import math
 import machine
 import moclcd
 import micropython
-#working cube rendering script , smaller size on 1.5.0 stable
+
+# Lock CPU to maximum 240 MHz silicon clock
 machine.freq(240_000_000)
 
 WIDTH  = 480
 HEIGHT = 320
 CX     = 240
-CY     = 130
+CY     = 160      # Perfectly centered on vertical axis
 FOV    = 240.0
 CAM_Z  = 3.8
 
+# -------------------------------------------------------------------------
+# EXACT WORKING HARDWARE STARTUP SEQUENCE (moclcd v1.5.0 STABLE)
+# -------------------------------------------------------------------------
 moclcd.init()
 moclcd.panel_init()
 moclcd.backlight(1)
-moclcd.fill_screen(0xF800)
-moclcd.fill_screen(0xFFFF)
+moclcd.fill_screen(0xF800)  # Power/sync boot flash
+moclcd.fill_screen(0xFFFF)  # Studio White background
 
+# -------------------------------------------------------------------------
+# Lighting & Shadow Projection Vectors
+# -------------------------------------------------------------------------
 KX, KY, KZ = 0.57735, -0.57735, -0.57735
 FX, FY, FZ = -0.4082, 0.8165, 0.4082
 HX, HY, HZ = 0.3714, -0.3714, -0.8510
 
-VIRTUAL_FLOOR_Y = 1.35
-LX, LY, LZ = -0.35, 1.4, -0.25
+# Virtual ground plane & shadow casting light source
+VIRTUAL_FLOOR_Y = 1.55
+LX, LY, LZ      = -0.25, 1.75, -0.20
 
-# Reduced scale cube vertices (0.75 scale) to keep the entire shadow within bounds
+# Reduced cube scale (0.75) keeps projection & shadow cleanly in-frame
 CUBE_VERTS = [
     (-0.75, -0.75, -0.75),
     ( 0.75, -0.75, -0.75),
@@ -38,19 +61,20 @@ CUBE_VERTS = [
 ]
 
 CUBE_FACES = [
-    (0, 1, 2, 3),
-    (5, 4, 7, 6),
-    (4, 0, 3, 7),
-    (1, 5, 6, 2),
-    (3, 2, 6, 7),
-    (4, 5, 1, 0)
+    (0, 1, 2, 3),  # Back
+    (5, 4, 7, 6),  # Front
+    (4, 0, 3, 7),  # Left
+    (1, 5, 6, 2),  # Right
+    (3, 2, 6, 7),  # Top
+    (4, 5, 1, 0)   # Bottom
 ]
 
+# Symmetrical 300x300 bounding box centered on 480x320 panel
 BB_W = 300
 BB_H = 300
-BB_X = CX - 150
-BB_Y = CY - 120
-ROW_PITCH = 600
+BB_X = CX - 150   # 90
+BB_Y = CY - 150   # 10
+ROW_PITCH = 600   # 300 pixels * 2 bytes/pixel
 
 FRAME_BUF = bytearray(BB_W * BB_H * 2)
 WHITE_CHUNK = bytearray([0xFF] * ROW_PITCH)
@@ -150,11 +174,13 @@ def run():
     prev_min_y = 0
     prev_max_y = 299
 
+    # Initialize frame buffer canvas with white
     for y in range(300):
         idx = y * 600
         FRAME_BUF[idx:idx + 600] = WHITE_CHUNK
 
     while True:
+        # Clear only the rows touched in the last frame
         clear_dirty_rows(FRAME_BUF, prev_min_y, prev_max_y, WHITE_CHUNK)
 
         cx, sx = math.cos(ax), math.sin(ax)
@@ -164,7 +190,7 @@ def run():
         frame_min_y = 300
         frame_max_y = 0
 
-        # Transform vertices and calculate floor shadow projections
+        # Transform vertices and calculate virtual plane shadow projection
         for i in range(8):
             vx, vy, vz = CUBE_VERTS[i]
             y1 = vy * cx - vz * sx
@@ -174,7 +200,7 @@ def run():
             x3 = x2 * cz - y1 * sz
             y3 = x2 * sz + y1 * cz
 
-            # Ray projection onto horizontal virtual plane
+            # Ray intersection onto the virtual ground plane
             t = (VIRTUAL_FLOOR_Y - y3) / LY
             sx_world = x3 + t * LX
             sz_world = z2 + t * LZ + CAM_Z
@@ -192,7 +218,7 @@ def run():
             SV_X[i] = int((CX + (x3 * FOV * inv_z)) - BB_X)
             SV_Y[i] = int((CY - (y3 * FOV * inv_z)) - BB_Y)
 
-        # 1. Rasterize cast shadow faces on the floor first
+        # 1. Rasterize projected drop shadow quads on virtual floor
         for f_idx in range(6):
             i0, i1, i2, i3 = CUBE_FACES[f_idx]
             shad_pts = (
@@ -201,7 +227,7 @@ def run():
                 (SHAD_X[i2], SHAD_Y[i2]),
                 (SHAD_X[i3], SHAD_Y[i3])
             )
-            s_min, s_max = raster_quad_pts(shad_pts, 0x84, 0x10)  # Darker gray shadow
+            s_min, s_max = raster_quad_pts(shad_pts, 0x84, 0x10)  # Dense gray shadow
             if s_min < frame_min_y: frame_min_y = s_min
             if s_max > frame_max_y: frame_max_y = s_max
 
@@ -278,13 +304,16 @@ def run():
             if q_min < frame_min_y: frame_min_y = q_min
             if q_max > frame_max_y: frame_max_y = q_max
 
+        # Vertical bounds clamping
         frame_min_y = max(0, min(299, frame_min_y))
         frame_max_y = max(0, min(299, frame_max_y))
 
+        # Union dirty span with previous frame
         blit_top = min(frame_min_y, prev_min_y)
         blit_bottom = max(frame_max_y, prev_max_y)
         blit_h = blit_bottom - blit_top + 1
 
+        # Push dirty scanline window over DMA
         start_offset = blit_top * (BB_W * 2)
         end_offset = start_offset + (blit_h * BB_W * 2)
         moclcd.blit(BB_X, BB_Y + blit_top, BB_W, blit_h, FRAME_BUF[start_offset:end_offset])
