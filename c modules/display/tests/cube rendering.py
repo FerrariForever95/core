@@ -2,13 +2,13 @@ import math
 import machine
 import moclcd
 import micropython
-#working rendering cube , but shadow inverted, on driver 1-5.0 stable
+#rendeirn gwith shadows on 1-5.0 stable , and still cube is  of large size so reducing it 
 machine.freq(240_000_000)
 
 WIDTH  = 480
 HEIGHT = 320
 CX     = 240
-CY     = 130
+CY     = 140
 FOV    = 240.0
 CAM_Z  = 3.6
 
@@ -22,8 +22,8 @@ KX, KY, KZ = 0.57735, -0.57735, -0.57735
 FX, FY, FZ = -0.4082, 0.8165, 0.4082
 HX, HY, HZ = 0.3714, -0.3714, -0.8510
 
-FLOOR_Y = 1.35
-LX, LY, LZ = -0.6, 1.2, -0.5
+VIRTUAL_FLOOR_Y = 1.35
+LX, LY, LZ = -0.4, 1.3, -0.3
 
 CUBE_VERTS = [
     (-1.0, -1.0, -1.0),
@@ -45,13 +45,14 @@ CUBE_FACES = [
     (4, 5, 1, 0)
 ]
 
-BB_W = 320
+BB_W = 300
 BB_H = 300
-BB_X = CX - 160
-BB_Y = CY - 120
+BB_X = CX - 150
+BB_Y = CY - 130
+ROW_PITCH = 600
 
 FRAME_BUF = bytearray(BB_W * BB_H * 2)
-WHITE_CHUNK = bytearray([0xFF] * (BB_W * 2))
+WHITE_CHUNK = bytearray([0xFF] * ROW_PITCH)
 
 EDGE_MIN = [0] * BB_H
 EDGE_MAX = [0] * BB_H
@@ -69,21 +70,11 @@ SORT_KEYS = [0.0] * 6
 SORT_IDXS = [0, 1, 2, 3, 4, 5]
 FACE_COLORS = [0] * 6
 
-PLANE_PTS = [
-    (-2.2, FLOOR_Y, -2.0),
-    ( 2.2, FLOOR_Y, -2.0),
-    ( 2.2, FLOOR_Y,  2.0),
-    (-2.2, FLOOR_Y,  2.0)
-]
-PLANE_SV_X = [0] * 4
-PLANE_SV_Y = [0] * 4
-
 @micropython.native
 def clear_dirty_rows(buf, y0: int, y1: int, white_row):
-    pitch = 640
     for y in range(y0, y1 + 1):
-        idx = y * pitch
-        buf[idx:idx + 640] = white_row
+        idx = y * 600
+        buf[idx:idx + 600] = white_row
 
 @micropython.native
 def raster_edge(x0: int, y0: int, x1: int, y1: int, e_min, e_max):
@@ -109,7 +100,6 @@ def raster_edge(x0: int, y0: int, x1: int, y1: int, e_min, e_max):
 
 @micropython.native
 def fill_spans(min_y: int, max_y: int, hi: int, lo: int, buf, e_min, e_max):
-    row_pitch = 640
     for y in range(min_y, max_y + 1):
         xs = e_min[y]
         xe = e_max[y]
@@ -117,10 +107,10 @@ def fill_spans(min_y: int, max_y: int, hi: int, lo: int, buf, e_min, e_max):
             continue
         if xs < 0:
             xs = 0
-        if xe >= 320:
-            xe = 319
+        if xe >= 300:
+            xe = 299
 
-        offset = y * row_pitch + (xs << 1)
+        offset = y * 600 + (xs << 1)
         cnt = xe - xs + 1
         for _ in range(cnt):
             buf[offset] = hi
@@ -160,22 +150,8 @@ def run():
     prev_max_y = 299
 
     for y in range(300):
-        idx = y * 640
-        FRAME_BUF[idx:idx + 640] = WHITE_CHUNK
-
-    for i in range(4):
-        px, py, pz = PLANE_PTS[i]
-        cam_z = pz + CAM_Z
-        inv_z = 1.0 / cam_z
-        PLANE_SV_X[i] = int((CX + (px * FOV * inv_z)) - BB_X)
-        PLANE_SV_Y[i] = int((CY - (py * FOV * inv_z)) - BB_Y)
-
-    plane_quad_pts = (
-        (PLANE_SV_X[0], PLANE_SV_Y[0]),
-        (PLANE_SV_X[1], PLANE_SV_Y[1]),
-        (PLANE_SV_X[2], PLANE_SV_Y[2]),
-        (PLANE_SV_X[3], PLANE_SV_Y[3])
-    )
+        idx = y * 600
+        FRAME_BUF[idx:idx + 600] = WHITE_CHUNK
 
     while True:
         clear_dirty_rows(FRAME_BUF, prev_min_y, prev_max_y, WHITE_CHUNK)
@@ -187,10 +163,6 @@ def run():
         frame_min_y = 300
         frame_max_y = 0
 
-        p_min, p_max = raster_quad_pts(plane_quad_pts, 0xEE, 0x79)
-        if p_min < frame_min_y: frame_min_y = p_min
-        if p_max > frame_max_y: frame_max_y = p_max
-
         for i in range(8):
             vx, vy, vz = CUBE_VERTS[i]
             y1 = vy * cx - vz * sx
@@ -200,13 +172,13 @@ def run():
             x3 = x2 * cz - y1 * sz
             y3 = x2 * sz + y1 * cz
 
-            t = (FLOOR_Y - y3) / LY
+            t = (VIRTUAL_FLOOR_Y - y3) / LY
             sx_world = x3 + t * LX
             sz_world = z2 + t * LZ + CAM_Z
 
             inv_sz = 1.0 / sz_world
             SHAD_X[i] = int((CX + (sx_world * FOV * inv_sz)) - BB_X)
-            SHAD_Y[i] = int((CY - (FLOOR_Y * FOV * inv_sz)) - BB_Y)
+            SHAD_Y[i] = int((CY - (VIRTUAL_FLOOR_Y * FOV * inv_sz)) - BB_Y)
 
             z3 = z2 + CAM_Z
             TV_X[i] = x3
@@ -225,7 +197,7 @@ def run():
                 (SHAD_X[i2], SHAD_Y[i2]),
                 (SHAD_X[i3], SHAD_Y[i3])
             )
-            s_min, s_max = raster_quad_pts(shad_pts, 0xC6, 0x18)
+            s_min, s_max = raster_quad_pts(shad_pts, 0x94, 0x92)
             if s_min < frame_min_y: frame_min_y = s_min
             if s_max > frame_max_y: frame_max_y = s_max
 
