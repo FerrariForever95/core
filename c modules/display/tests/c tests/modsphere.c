@@ -3,15 +3,9 @@
  *  FILE:         modsphere.c
  *  MODULE:       sphere (MicroPython native C module)
  *  TARGET:       ESP32-S3, ILI9488 8-bit Parallel i80 (moclcd v1.5.0-STABLE)
- *  DESCRIPTION:  Native C implementation of the low-bounce squashing 3D sphere
- *                with dynamic perspective shadow and corner FPS overlay.
- *                Includes mp_handle_pending(true) hook on each frame loop so that
- *                Ctrl+C (SIGINT / KeyboardInterrupt) cleanly breaks out to the REPL.
- *
- *  USAGE:
- *      import sphere
- *      sphere.start()         # Runs continuous render loop; hit Ctrl+C to exit to REPL
- *      sphere.start(300)      # Benchmark 300 frames or exit early on Ctrl+C
+ *  DESCRIPTION:  Native C implementation of the 3D bouncing sphere with increased
+ *                peak bounce height, dynamic shadow dispersion, and clean Ctrl+C
+ *                exit via mp_handle_pending(true).
  * =====================================================================================
  */
 
@@ -176,7 +170,7 @@ static void render_sphere_squash(int cx, int cy, int r_screen, float sx, float s
 
                     float r = 0.10f + 0.38f * diff_k + 0.10f * diff_f + spec * 1.35f;
                     float g = 0.35f + 1.05f * diff_k + 0.25f * diff_f + spec * 1.35f;
-                    float b = 0.72f + 1.25f * diff_k + 0.50f * diff_f + spec * 1.45f;
+                    b = 0.72f + 1.25f * diff_k + 0.50f * diff_f + spec * 1.45f;
 
                     if (r > 1.0f) r = 1.0f;
                     if (g > 1.0f) g = 1.0f;
@@ -218,10 +212,11 @@ static mp_obj_t sphere_start(size_t n_args, const mp_obj_t *args)
 
     memset(s_frame_buf, 0xFF, BB_W * BB_H * 2);
 
-    float pos_y = 0.25f;
+    /* Higher apex launch & tuned physics */
+    float pos_y = 1.15f;
     float vel_y = 0.0f;
-    const float gravity = -0.016f;
-    const float restitution = -0.72f;
+    const float gravity = -0.012f;
+    const float restitution = -0.88f;
     const float floor_contact_y = VIRTUAL_FLOOR_Y + SPHERE_RADIUS;
 
     float squash_x = 1.0f;
@@ -245,7 +240,6 @@ static mp_obj_t sphere_start(size_t n_args, const mp_obj_t *args)
     moclcd_draw_text_internal(10, 10, fps_str, COLOR_BLACK, COLOR_WHITE);
 
     while (max_frames < 0 || frame_count < max_frames) {
-        /* Check for pending asynchronous events (Ctrl+C / KeyboardInterrupt) */
         mp_handle_pending(true);
 
         clear_dirty_rows(s_frame_buf, prev_min_y, prev_max_y);
@@ -258,23 +252,25 @@ static mp_obj_t sphere_start(size_t n_args, const mp_obj_t *args)
             float impact_energy = fabsf(vel_y);
             vel_y *= restitution;
 
-            if (fabsf(vel_y) < 0.04f) {
-                vel_y = 0.11f;
+            /* Ground rest threshold with continuous bounce kick */
+            if (fabsf(vel_y) < 0.05f) {
+                vel_y = 0.19f;
             }
 
-            float squash_factor = impact_energy * 1.5f;
-            if (squash_factor > 0.25f) squash_factor = 0.25f;
+            float squash_factor = impact_energy * 1.6f;
+            if (squash_factor > 0.35f) squash_factor = 0.35f;
             squash_y = 1.0f - squash_factor;
             squash_x = 1.0f + (squash_factor * 0.5f);
         } else {
-            squash_x += (1.0f - squash_x) * 0.30f;
-            squash_y += (1.0f - squash_y) * 0.30f;
+            squash_x += (1.0f - squash_x) * 0.22f;
+            squash_y += (1.0f - squash_y) * 0.22f;
         }
 
+        /* Altitude-linked shadow width and fade */
         float altitude = pos_y - floor_contact_y;
-        int shadow_rx = (int)((float)sphere_r * (0.82f + altitude * 0.38f) * squash_x);
+        int shadow_rx = (int)((float)sphere_r * (0.80f + altitude * 0.40f) * squash_x);
         int shadow_ry = (int)((float)shadow_rx * 0.30f);
-        int dens_calc = (int)(6.0f - altitude * 3.5f);
+        int dens_calc = (int)(6.0f - altitude * 2.3f);
         int shadow_density = (dens_calc < 1) ? 1 : ((dens_calc > 6) ? 6 : dens_calc);
 
         int s_min_y, s_max_y;
