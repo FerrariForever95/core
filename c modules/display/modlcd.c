@@ -275,7 +275,7 @@ static const char *TAG = "moclcd";
  *  on real hardware and explicitly confirmed it. Leave at 0 ("dev/unverified") for
  *  every iteration until that happens.
  * =================================================================================== */
-#define MOCLCD_VERSION_STRING   "1.4.0-dev"
+#define MOCLCD_VERSION_STRING   "1.5.0-dev"
 #define MOCLCD_BUILD_STABLE     0   /* 0 = dev/unverified, 1 = STABLE (only after user confirms) */
 
 #if MOCLCD_BUILD_STABLE
@@ -306,7 +306,7 @@ static const char *TAG = "moclcd";
 #define ILI9488_CMD_CASET   0x2A
 #define ILI9488_CMD_PASET   0x2B
 #define ILI9488_CMD_RAMWR   0x2C
-#define ILI9488_CMD_RAMWRC  0x3C   /* Write Memory Continue -- optional, RAMWR also works mid-window */
+#define ILI9488_CMD_RAMWRC  0x3C   /* Write Memory Continue -- used for every pixel payload chunk, see moclcd_send_pixels() */
 #define ILI9488_CMD_RAMRD   0x2E
 #define ILI9488_CMD_MADCTL  0x36
 #define ILI9488_CMD_COLMOD  0x3A
