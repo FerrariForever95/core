@@ -2,15 +2,15 @@ import math
 import machine
 import moclcd
 import micropython
-#rendeirn gwith shadows on 1-5.0 stable , and still cube is  of large size so reducing it 
+#working cube rendering script , smaller size on 1.5.0 stable
 machine.freq(240_000_000)
 
 WIDTH  = 480
 HEIGHT = 320
 CX     = 240
-CY     = 140
+CY     = 130
 FOV    = 240.0
-CAM_Z  = 3.6
+CAM_Z  = 3.8
 
 moclcd.init()
 moclcd.panel_init()
@@ -23,17 +23,18 @@ FX, FY, FZ = -0.4082, 0.8165, 0.4082
 HX, HY, HZ = 0.3714, -0.3714, -0.8510
 
 VIRTUAL_FLOOR_Y = 1.35
-LX, LY, LZ = -0.4, 1.3, -0.3
+LX, LY, LZ = -0.35, 1.4, -0.25
 
+# Reduced scale cube vertices (0.75 scale) to keep the entire shadow within bounds
 CUBE_VERTS = [
-    (-1.0, -1.0, -1.0),
-    ( 1.0, -1.0, -1.0),
-    ( 1.0,  1.0, -1.0),
-    (-1.0,  1.0, -1.0),
-    (-1.0, -1.0,  1.0),
-    ( 1.0, -1.0,  1.0),
-    ( 1.0,  1.0,  1.0),
-    (-1.0,  1.0,  1.0)
+    (-0.75, -0.75, -0.75),
+    ( 0.75, -0.75, -0.75),
+    ( 0.75,  0.75, -0.75),
+    (-0.75,  0.75, -0.75),
+    (-0.75, -0.75,  0.75),
+    ( 0.75, -0.75,  0.75),
+    ( 0.75,  0.75,  0.75),
+    (-0.75,  0.75,  0.75)
 ]
 
 CUBE_FACES = [
@@ -48,7 +49,7 @@ CUBE_FACES = [
 BB_W = 300
 BB_H = 300
 BB_X = CX - 150
-BB_Y = CY - 130
+BB_Y = CY - 120
 ROW_PITCH = 600
 
 FRAME_BUF = bytearray(BB_W * BB_H * 2)
@@ -163,6 +164,7 @@ def run():
         frame_min_y = 300
         frame_max_y = 0
 
+        # Transform vertices and calculate floor shadow projections
         for i in range(8):
             vx, vy, vz = CUBE_VERTS[i]
             y1 = vy * cx - vz * sx
@@ -172,6 +174,7 @@ def run():
             x3 = x2 * cz - y1 * sz
             y3 = x2 * sz + y1 * cz
 
+            # Ray projection onto horizontal virtual plane
             t = (VIRTUAL_FLOOR_Y - y3) / LY
             sx_world = x3 + t * LX
             sz_world = z2 + t * LZ + CAM_Z
@@ -189,6 +192,7 @@ def run():
             SV_X[i] = int((CX + (x3 * FOV * inv_z)) - BB_X)
             SV_Y[i] = int((CY - (y3 * FOV * inv_z)) - BB_Y)
 
+        # 1. Rasterize cast shadow faces on the floor first
         for f_idx in range(6):
             i0, i1, i2, i3 = CUBE_FACES[f_idx]
             shad_pts = (
@@ -197,10 +201,11 @@ def run():
                 (SHAD_X[i2], SHAD_Y[i2]),
                 (SHAD_X[i3], SHAD_Y[i3])
             )
-            s_min, s_max = raster_quad_pts(shad_pts, 0x94, 0x92)
+            s_min, s_max = raster_quad_pts(shad_pts, 0x84, 0x10)  # Darker gray shadow
             if s_min < frame_min_y: frame_min_y = s_min
             if s_max > frame_max_y: frame_max_y = s_max
 
+        # 2. Lighting & Backface Culling for the cube
         active_count = 0
         for f_idx in range(6):
             i0, i1, i2, i3 = CUBE_FACES[f_idx]
@@ -244,6 +249,7 @@ def run():
                 SORT_IDXS[active_count] = f_idx
                 active_count += 1
 
+        # Z-sorting
         for i in range(1, active_count):
             k = SORT_KEYS[i]
             idx_val = SORT_IDXS[i]
@@ -255,6 +261,7 @@ def run():
             SORT_KEYS[j + 1] = k
             SORT_IDXS[j + 1] = idx_val
 
+        # 3. Rasterize visible cube faces over the shadow
         for i in range(active_count):
             f_idx = SORT_IDXS[i]
             i0, i1, i2, i3 = CUBE_FACES[f_idx]
