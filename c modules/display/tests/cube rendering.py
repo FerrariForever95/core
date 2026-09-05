@@ -1,16 +1,20 @@
 # =====================================================================================
-#  3D REAL-TIME PERSPECTIVE RASTER ENGINE (WITH CORNER FPS COUNTER)
+#  3D REAL-TIME PERSPECTIVE RASTER ENGINE
 #  DRIVER:      moclcd v1.5.0 STABLE
 #  TARGET:      ESP32-S3, 8-bit Parallel Intel 8080 LCD (ILI9488, 480x320)
 #
 #  CHANGELOG (vs previous build):
 #  - Driver retained on moclcd v1.5.0 STABLE.
-#  - Cube remains perfectly centered (CX=240, CY=160, BB_X=90, BB_Y=10) over white canvas.
-#  - Retained fast 3x3 combined matrix math and binary-tree specular highlight.
-#  - Added real-time FPS overlay in the top-left corner (x=10, y=10) with sharp
-#    black text on a clean white background.
-#  - FPS calculations are smoothed over an exponential moving average (EMA)
-#    and updated every 10 frames to eliminate text draw overhead from the 3D pipeline.
+#  - Fixed inverted Y coordinate convention on perspective projection:
+#      * Screen space Y goes DOWNWARDS (0 at top, +320 at bottom).
+#      * Cube vertices with positive 3D world Y were previously projecting downwards,
+#        while the floor shadow was calculating above the cube.
+#      * Inverted projection mapping: SV_Y = CY - (y3 * FOV * inv_z), so positive
+#        Y is up in world space and negative Y points down toward the floor.
+#      * Floor positioned below at negative Y (VIRTUAL_FLOOR_Y = -1.45).
+#      * Light directed downwards from ceiling (LY = -1.75).
+#      * Corrected shadow Y projection so it strictly casts onto the floor beneath the cube.
+#  - Repositioned FPS tag to top-left margin (x=12, y=12) with explicit fill_rect clearing.
 # =====================================================================================
 
 import math
@@ -25,7 +29,7 @@ machine.freq(240_000_000)
 WIDTH  = 480
 HEIGHT = 320
 CX     = 240
-CY     = 160
+CY     = 150
 FOV    = 240.0
 CAM_Z  = 3.8
 
@@ -35,19 +39,23 @@ CAM_Z  = 3.8
 moclcd.init()
 moclcd.panel_init()
 moclcd.backlight(1)
-moclcd.fill_screen(0xF800)  # Boot flash
+moclcd.fill_screen(0xF800)  # Hardware boot flash
 moclcd.fill_screen(0xFFFF)  # Studio White canvas
 
 # -------------------------------------------------------------------------
-# Lighting & Projection Constants
+# Lighting & Projection Setup (Standard 3D: +Y is UP, -Y is DOWN)
 # -------------------------------------------------------------------------
-KX, KY, KZ = 0.57735, -0.57735, -0.57735
-FX, FY, FZ = -0.4082, 0.8165, 0.4082
-HX, HY, HZ = 0.3714, -0.3714, -0.8510
+# Key & Fill directional vectors
+KX, KY, KZ = 0.57735, 0.57735, -0.57735
+FX, FY, FZ = -0.4082, -0.8165, 0.4082
+HX, HY, HZ = 0.3714, 0.3714, -0.8510
 
-VIRTUAL_FLOOR_Y = 1.55
-INV_LY          = 1.0 / 1.75
-LX, LZ          = -0.25, -0.20
+# Virtual floor is BELOW the cube at negative Y
+VIRTUAL_FLOOR_Y = -1.45
+
+# Light vector pointing downwards toward the floor (-Y direction)
+LX, LY, LZ = -0.25, -1.75, -0.20
+INV_LY     = 1.0 / LY
 
 CUBE_VERTS = [
     (-0.75, -0.75, -0.75),
@@ -72,7 +80,7 @@ CUBE_FACES = [
 BB_W = 300
 BB_H = 300
 BB_X = CX - 150  # 90
-BB_Y = CY - 150  # 10
+BB_Y = CY - 150  # 0
 ROW_PITCH = 600
 
 FRAME_BUF = bytearray(BB_W * BB_H * 2)
@@ -180,7 +188,7 @@ def run():
         idx = y * 600
         FRAME_BUF[idx:idx + 600] = WHITE_CHUNK
 
-    # FPS calculation tracking
+    # FPS counter state
     fps_counter = 0
     t_last_fps = time.ticks_ms()
     fps_display_str = "FPS: --"
@@ -188,8 +196,8 @@ def run():
     ticks_ms = time.ticks_ms
     ticks_diff = time.ticks_diff
 
-    # Initial FPS label rendering in top-left corner
-    moclcd.fill_rect(10, 10, 80, 12, 0xFFFF)
+    # Clear corner area and draw initial FPS tag
+    moclcd.fill_rect(10, 10, 75, 12, 0xFFFF)
     moclcd.draw_text(10, 10, fps_display_str, 0x0000, 0xFFFF)
 
     while True:
@@ -197,7 +205,7 @@ def run():
         clear_dirty_rows(FRAME_BUF, prev_min_y, prev_max_y, WHITE_CHUNK)
 
         # -----------------------------------------------------------------
-        # 1. Precomputed Single 3x3 Rotation Matrix
+        # 1. 3x3 Combined Rotation Matrix
         # -----------------------------------------------------------------
         cx, sx = math.cos(ax), math.sin(ax)
         cy, sy = math.cos(ay), math.sin(ay)
@@ -219,7 +227,7 @@ def run():
         frame_max_y = 0
 
         # -----------------------------------------------------------------
-        # 2. Fast Vertex Transform & Simplified Ray Projection
+        # 2. Transform Vertices & Project Floor Shadow (Y-Inverted for Screen)
         # -----------------------------------------------------------------
         for i in range(8):
             vx, vy, vz = CUBE_VERTS[i]
@@ -227,13 +235,15 @@ def run():
             y3 = r10 * vx + r11 * vy + r12 * vz
             z3 = r20 * vx + r21 * vy + r22 * vz
 
-            # Floor shadow projection ray intersection
+            # Floor shadow ray intersection (downward to -Y plane)
             t = (VIRTUAL_FLOOR_Y - y3) * INV_LY
             sx_world = x3 + t * LX
             sz_world = z3 + t * LZ + CAM_Z
 
             inv_sz = 1.0 / sz_world
             SHAD_X[i] = int((CX + (sx_world * FOV * inv_sz)) - BB_X)
+            # Standard perspective: screen Y = CY - (world Y * FOV * inv_z)
+            # Since VIRTUAL_FLOOR_Y is negative, CY - (neg) = CY + pos -> bottom of screen!
             SHAD_Y[i] = int((CY - (VIRTUAL_FLOOR_Y * FOV * inv_sz)) - BB_Y)
 
             cam_z = z3 + CAM_Z
@@ -246,7 +256,7 @@ def run():
             SV_Y[i] = int((CY - (y3 * FOV * inv_z)) - BB_Y)
 
         # -----------------------------------------------------------------
-        # 3. Rasterize Shadow Faces on Floor
+        # 3. Rasterize Shadow Faces on Floor (Appears beneath the cube)
         # -----------------------------------------------------------------
         for f_idx in range(6):
             i0, i1, i2, i3 = CUBE_FACES[f_idx]
@@ -256,12 +266,12 @@ def run():
                 (SHAD_X[i2], SHAD_Y[i2]),
                 (SHAD_X[i3], SHAD_Y[i3])
             )
-            s_min, s_max = raster_quad_pts(shad_pts, 0x94, 0x92)
+            s_min, s_max = raster_quad_pts(shad_pts, 0x84, 0x10)  # Deep gray shadow
             if s_min < frame_min_y: frame_min_y = s_min
             if s_max > frame_max_y: frame_max_y = s_max
 
         # -----------------------------------------------------------------
-        # 4. Face Normal, Backface Cull & Approximate Shader
+        # 4. Face Normals, Backface Cull & Lighting
         # -----------------------------------------------------------------
         active_count = 0
         for f_idx in range(6):
@@ -281,14 +291,14 @@ def run():
                 ny *= inv_l
                 nz *= inv_l
 
-                # Diffuse Key & Fill
+                # Key & Fill diffuse
                 dot_k = nx * KX + ny * KY + nz * KZ
                 diff_k = dot_k if dot_k > 0.0 else 0.0
 
                 dot_f = nx * FX + ny * FY + nz * FZ
                 diff_f = dot_f if dot_f > 0.0 else 0.0
 
-                # Approximate specular glint: ((x^2)^2)^2 = x^16
+                # Specular glint
                 dot_h = nx * HX + ny * HY + nz * HZ
                 if dot_h > 0.0:
                     h2 = dot_h * dot_h
@@ -315,7 +325,7 @@ def run():
                 SORT_IDXS[active_count] = f_idx
                 active_count += 1
 
-        # In-place Z sort
+        # In-place Z-sort
         for i in range(1, active_count):
             k = SORT_KEYS[i]
             idx_val = SORT_IDXS[i]
@@ -328,7 +338,7 @@ def run():
             SORT_IDXS[j + 1] = idx_val
 
         # -----------------------------------------------------------------
-        # 5. Rasterize Visible Cube Faces Over Shadow
+        # 5. Rasterize Cube Faces Over the Floor Shadow
         # -----------------------------------------------------------------
         for i in range(active_count):
             f_idx = SORT_IDXS[i]
@@ -350,7 +360,7 @@ def run():
         frame_min_y = max(0, min(299, frame_min_y))
         frame_max_y = max(0, min(299, frame_max_y))
 
-        # Union dirty band with previous frame
+        # Union bounds with previous frame to prevent tearing
         blit_top = min(frame_min_y, prev_min_y)
         blit_bottom = max(frame_max_y, prev_max_y)
         blit_h = blit_bottom - blit_top + 1
@@ -363,13 +373,12 @@ def run():
         prev_min_y = frame_min_y
         prev_max_y = frame_max_y
 
-        # Rotation increments
-        ax += 0.09
-        ay += 0.13
-        az += 0.06
+        ax += 0.08
+        ay += 0.12
+        az += 0.05
 
         # -----------------------------------------------------------------
-        # 6. Real-Time FPS Overlay (Black text in top-left corner)
+        # 6. Top-Left FPS Counter (Black on White)
         # -----------------------------------------------------------------
         fps_counter += 1
         if fps_counter >= 10:
@@ -378,8 +387,8 @@ def run():
             if dt > 0:
                 fps = (fps_counter * 1000.0) / dt
                 fps_display_str = "FPS: {:.1f}".format(fps)
-                # Overwrite dirty rectangle with white background then draw black text
-                moclcd.fill_rect(10, 10, 72, 10, 0xFFFF)
+                # Clear label backing rectangle and render crisp black text
+                moclcd.fill_rect(10, 10, 75, 10, 0xFFFF)
                 moclcd.draw_text(10, 10, fps_display_str, 0x0000, 0xFFFF)
             t_last_fps = now
             fps_counter = 0
