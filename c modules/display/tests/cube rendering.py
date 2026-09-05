@@ -2,34 +2,28 @@ import math
 import machine
 import moclcd
 import micropython
-#wokring cube rendeirng code for 1.5.0 - stable , with shaders and background
-# Lock CPU to 240 MHz for maximum math throughput
+#working rendering cube , but shadow inverted, on driver 1-5.0 stable
 machine.freq(240_000_000)
 
 WIDTH  = 480
 HEIGHT = 320
 CX     = 240
-CY     = 145      # Centered with room for floor shadow
+CY     = 130
 FOV    = 240.0
 CAM_Z  = 3.6
 
-# -------------------------------------------------------------------------
-# EXACT WORKING HARDWARE STARTUP SEQUENCE
-# -------------------------------------------------------------------------
 moclcd.init()
 moclcd.panel_init()
 moclcd.backlight(1)
-moclcd.fill_screen(0xF800)  # Visual boot confirmation
-moclcd.fill_screen(0xFFFF)  # Studio White Background
+moclcd.fill_screen(0xF800)
+moclcd.fill_screen(0xFFFF)
 
-# -------------------------------------------------------------------------
-# Lighting Setup
-# -------------------------------------------------------------------------
 KX, KY, KZ = 0.57735, -0.57735, -0.57735
 FX, FY, FZ = -0.4082, 0.8165, 0.4082
-
-# Blinn-Phong Halfway vector with View vector (0, 0, -1)
 HX, HY, HZ = 0.3714, -0.3714, -0.8510
+
+FLOOR_Y = 1.35
+LX, LY, LZ = -0.6, 1.2, -0.5
 
 CUBE_VERTS = [
     (-1.0, -1.0, -1.0),
@@ -43,21 +37,19 @@ CUBE_VERTS = [
 ]
 
 CUBE_FACES = [
-    (0, 1, 2, 3),  # Back
-    (5, 4, 7, 6),  # Front
-    (4, 0, 3, 7),  # Left
-    (1, 5, 6, 2),  # Right
-    (3, 2, 6, 7),  # Top
-    (4, 5, 1, 0)   # Bottom
+    (0, 1, 2, 3),
+    (5, 4, 7, 6),
+    (4, 0, 3, 7),
+    (1, 5, 6, 2),
+    (3, 2, 6, 7),
+    (4, 5, 1, 0)
 ]
 
-# Expanded bounding box: 300x300 prevents edge clipping
-BB_W = 300
+BB_W = 320
 BB_H = 300
-BB_X = CX - 150
-BB_Y = CY - 140
+BB_X = CX - 160
+BB_Y = CY - 120
 
-# 300x300 RGB565 buffer (180,000 bytes)
 FRAME_BUF = bytearray(BB_W * BB_H * 2)
 WHITE_CHUNK = bytearray([0xFF] * (BB_W * 2))
 
@@ -70,16 +62,28 @@ TV_Z = [0.0] * 8
 SV_X = [0] * 8
 SV_Y = [0] * 8
 
+SHAD_X = [0] * 8
+SHAD_Y = [0] * 8
+
 SORT_KEYS = [0.0] * 6
 SORT_IDXS = [0, 1, 2, 3, 4, 5]
 FACE_COLORS = [0] * 6
 
+PLANE_PTS = [
+    (-2.2, FLOOR_Y, -2.0),
+    ( 2.2, FLOOR_Y, -2.0),
+    ( 2.2, FLOOR_Y,  2.0),
+    (-2.2, FLOOR_Y,  2.0)
+]
+PLANE_SV_X = [0] * 4
+PLANE_SV_Y = [0] * 4
+
 @micropython.native
 def clear_dirty_rows(buf, y0: int, y1: int, white_row):
-    pitch = 600  # 300 pixels * 2 bytes
+    pitch = 640
     for y in range(y0, y1 + 1):
         idx = y * pitch
-        buf[idx:idx + 600] = white_row
+        buf[idx:idx + 640] = white_row
 
 @micropython.native
 def raster_edge(x0: int, y0: int, x1: int, y1: int, e_min, e_max):
@@ -105,7 +109,7 @@ def raster_edge(x0: int, y0: int, x1: int, y1: int, e_min, e_max):
 
 @micropython.native
 def fill_spans(min_y: int, max_y: int, hi: int, lo: int, buf, e_min, e_max):
-    row_pitch = 600
+    row_pitch = 640
     for y in range(min_y, max_y + 1):
         xs = e_min[y]
         xe = e_max[y]
@@ -113,8 +117,8 @@ def fill_spans(min_y: int, max_y: int, hi: int, lo: int, buf, e_min, e_max):
             continue
         if xs < 0:
             xs = 0
-        if xe >= 300:
-            xe = 299
+        if xe >= 320:
+            xe = 319
 
         offset = y * row_pitch + (xs << 1)
         cnt = xe - xs + 1
@@ -123,49 +127,7 @@ def fill_spans(min_y: int, max_y: int, hi: int, lo: int, buf, e_min, e_max):
             buf[offset + 1] = lo
             offset += 2
 
-@micropython.native
-def draw_drop_shadow(cx: int, cy: int, rx: int, ry: int, buf):
-    """Soft, dual-tier elliptical drop shadow on the white studio floor."""
-    row_pitch = 600
-    rx2 = rx * rx
-    ry2 = ry * ry
-    if rx2 <= 0 or ry2 <= 0:
-        return
-
-    # Shadow tints in RGB565
-    inner_hi, inner_lo = 0xBD, 0xD7  # ~#B8B8B8 Soft Gray
-    outer_hi, outer_lo = 0xDE, 0xFB  # ~#DEDEDE Ambient Rim Gray
-
-    for dy in range(-ry, ry + 1):
-        sy = cy + dy
-        if 0 <= sy < 300:
-            dy2 = dy * dy
-            val = 1.0 - (dy2 / ry2)
-            if val > 0:
-                span_x = int(rx * math.sqrt(val))
-                x_start = max(0, cx - span_x)
-                x_end = min(299, cx + span_x)
-                offset = sy * row_pitch + (x_start << 1)
-
-                for px in range(x_start, x_end + 1):
-                    dx = px - cx
-                    dist_norm = (dx * dx) / rx2 + dy2 / ry2
-                    if dist_norm < 0.45:
-                        buf[offset] = inner_hi
-                        buf[offset + 1] = inner_lo
-                    elif dist_norm < 1.0:
-                        buf[offset] = outer_hi
-                        buf[offset + 1] = outer_lo
-                    offset += 2
-
-def raster_quad(i0, i1, i2, i3, hi, lo):
-    pts = (
-        (SV_X[i0], SV_Y[i0]),
-        (SV_X[i1], SV_Y[i1]),
-        (SV_X[i2], SV_Y[i2]),
-        (SV_X[i3], SV_Y[i3])
-    )
-    
+def raster_quad_pts(pts, hi, lo):
     min_y = 300
     max_y = -1
     for p in pts:
@@ -197,24 +159,38 @@ def run():
     prev_min_y = 0
     prev_max_y = 299
 
-    # Pre-fill initial frame buffer with white
     for y in range(300):
-        idx = y * 600
-        FRAME_BUF[idx:idx + 600] = WHITE_CHUNK
+        idx = y * 640
+        FRAME_BUF[idx:idx + 640] = WHITE_CHUNK
+
+    for i in range(4):
+        px, py, pz = PLANE_PTS[i]
+        cam_z = pz + CAM_Z
+        inv_z = 1.0 / cam_z
+        PLANE_SV_X[i] = int((CX + (px * FOV * inv_z)) - BB_X)
+        PLANE_SV_Y[i] = int((CY - (py * FOV * inv_z)) - BB_Y)
+
+    plane_quad_pts = (
+        (PLANE_SV_X[0], PLANE_SV_Y[0]),
+        (PLANE_SV_X[1], PLANE_SV_Y[1]),
+        (PLANE_SV_X[2], PLANE_SV_Y[2]),
+        (PLANE_SV_X[3], PLANE_SV_Y[3])
+    )
 
     while True:
-        # Clear only the rows dirtied during the previous frame back to white
         clear_dirty_rows(FRAME_BUF, prev_min_y, prev_max_y, WHITE_CHUNK)
 
         cx, sx = math.cos(ax), math.sin(ax)
         cy, sy = math.cos(ay), math.sin(ay)
         cz, sz = math.cos(az), math.sin(az)
 
-        min_proj_y = 999
-        max_proj_y = -999
-        avg_cam_x = 0.0
+        frame_min_y = 300
+        frame_max_y = 0
 
-        # Transform and project vertices
+        p_min, p_max = raster_quad_pts(plane_quad_pts, 0xEE, 0x79)
+        if p_min < frame_min_y: frame_min_y = p_min
+        if p_max > frame_max_y: frame_max_y = p_max
+
         for i in range(8):
             vx, vy, vz = CUBE_VERTS[i]
             y1 = vy * cx - vz * sx
@@ -223,36 +199,37 @@ def run():
             z2 = -vx * sy + z1 * cy
             x3 = x2 * cz - y1 * sz
             y3 = x2 * sz + y1 * cz
-            z3 = z2 + CAM_Z
 
+            t = (FLOOR_Y - y3) / LY
+            sx_world = x3 + t * LX
+            sz_world = z2 + t * LZ + CAM_Z
+
+            inv_sz = 1.0 / sz_world
+            SHAD_X[i] = int((CX + (sx_world * FOV * inv_sz)) - BB_X)
+            SHAD_Y[i] = int((CY - (FLOOR_Y * FOV * inv_sz)) - BB_Y)
+
+            z3 = z2 + CAM_Z
             TV_X[i] = x3
             TV_Y[i] = y3
             TV_Z[i] = z3
-            avg_cam_x += x3
 
             inv_z = 1.0 / z3
-            px = int((CX + (x3 * FOV * inv_z)) - BB_X)
-            py = int((CY - (y3 * FOV * inv_z)) - BB_Y)
+            SV_X[i] = int((CX + (x3 * FOV * inv_z)) - BB_X)
+            SV_Y[i] = int((CY - (y3 * FOV * inv_z)) - BB_Y)
 
-            SV_X[i] = px
-            SV_Y[i] = py
-
-            if py < min_proj_y: min_proj_y = py
-            if py > max_proj_y: max_proj_y = py
-
-        avg_cam_x *= 0.125
-
-        # Floor shadow beneath the cube
-        shadow_floor_y = 256
-        shadow_cx = int(150 + (avg_cam_x * 40.0))
-        shadow_rx = 78
-        shadow_ry = 18
-
-        draw_drop_shadow(shadow_cx, shadow_floor_y, shadow_rx, shadow_ry, FRAME_BUF)
+        for f_idx in range(6):
+            i0, i1, i2, i3 = CUBE_FACES[f_idx]
+            shad_pts = (
+                (SHAD_X[i0], SHAD_Y[i0]),
+                (SHAD_X[i1], SHAD_Y[i1]),
+                (SHAD_X[i2], SHAD_Y[i2]),
+                (SHAD_X[i3], SHAD_Y[i3])
+            )
+            s_min, s_max = raster_quad_pts(shad_pts, 0xC6, 0x18)
+            if s_min < frame_min_y: frame_min_y = s_min
+            if s_max > frame_max_y: frame_max_y = s_max
 
         active_count = 0
-
-        # Compute lighting and face normals
         for f_idx in range(6):
             i0, i1, i2, i3 = CUBE_FACES[f_idx]
             x0, y0, z0 = TV_X[i0], TV_Y[i0], TV_Z[i0]
@@ -281,7 +258,6 @@ def run():
                 avg_z = z0 + TV_Z[i1] + TV_Z[i2] + TV_Z[i3]
                 depth_factor = max(0.60, 1.28 - (avg_z * 0.15))
 
-                # Deep Cobalt/Azure Material (bold contrast against white)
                 r = (0.10 + 0.35 * diff_k + 0.10 * diff_f + spec * 1.25) * depth_factor
                 g = (0.35 + 1.05 * diff_k + 0.25 * diff_f + spec * 1.25) * depth_factor
                 b = (0.70 + 1.25 * diff_k + 0.50 * diff_f + spec * 1.30) * depth_factor
@@ -296,7 +272,6 @@ def run():
                 SORT_IDXS[active_count] = f_idx
                 active_count += 1
 
-        # Z-sorting
         for i in range(1, active_count):
             k = SORT_KEYS[i]
             idx_val = SORT_IDXS[i]
@@ -308,28 +283,29 @@ def run():
             SORT_KEYS[j + 1] = k
             SORT_IDXS[j + 1] = idx_val
 
-        # Rasterize visible faces
-        frame_min_y = min_proj_y
-        frame_max_y = max(max_proj_y, shadow_floor_y + shadow_ry)
-
         for i in range(active_count):
             f_idx = SORT_IDXS[i]
             i0, i1, i2, i3 = CUBE_FACES[f_idx]
             col = FACE_COLORS[f_idx]
             hi = (col >> 8) & 0xFF
             lo = col & 0xFF
-            raster_quad(i0, i1, i2, i3, hi, lo)
+            quad_pts = (
+                (SV_X[i0], SV_Y[i0]),
+                (SV_X[i1], SV_Y[i1]),
+                (SV_X[i2], SV_Y[i2]),
+                (SV_X[i3], SV_Y[i3])
+            )
+            q_min, q_max = raster_quad_pts(quad_pts, hi, lo)
+            if q_min < frame_min_y: frame_min_y = q_min
+            if q_max > frame_max_y: frame_max_y = q_max
 
-        # Clamp vertical bounds
         frame_min_y = max(0, min(299, frame_min_y))
         frame_max_y = max(0, min(299, frame_max_y))
 
-        # Union bounds with previous frame
         blit_top = min(frame_min_y, prev_min_y)
         blit_bottom = max(frame_max_y, prev_max_y)
         blit_h = blit_bottom - blit_top + 1
 
-        # Push dirty scanline band via DMA
         start_offset = blit_top * (BB_W * 2)
         end_offset = start_offset + (blit_h * BB_W * 2)
         moclcd.blit(BB_X, BB_Y + blit_top, BB_W, blit_h, FRAME_BUF[start_offset:end_offset])
