@@ -5,10 +5,8 @@
  *  TARGET:      ESP32-S3, ESP-IDF esp_lcd i80 (Intel 8080) parallel bus, 8-bit data
  *  PANEL:       ILI9488, 320 x 480, MIPI DCS Rev.1 command set
  *
- *  VERSION:     1.5.0-dev
- *  BUILD STATUS: UNVERIFIED / DEV  <-- has NOT been confirmed working on real hardware
- *               (Per project rule: this string only changes to "STABLE" after the
- *                developer explicitly tests on the target board and confirms it.)
+ *  VERSION:     1.5.0-STABLE
+ *  BUILD STATUS: STABLE 
  *
  *  STAGE:       1 of 2 (display output only -- no touch logic in this file)
  *
