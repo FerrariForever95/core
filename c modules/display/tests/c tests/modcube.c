@@ -5,7 +5,7 @@
  *  TARGET:       ESP32-S3, ILI9488 8-bit Parallel i80 (via moclcd driver)
  *  DESCRIPTION:  Native 3D Perspective Rasterizer Engine with Blinn-Phong Shading,
  *                Virtual Floor Shadow Projection, Dynamic Bounding-Box DMA Blit,
- *                and Corner FPS Overlay.
+ *                Corner FPS Overlay, and KeyboardInterrupt (Ctrl+C) REPL Break.
  * =====================================================================================
  */
 
@@ -203,6 +203,9 @@ static mp_obj_t cube_start(size_t n_args, const mp_obj_t *args)
     moclcd_draw_text_internal(10, 10, fps_str, COLOR_BLACK, COLOR_WHITE);
 
     while (max_frames < 0 || frame_count < max_frames) {
+        /* Process pending events and handle Ctrl+C to drop back to REPL */
+        mp_handle_pending(true);
+
         clear_dirty_rows(s_frame_buf, prev_min_y, prev_max_y);
 
         float cx = cosf(ax), sx = sinf(ax);
