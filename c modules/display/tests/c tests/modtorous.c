@@ -5,13 +5,14 @@
  *  TARGET:       ESP32-S3, ILI9488 8-bit Parallel i80 (moclcd v1.5.0-STABLE)
  *  DESCRIPTION:  High-stress 3D Gyroscopic Engine: Dual Precessing Concentric
  *                Torus Rings, Central Chrome Core Sphere, Dynamic Negative-Hole
- *                Floor Shadows, Interleaved Painter's Depth Sorting, Fixed 72 FPS
- *                Frame Pacing, and Clean Ctrl+C REPL Breakout.
+ *                Floor Shadows, Interleaved Painter's Depth Sorting, Multi-Tier
+ *                DMA Allocation Fallback, Dynamic Target FPS Limiter, and Ctrl+C Breakout.
  *
  *  USAGE:
  *      import gyro
- *      gyro.start()       # Continuous rendering loop; Ctrl+C returns to REPL
- *      gyro.start(500)    # Runs for 500 benchmark frames or until Ctrl+C
+ *      gyro.start()       # Runs at default 72 FPS cap
+ *      gyro.start(30)     # Sets dynamic frame rate cap to 30 FPS
+ *      gyro.start(60)     # Sets dynamic frame rate cap to 60 FPS
  * =====================================================================================
  */
 
@@ -66,7 +67,7 @@ extern void moclcd_draw_text_internal(uint16_t x, uint16_t y, const char *str, u
 #define LIGHT_DIR_Z           (-0.20f)
 #define INV_LIGHT_DIR_Y       (1.0f / LIGHT_DIR_Y)
 
-#define TARGET_FRAME_TIME_US  13888             /* 72 FPS */
+#define DEFAULT_FPS           72
 
 /* Torus Mesh Resolution: 16 Ring Slices x 8 Tube Slices = 128 Verts / Quads */
 #define SEGS_U                16
@@ -317,18 +318,39 @@ static void render_core_sphere(int cx, int cy, int r_screen, uint8_t *buf, int *
 }
 
 /* -------------------------------------------------------------------------
- * Execution Loop: gyro.start()
+ * Execution Loop: gyro.start(target_fps=72)
  * ------------------------------------------------------------------------- */
 static mp_obj_t gyro_start(size_t n_args, const mp_obj_t *args)
 {
-    int max_frames = (n_args > 0) ? mp_obj_get_int(args[0]) : -1;
+    int target_fps = DEFAULT_FPS;
+    if (n_args > 0) {
+        target_fps = mp_obj_get_int(args[0]);
+        if (target_fps < 1) target_fps = 1;
+        if (target_fps > 120) target_fps = 120;
+    }
+
+    uint32_t target_frame_time_us = (uint32_t)(1000000 / target_fps);
 
     init_torus_meshes();
 
     if (s_frame_buf == NULL) {
-        s_frame_buf = (uint8_t *)heap_caps_malloc(BB_W * BB_H * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        size_t buf_size = (size_t)BB_W * BB_H * 2;
+        
+        /* Step 1: Internal DMA SRAM */
+        s_frame_buf = (uint8_t *)heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+
+        /* Step 2: Fallback to PSRAM (SPIRAM) */
         if (s_frame_buf == NULL) {
-            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("gyro: failed to allocate DMA frame buffer"));
+            s_frame_buf = (uint8_t *)heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+        }
+
+        /* Step 3: Generic DMA heap fallback */
+        if (s_frame_buf == NULL) {
+            s_frame_buf = (uint8_t *)heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        }
+
+        if (s_frame_buf == NULL) {
+            mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("gyro: failed to allocate DMA frame buffer in SRAM or PSRAM"));
         }
     }
 
@@ -346,10 +368,10 @@ static mp_obj_t gyro_start(size_t n_args, const mp_obj_t *args)
     int prev_min_y = 0;
     int prev_max_y = BB_H - 1;
 
-    int frame_count = 0;
     int fps_frame_count = 0;
     int64_t t_last_fps = esp_timer_get_time();
-    char fps_str[36] = "FPS: -- | Capped to 72";
+    char fps_str[36];
+    snprintf(fps_str, sizeof(fps_str), "FPS: -- | Capped to %d", target_fps);
 
     moclcd_fill_rect_internal(10, 10, 160, 12, COLOR_WHITE);
     moclcd_draw_text_internal(10, 10, fps_str, COLOR_BLACK, COLOR_WHITE);
@@ -371,7 +393,7 @@ static mp_obj_t gyro_start(size_t n_args, const mp_obj_t *args)
     const int core_cx = CENTER_X - BB_X;
     const int core_cy = CENTER_Y - BB_Y;
 
-    while (max_frames < 0 || frame_count < max_frames) {
+    while (true) {
         int64_t frame_start = esp_timer_get_time();
 
         /* MicroPython interrupt handler (Ctrl+C REPL break) */
@@ -659,10 +681,10 @@ static mp_obj_t gyro_start(size_t n_args, const mp_obj_t *args)
         rot2_y += 0.091f;
         rot2_z += 0.063f;
 
-        /* Hardware 72 FPS limiter */
+        /* Dynamic Target Frame Rate Limiter */
         int64_t elapsed_us = esp_timer_get_time() - frame_start;
-        if (elapsed_us < TARGET_FRAME_TIME_US) {
-            esp_rom_delay_us((uint32_t)(TARGET_FRAME_TIME_US - elapsed_us));
+        if (elapsed_us < (int64_t)target_frame_time_us) {
+            esp_rom_delay_us((uint32_t)((int64_t)target_frame_time_us - elapsed_us));
         }
 
         fps_frame_count++;
@@ -671,15 +693,13 @@ static mp_obj_t gyro_start(size_t n_args, const mp_obj_t *args)
             int64_t dt = now - t_last_fps;
             if (dt > 0) {
                 float fps = (fps_frame_count * 1000000.0f) / (float)dt;
-                snprintf(fps_str, sizeof(fps_str), "FPS: %.1f | Capped to 72", fps);
+                snprintf(fps_str, sizeof(fps_str), "FPS: %.1f | Capped to %d", fps, target_fps);
                 moclcd_fill_rect_internal(10, 10, 160, 10, COLOR_WHITE);
                 moclcd_draw_text_internal(10, 10, fps_str, COLOR_BLACK, COLOR_WHITE);
             }
             t_last_fps = now;
             fps_frame_count = 0;
         }
-
-        frame_count++;
     }
 
     return mp_const_none;
