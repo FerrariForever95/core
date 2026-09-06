@@ -1,9 +1,20 @@
+# =====================================================================================
+#  FILE:         highway_gtr.py
+#  MODULE:       highway (MicroPython pseudo-3D perspective racer demo)
+#  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 interface
+#  DRIVER:       moclcd v1.5.0-STABLE (Native C driver module via DMA)
+#  DESCRIPTION:  High-speed arcade perspective highway engine featuring a Nissan GT-R
+#                (R35) chase-cam model with dynamic road curvature scanlines, dual-tone
+#                rumble strips, dashed lane dividers, and suspension physics.
+# =====================================================================================
+
 import math
 import time
 import machine
 import moclcd
 import micropython
 
+# Lock CPU to peak 240 MHz clock for deterministic software rasterization
 machine.freq(240_000_000)
 
 WIDTH  = 480
@@ -11,6 +22,7 @@ HEIGHT = 320
 CX     = 240
 CY     = 124
 
+# Initialize ILI9488 panel via moclcd parallel bus
 moclcd.init()
 moclcd.panel_init()
 moclcd.backlight(1)
@@ -26,23 +38,19 @@ ROW_PITCH = BB_W * 2
 FRAME_BUF = bytearray(BB_W * BB_H * 2)
 
 # -------------------------------------------------------------------------
-# Hypercar Color Palette (Track Spec Carbon & Flare Orange / Jet Black)
+# Nissan GT-R (R35) Signature Palette: Bayside Blue & Carbon
 # -------------------------------------------------------------------------
-COL_BODY_BASE    = 0xFBE0  # Vivid Flame Orange / Sunset Gold
-COL_BODY_SHADOW  = 0xB9A0  # Shaded Underbody Orange
-COL_BODY_HL      = 0xFDC0  # Specular Edge Highlight
-COL_CARBON_DARK  = 0x1082  # Weave Base Carbon
-COL_CARBON_LGT   = 0x2124  # Exposed Satin Carbon
-COL_EXHAUST_GLOW = 0x54BE  # Burnt Blue Titanium Lips
-COL_DIFFUSER     = 0x0841  # Pure Matte Black Aerodynamics
-COL_TAIL_CORE    = 0xFFE0  # White-Hot LED Core
-COL_TAIL_RED     = 0xF800  # Intense Cherry LED Brake Bar
-COL_TAIL_BLOOM   = 0x9000  # Ambient Red Reflector Edge
-COL_GLASS_TINT   = 0x1185  # Deep Smoked Polycarbonate
-COL_ENGINE_MESH  = 0x18C3  # Rear Deck Cooling Grille
+COL_GTR_BLUE     = 0x1A7F  # Bayside Blue metallic
+COL_GTR_SHADOW   = 0x0974  # Deep under-bumper blue
+COL_CARBON_DIFF  = 0x10A2  # Carbon rear diffuser
+COL_CHROME_TIPS  = 0xCE79  # Large dual quad exhaust tips
+COL_TAIL_OUTER   = 0xF800  # Iconic dual ring outer red
+COL_TAIL_CORE    = 0xFFE0  # Concentric glowing halo core
+COL_GLASS_TINT   = 0x1125  # Dark tinted rear windshield
+COL_WING_CARBON  = 0x0841  # R35 trunk deck spoiler
 
 # -------------------------------------------------------------------------
-# Low-Level Rasterizers (Trapezoids & Solid Spans)
+# Low-Level Rasterizers
 # -------------------------------------------------------------------------
 @micropython.native
 def fill_rect(x0: int, y0: int, w: int, h: int, hi: int, lo: int, buf):
@@ -87,19 +95,18 @@ def fill_trapezoid(cx: int, y0: int, y1: int, w_top: int, w_bot: int, hi: int, l
                     offset += 2
 
 # -------------------------------------------------------------------------
-# Dynamic Track Scanline Renderer
+# Dynamic Curving Track
 # -------------------------------------------------------------------------
 @micropython.native
 def render_track(buf, pos_z: float, curve_val: float):
     pitch = 760
     bb_cx = 190
 
-    # 1. Sky Gradient with Horizon Haze
     for y in range(120):
         t = y * 0.00833
-        r = int(10.0 + t * 20.0)
-        g = int(14.0 + t * 24.0)
-        b = int(38.0 + t * 40.0)
+        r = int(12.0 + t * 18.0)
+        g = int(16.0 + t * 24.0)
+        b = int(40.0 + t * 38.0)
         hi = ((r & 0x1F) << 3) | ((g >> 3) & 0x07)
         lo = (((g & 0x07) << 5) | (b & 0x1F)) & 0xFF
         offset = y * pitch
@@ -108,7 +115,6 @@ def render_track(buf, pos_z: float, curve_val: float):
             buf[offset + 1] = lo
             offset += 2
 
-    # 2. Curving Highway Scanlines
     for y in range(120, 300):
         dy = y - 118
         z = 1800.0 / dy
@@ -159,79 +165,68 @@ def render_track(buf, pos_z: float, curve_val: float):
             offset += 2
 
 # -------------------------------------------------------------------------
-# Upgraded GT3 / Hypercar Model
+# Nissan GT-R (R35) Rear Profile Renderer
 # -------------------------------------------------------------------------
 @micropython.native
-def render_hypercar(cx: int, cy: int, steer_lean: int, buf):
-    # 1. Broad Aerodynamic Ground Contact Shadow
-    fill_trapezoid(cx, cy + 10, cy + 22, 114, 134, 0x08, 0x41, buf)
+def render_gtr(cx: int, cy: int, steer_lean: int, buf):
+    # 1. Ground contact shadow
+    fill_trapezoid(cx, cy + 10, cy + 22, 108, 126, 0x08, 0x41, buf)
 
-    # 2. Racing Slicks (Rear Wheels with Camber Angle)
-    fill_trapezoid(cx - 48, cy - 8, cy + 18, 18, 22, 0x18, 0xC3, buf)
-    fill_trapezoid(cx + 48, cy - 8, cy + 18, 18, 22, 0x18, 0xC3, buf)
-    # Inner Wheel Well Shadows
-    fill_rect(cx - 56, cy - 4, 8, 18, 0x00, 0x00, buf)
-    fill_rect(cx + 48, cy - 4, 8, 18, 0x00, 0x00, buf)
+    # 2. Wide rear tires
+    fill_rect(cx - 50, cy - 4, 16, 20, 0x18, 0xC3, buf)
+    fill_rect(cx + 34, cy - 4, 16, 20, 0x18, 0xC3, buf)
 
-    # 3. Race Rear Diffuser (Faceted Strakes & Negative Venting)
-    fill_trapezoid(cx, cy + 2, cy + 18, 86, 96, 0x10, 0x82, buf)
-    # 4 Vertical Diffuser Strakes
-    fill_rect(cx - 30, cy + 6, 3, 13, 0x00, 0x00, buf)
-    fill_rect(cx - 10, cy + 6, 3, 13, 0x00, 0x00, buf)
-    fill_rect(cx + 8,  cy + 6, 3, 13, 0x00, 0x00, buf)
-    fill_rect(cx + 28, cy + 6, 3, 13, 0x00, 0x00, buf)
+    # 3. Carbon rear diffuser with center rear fog light
+    fill_trapezoid(cx, cy + 2, cy + 16, 86, 94, 0x10, 0xA2, buf)
+    fill_rect(cx - 4, cy + 8, 8, 4, 0xF8, 0x00, buf)
 
-    # Central FIA Rain Light
-    fill_rect(cx - 4, cy + 10, 8, 5, 0xFE, 0x00, buf)
+    # 4. Massive Dual Quad Exhaust Tips (GT-R signature feature)
+    fill_rect(cx - 38, cy + 4, 10, 8, 0xCE, 0x79, buf)
+    fill_rect(cx - 26, cy + 4, 10, 8, 0xCE, 0x79, buf)
+    fill_rect(cx + 16, cy + 4, 10, 8, 0xCE, 0x79, buf)
+    fill_rect(cx + 28, cy + 4, 10, 8, 0xCE, 0x79, buf)
+    # Dark exhaust bores
+    fill_rect(cx - 36, cy + 6, 6, 4, 0x08, 0x41, buf)
+    fill_rect(cx - 24, cy + 6, 6, 4, 0x08, 0x41, buf)
+    fill_rect(cx + 18, cy + 6, 6, 4, 0x08, 0x41, buf)
+    fill_rect(cx + 30, cy + 6, 6, 4, 0x08, 0x41, buf)
 
-    # Quad Inset Titanium Exhaust Outlets
-    fill_rect(cx - 24, cy + 4, 9, 6, 0x21, 0x24, buf)
-    fill_rect(cx - 22, cy + 5, 5, 4, 0x54, 0xBE, buf)
-    fill_rect(cx + 15, cy + 4, 9, 6, 0x21, 0x24, buf)
-    fill_rect(cx + 17, cy + 5, 5, 4, 0x54, 0xBE, buf)
+    # 5. Broad, Muscular R35 Rear Bumper and Fenders
+    fill_trapezoid(cx, cy - 14, cy + 4, 98, 92, 0x09, 0x74, buf)
+    fill_trapezoid(cx, cy - 24, cy - 14, 92, 98, 0x1A, 0x7F, buf)
+    # Inset license plate recess
+    fill_rect(cx - 18, cy - 8, 36, 10, 0x10, 0xA2, buf)
 
-    # 4. Muscular Rear Haunches & Lower Bumper
-    fill_trapezoid(cx, cy - 14, cy + 4, 98, 92, 0xB9, 0xA0, buf)
-    fill_trapezoid(cx - 44, cy - 20, cy - 4, 24, 28, 0xFB, 0xE0, buf)
-    fill_trapezoid(cx + 44, cy - 20, cy - 4, 24, 28, 0xFB, 0xE0, buf)
-    fill_rect(cx - 32, cy - 12, 64, 14, 0x10, 0x82, buf)
+    # 6. Iconic 4 Circular Halo Taillights (Outer Large, Inner Small)
+    # Left Outer Ring
+    fill_rect(cx - 40, cy - 20, 10, 10, 0xF8, 0x00, buf)
+    fill_rect(cx - 38, cy - 18, 6, 6, 0xFF, 0xE0, buf)
+    # Left Inner Ring
+    fill_rect(cx - 26, cy - 19, 8, 8, 0xF8, 0x00, buf)
+    fill_rect(cx - 24, cy - 17, 4, 4, 0xFF, 0xE0, buf)
+    # Right Inner Ring
+    fill_rect(cx + 18, cy - 19, 8, 8, 0xF8, 0x00, buf)
+    fill_rect(cx + 20, cy - 17, 4, 4, 0xFF, 0xE0, buf)
+    # Right Outer Ring
+    fill_rect(cx + 30, cy - 20, 10, 10, 0xF8, 0x00, buf)
+    fill_rect(cx + 32, cy - 18, 6, 6, 0xFF, 0xE0, buf)
 
-    # 5. Continuous Sleek Blade Taillights
-    fill_rect(cx - 44, cy - 17, 88, 5, 0x90, 0x00, buf)
-    fill_rect(cx - 42, cy - 16, 84, 3, 0xF8, 0x00, buf)
-    fill_rect(cx - 38, cy - 15, 76, 1, 0xFF, 0xE0, buf)
-    fill_rect(cx - 44, cy - 14, 3, 5, 0xF8, 0x00, buf)
-    fill_rect(cx + 41, cy - 14, 3, 5, 0xF8, 0x00, buf)
+    # 7. Angular R35 Greenhouse Canopy & Tinted Glass
+    cockpit_cx = cx + steer_lean
+    fill_trapezoid(cockpit_cx, cy - 44, cy - 24, 52, 70, 0x1A, 0x7F, buf)
+    fill_trapezoid(cockpit_cx, cy - 42, cy - 26, 42, 58, 0x11, 0x25, buf)
 
-    # 6. Mid-Engine Deck, Slotted Cooling Louvres & Roofline
-    roof_offset = steer_lean
-    cockpit_cx = cx + roof_offset
-
-    fill_trapezoid(cockpit_cx, cy - 32, cy - 18, 62, 78, 0xFB, 0xE0, buf)
-    fill_rect(cockpit_cx - 20, cy - 28, 40, 2, 0x10, 0x82, buf)
-    fill_rect(cockpit_cx - 18, cy - 24, 36, 2, 0x10, 0x82, buf)
-    fill_rect(cockpit_cx - 16, cy - 20, 32, 2, 0x10, 0x82, buf)
-
-    fill_trapezoid(cockpit_cx, cy - 48, cy - 32, 42, 62, 0xFB, 0xE0, buf)
-    fill_trapezoid(cockpit_cx, cy - 45, cy - 33, 34, 52, 0x11, 0x85, buf)
-    fill_rect(cockpit_cx - 6, cy - 50, 12, 3, 0x10, 0x82, buf)
-
-    # 7. High-Downforce Swan-Neck GT Rear Wing
-    wing_cx = cx + (roof_offset >> 1)
-    wing_y = cy - 36
-
-    fill_rect(wing_cx - 18, wing_y + 4, 3, 14, 0x10, 0x82, buf)
-    fill_rect(wing_cx + 15, wing_y + 4, 3, 14, 0x10, 0x82, buf)
-
-    fill_trapezoid(wing_cx, wing_y, wing_y + 5, 96, 92, 0x21, 0x24, buf)
-    # Fixed: passed hi/lo bytes (0xFD, 0xC0) instead of single 16-bit integer
-    fill_rect(wing_cx - 46, wing_y + 1, 92, 2, 0xFD, 0xC0, buf)
-
-    fill_trapezoid(wing_cx - 48, wing_y - 4, wing_y + 9, 5, 7, 0xFB, 0xE0, buf)
-    fill_trapezoid(wing_cx + 47, wing_y - 4, wing_y + 9, 5, 7, 0xFB, 0xE0, buf)
+    # 8. Factory Trunk-Mounted Pedestal Spoiler
+    wing_cx = cx + (steer_lean >> 1)
+    wing_y = cy - 30
+    # Left and right mounting uprights
+    fill_rect(wing_cx - 28, wing_y + 4, 4, 8, 0x08, 0x41, buf)
+    fill_rect(wing_cx + 24, wing_y + 4, 4, 8, 0x08, 0x41, buf)
+    # Aerofoil main plane
+    fill_rect(wing_cx - 42, wing_y, 84, 4, 0x08, 0x41, buf)
 
 # -------------------------------------------------------------------------
-# Loop Runner
+# Main Game Loop
 # -------------------------------------------------------------------------
 def run():
     road_z = 0.0
@@ -244,12 +239,12 @@ def run():
         curve_phase += 0.022
         curve = math.sin(curve_phase) * 1.7
 
-        steer_lean = int(curve * 4.2)
-        car_draw_x = int(car_x + math.sin(curve_phase * 1.4) * 28.0)
+        steer_lean = int(curve * 3.6)
+        car_draw_x = int(car_x + math.sin(curve_phase * 1.4) * 26.0)
         suspension_bob = int(math.sin(road_z * 0.35) * 1.5)
 
         render_track(FRAME_BUF, road_z, curve)
-        render_hypercar(car_draw_x, car_y + suspension_bob, steer_lean, FRAME_BUF)
+        render_gtr(car_draw_x, car_y + suspension_bob, steer_lean, FRAME_BUF)
 
         moclcd.blit(BB_X, BB_Y, BB_W, BB_H, FRAME_BUF)
         time.sleep_ms(12)
