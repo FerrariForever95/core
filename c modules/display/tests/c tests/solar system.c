@@ -23,11 +23,12 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 
-extern void moclcd_init(void);
-extern void moclcd_panel_init(void);
-extern void moclcd_backlight(uint8_t state);
-extern void moclcd_fill_screen(uint16_t color);
-extern void moclcd_blit(int16_t x, int16_t y, int16_t w, int16_t h, const uint8_t *buf);
+// External hardware hooks pointing to original moclcd internal drivers
+extern void moclcd_init_internal(void);
+extern void moclcd_panel_init_internal(void);
+extern void moclcd_backlight_internal(bool on);
+extern void moclcd_fill_screen_internal(uint16_t color);
+extern void moclcd_blit_internal(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const void *buf);
 
 #define WIDTH     480
 #define HEIGHT    320
@@ -307,7 +308,7 @@ static int compare_planets(const void *a, const void *b) {
 
 static void solarsystem_render_task(void *pvParameters) {
     if (!s_chunk_buf) {
-        s_chunk_buf = (uint8_t * )heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        s_chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         if (!s_chunk_buf) {
             s_ss_running = false;
             vTaskDelete(NULL);
@@ -315,10 +316,10 @@ static void solarsystem_render_task(void *pvParameters) {
         }
     }
 
-    moclcd_init();
-    moclcd_panel_init();
-    moclcd_backlight(1);
-    moclcd_fill_screen(0x0000);
+    moclcd_init_internal();
+    moclcd_panel_init_internal();
+    moclcd_backlight_internal(true);
+    moclcd_fill_screen_internal(0x0000);
 
     init_starfield();
 
@@ -379,7 +380,7 @@ static void solarsystem_render_task(void *pvParameters) {
                 }
             }
 
-            moclcd_blit(0, y_start, WIDTH, CHUNK_H, s_chunk_buf);
+            moclcd_blit_internal(0, y_start, WIDTH, CHUNK_H, s_chunk_buf);
         }
 
         vTaskDelay(pdMS_TO_TICKS(8));
