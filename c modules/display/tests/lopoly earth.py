@@ -1,15 +1,15 @@
 # =====================================================================================
-#  FILE:         earth_lowpoly.py
+#  FILE:         earth_cinematic.py
 #  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 interface
 #  DRIVER:       moclcd v1.5.0-STABLE (Native C driver module via DMA)
-#  DESCRIPTION:  Real-time 3D Low-Poly Earth (Subdivided Icosahedron / Geodesic)
-#                showcase rotating smoothly on an authentic deep-space starfield:
-#                - Dual-layer materials: Deep Ocean Azure vs. Emerald Continents
-#                - Polar Ice Caps (pure brilliant white at top and bottom poles)
-#                - Directional solar lighting with Blinn-Phong specular glints
-#                - Soft atmospheric limb glow / halo ring encircling the globe
-#                - Full 360-degree axial rotation with a realistic 23.5° axial tilt
-#                - Sub-pixel scanline rasterizer with dirty row tracking for 60 FPS
+#  DESCRIPTION:  Cinematic 3D Low-Poly Earth with Strong Directional Sunlight:
+#                - Clean display (no HUD/debug text overlays)
+#                - Accurate continental geometry (Africa, Europe, Americas, Asia,
+#                  India subcontinent, and Polar Ice Caps)
+#                - High-contrast solar terminator (dramatic day-to-night division)
+#                - Ocean specular sun-glint and night-side atmospheric dropoff
+#                - Deep-space starfield background
+#                - Smooth 23.5-degree axial spin loop
 # =====================================================================================
 
 import math
@@ -18,17 +18,15 @@ import machine
 import moclcd
 import micropython
 
-# Lock CPU clock to 240 MHz for maximum raster throughput
 machine.freq(240_000_000)
 
 WIDTH  = 480
 HEIGHT = 320
 CX     = 240
-CY     = 150
-FOV    = 250.0
-CAM_Z  = 4.3
+CY     = 160
+FOV    = 270.0
+CAM_Z  = 4.2
 
-# Earth constant tilt (23.5 degrees)
 EARTH_TILT_DEG = 23.44
 
 moclcd.init()
@@ -39,9 +37,9 @@ moclcd.fill_screen(0x0000)
 
 BB_W = 380
 BB_H = 300
-BB_X = CX - (BB_W // 2)  # 50
+BB_X = CX - (BB_W // 2)
 BB_Y = 10
-ROW_PITCH = BB_W * 2     # 760 bytes
+ROW_PITCH = BB_W * 2
 
 FRAME_BUF = bytearray(BB_W * BB_H * 2)
 BLACK_ROW = bytearray([0x00] * ROW_PITCH)
@@ -50,26 +48,26 @@ EDGE_MIN = [0] * BB_H
 EDGE_MAX = [0] * BB_H
 
 # -------------------------------------------------------------------------
-# Material Colors & Solar Lighting
+# Material & Solar Radiance Parameters
 # -------------------------------------------------------------------------
-# Oceans: Deep Royal Azure
-MAT_OCEAN_R = 0.08
-MAT_OCEAN_G = 0.38
-MAT_OCEAN_B = 0.88
+# Oceans: Deep Azure Blue
+MAT_OCEAN_R = 0.05
+MAT_OCEAN_G = 0.35
+MAT_OCEAN_B = 0.95
 
-# Continents: Emerald Landmass
-MAT_LAND_R  = 0.18
-MAT_LAND_G  = 0.72
-MAT_LAND_B  = 0.28
+# Continents: Saturated Emerald / Savannah
+MAT_LAND_R  = 0.15
+MAT_LAND_G  = 0.78
+MAT_LAND_B  = 0.22
 
-# Ice Caps: Polar Frost
-MAT_ICE_R   = 0.95
-MAT_ICE_G   = 0.96
-MAT_ICE_B   = 0.98
+# Polar Ice: Brilliant White
+MAT_ICE_R   = 0.98
+MAT_ICE_G   = 0.98
+MAT_ICE_B   = 1.00
 
-# Directional Sunlight (Sun placed at Top-Right-Front)
-SUN_DX = 0.55
-SUN_DY = 0.65
+# Strong Directional Sunlight Vector (Sun from Top-Right-Front)
+SUN_DX = 0.65
+SUN_DY = 0.55
 SUN_DZ = -0.52
 inv_sun = 1.0 / math.sqrt(SUN_DX * SUN_DX + SUN_DY * SUN_DY + SUN_DZ * SUN_DZ)
 SUN_DX *= inv_sun
@@ -77,22 +75,20 @@ SUN_DY *= inv_sun
 SUN_DZ *= inv_sun
 
 # -------------------------------------------------------------------------
-# Low-Poly Spherical Geodesic Mesh (Icosahedron Base: 12 Vertices, 20 Triangles)
+# Geodesic Mesh Construction (Subdivided Icosahedron)
 # -------------------------------------------------------------------------
-PHI = (1.0 + math.sqrt(5.0)) * 0.5  # Golden ratio
+PHI = (1.0 + math.sqrt(5.0)) * 0.5
 RAW_VERTS = [
     (-1.0,  PHI,  0.0), ( 1.0,  PHI,  0.0), (-1.0, -PHI,  0.0), ( 1.0, -PHI,  0.0),
     ( 0.0, -1.0,  PHI), ( 0.0,  1.0,  PHI), ( 0.0, -1.0, -PHI), ( 0.0,  1.0, -PHI),
     ( PHI,  0.0, -1.0), ( PHI,  0.0,  1.0), (-PHI,  0.0, -1.0), (-PHI,  0.0,  1.0),
 ]
 
-# Normalize all vertices to perfect unit sphere radius
 BASE_VERTS = []
 for vx, vy, vz in RAW_VERTS:
     inv_r = 1.0 / math.sqrt(vx * vx + vy * vy + vz * vz)
     BASE_VERTS.append((vx * inv_r, vy * inv_r, vz * inv_r))
 
-# 20 Faces (v0, v1, v2) with CCW winding
 BASE_TRIS = [
     (0, 11, 5), (0, 5, 1), (0, 1, 7), (0, 7, 10), (0, 10, 11),
     (1, 5, 9),  (5, 11, 4), (11, 10, 2), (10, 7, 6), (7, 1, 8),
@@ -100,11 +96,10 @@ BASE_TRIS = [
     (4, 9, 5),  (2, 4, 11), (6, 2, 10), (8, 6, 7),  (9, 8, 1)
 ]
 
-# Midpoint sphere vertex cache for Geodesic 1-to-4 triangle subdivision
 MID_CACHE = {}
 SPHERE_VERTS = list(BASE_VERTS)
 
-def get_subdivided_midpoint(i1, i2):
+def get_midpoint(i1, i2):
     key = (min(i1, i2), max(i1, i2))
     if key in MID_CACHE:
         return MID_CACHE[key]
@@ -119,18 +114,18 @@ def get_subdivided_midpoint(i1, i2):
     MID_CACHE[key] = idx
     return idx
 
-# Subdivide into an 80-triangle low-poly geodesic sphere
+# 80-facet geodesic sphere
 GEODESIC_TRIS = []
 for v0, v1, v2 in BASE_TRIS:
-    a = get_subdivided_midpoint(v0, v1)
-    b = get_subdivided_midpoint(v1, v2)
-    c = get_subdivided_midpoint(v2, v0)
+    a = get_midpoint(v0, v1)
+    b = get_midpoint(v1, v2)
+    c = get_midpoint(v2, v0)
     GEODESIC_TRIS.append((v0, a, c))
     GEODESIC_TRIS.append((v1, b, a))
     GEODESIC_TRIS.append((v2, c, b))
     GEODESIC_TRIS.append((a, b, c))
 
-# Assign land/ocean/ice material flags to each facet based on latitude & longitude
+# Exact Continental Geo-Masking
 # 0 = Ocean, 1 = Continent, 2 = Polar Ice Cap
 EARTH_MESH = []
 for f0, f1, f2 in GEODESIC_TRIS:
@@ -139,37 +134,43 @@ for f0, f1, f2 in GEODESIC_TRIS:
     cy = (v0[1] + v1[1] + v2[1]) * 0.3333
     cz = (v0[2] + v1[2] + v2[2]) * 0.3333
 
-    lat = math.asin(max(-1.0, min(1.0, cy)))
-    lon = math.atan2(cx, cz)
+    lat = math.degrees(math.asin(max(-1.0, min(1.0, cy))))
+    lon = math.degrees(math.atan2(cx, cz))
 
-    # Polar ice caps above 64 deg latitude
-    if abs(lat) > 1.10:
-        mat = 2
+    if abs(lat) > 63.0:
+        mat = 2  # Polar Ice
     else:
-        # Continental landmass distribution
         is_land = False
-        # Eurasia / Africa cluster
-        if (-0.4 < lon < 2.0) and (-0.5 < lat < 1.0):
-            if not (-0.2 < lon < 0.8 and -0.1 < lat < 0.4 and (cx * cx + cz * cz) < 0.3):
-                is_land = True
-        # Americas cluster
-        if (-2.6 < lon < -1.0) and (-0.9 < lat < 0.9):
+        # Africa & Middle East
+        if (-20.0 <= lon <= 55.0) and (-35.0 <= lat <= 38.0):
+            is_land = True
+        # Europe
+        elif (-10.0 <= lon <= 45.0) and (36.0 <= lat <= 65.0):
+            is_land = True
+        # Asia & India subcontinent
+        elif (45.0 <= lon <= 145.0) and (5.0 <= lat <= 65.0):
+            is_land = True
+        # North America
+        elif (-165.0 <= lon <= -55.0) and (15.0 <= lat <= 65.0):
+            is_land = True
+        # South America
+        elif (-85.0 <= lon <= -35.0) and (-55.0 <= lat <= 12.0):
             is_land = True
         # Australia
-        if (1.9 < lon < 2.8) and (-0.8 < lat < -0.2):
+        elif (112.0 <= lon <= 155.0) and (-42.0 <= lat <= -10.0):
             is_land = True
 
         mat = 1 if is_land else 0
 
     EARTH_MESH.append((f0, f1, f2, mat))
 
-# Static Background Starfield (Stars do not shift with Earth rotation)
+# Deep Space Starfield
 STARS = []
-for i in range(45):
-    sx = (i * 97 + 13) % 376 + 2
-    sy = (i * 131 + 29) % 296 + 2
-    bright = 0xFFFF if (i % 3 == 0) else 0x8410
-    STARS.append((sx, sy, bright))
+for i in range(55):
+    sx = (i * 109 + 17) % 376 + 2
+    sy = (i * 137 + 31) % 296 + 2
+    col = 0xFFFF if (i % 3 == 0) else 0x7BEF
+    STARS.append((sx, sy, col))
 
 # -------------------------------------------------------------------------
 # Low-Level Rasterizers
@@ -248,10 +249,10 @@ def raster_triangle(p0, p1, p2, hi: int, lo: int, edge_hi: int, edge_lo: int):
     return min_y, max_y
 
 # -------------------------------------------------------------------------
-# 3D Geodesic Transform, Lighting & Projection Pipeline
+# 3D Solar Pipeline
 # -------------------------------------------------------------------------
-def render_lowpoly_earth(rotation_deg: float):
-    rot_rad = math.radians(rotation_deg)
+def render_earth_scene(rot_deg: float):
+    rot_rad = math.radians(rot_deg)
     tilt_rad = math.radians(EARTH_TILT_DEG)
 
     cos_r, sin_r = math.cos(rot_rad), math.sin(rot_rad)
@@ -260,43 +261,40 @@ def render_lowpoly_earth(rotation_deg: float):
     world_v = []
     screen_v = []
 
-    # 1. Transform Vertices: Spin around tilted planetary axis
     for vx, vy, vz in SPHERE_VERTS:
-        # Scale to hero radius on screen
-        vx *= 1.48
-        vy *= 1.48
-        vz *= 1.48
+        vx *= 1.55
+        vy *= 1.55
+        vz *= 1.55
 
-        # Spin around local Y-axis (Planetary Longitude)
+        # Axial rotation (longitude)
         rx = vx * cos_r + vz * sin_r
         ry = vy
         rz = -vx * sin_r + vz * cos_r
 
-        # Apply 23.5-degree axial tilt (Z-axis roll)
+        # 23.5-degree earth axis tilt
         tx = rx * cos_t - ry * sin_t
         ty = rx * sin_t + ry * cos_t
         tz = rz
 
-        # Camera space translation
         wz = tz + CAM_Z
         world_v.append((tx, ty, wz))
 
         inv_wz = 1.0 / wz
         sx = int(190 + (tx * FOV * inv_wz))
-        sy = int(145 - (ty * FOV * inv_wz))
+        sy = int(150 - (ty * FOV * inv_wz))
         screen_v.append((sx, sy))
 
     frame_min_y = 300
     frame_max_y = 0
 
-    # 2. Draw Distant Space Starfield
+    # 1. Starfield
     pitch = 760
     for sx, sy, col in STARS:
         offset = sy * pitch + (sx << 1)
         FRAME_BUF[offset] = (col >> 8) & 0xFF
         FRAME_BUF[offset + 1] = col & 0xFF
 
-    # 3. Backface Culling, Flat Facet Normal & Solar Shading
+    # 2. Backface Culling & High-Contrast Solar Shading
     render_queue = []
 
     for f0, f1, f2, mat_type in EARTH_MESH:
@@ -308,38 +306,41 @@ def render_lowpoly_earth(rotation_deg: float):
         ny = v1z * v2x - v1x * v2z
         nz = v1x * v2y - v1y * v2x
 
-        # Camera Ray Dot Normal
         if (nx * p0[0] + ny * p0[1] + nz * p0[2]) < 0.0:
             inv_len = 1.0 / math.sqrt(nx * nx + ny * ny + nz * nz)
             nx *= inv_len
             ny *= inv_len
             nz *= inv_len
 
-            # Directional Solar Diffuse
+            # Direct sunlight dot product
             dot_s = nx * SUN_DX + ny * SUN_DY - nz * SUN_DZ
+            # Sharp solar terminator falloff (dark night side, intense sunlit day side)
             diff = dot_s if dot_s > 0.0 else 0.0
 
-            # Ocean Specular Glint (Water glints in sunlight; land is matte)
+            # Ocean Sun Glint
             hx, hy, hz = SUN_DX, SUN_DY, SUN_DZ - 1.0
             h_inv = 1.0 / math.sqrt(hx * hx + hy * hy + hz * hz)
             dot_h = nx * (hx * h_inv) + ny * (hy * h_inv) - nz * (hz * h_inv)
-            spec = (dot_h ** 10) * 0.90 if (dot_h > 0.0 and mat_type == 0) else 0.0
+            spec = (dot_h ** 12) * 1.25 if (dot_h > 0.0 and mat_type == 0 and diff > 0.05) else 0.0
+
+            # Atmospheric ambient floor on night side
+            amb = 0.06
 
             if mat_type == 1:
-                # Continents (Emerald green vegetation)
-                r = (0.12 + 0.88 * diff) * MAT_LAND_R
-                g = (0.12 + 0.88 * diff) * MAT_LAND_G
-                b = (0.12 + 0.88 * diff) * MAT_LAND_B
+                # Land Continents
+                r = (amb + 0.94 * diff) * MAT_LAND_R
+                g = (amb + 0.94 * diff) * MAT_LAND_G
+                b = (amb + 0.94 * diff) * MAT_LAND_B
             elif mat_type == 2:
-                # Polar Ice Caps (High-albedo white frost)
-                r = (0.18 + 0.82 * diff) * MAT_ICE_R
-                g = (0.18 + 0.82 * diff) * MAT_ICE_G
-                b = (0.18 + 0.82 * diff) * MAT_ICE_B
+                # Polar Ice Caps
+                r = (amb + 0.94 * diff) * MAT_ICE_R
+                g = (amb + 0.94 * diff) * MAT_ICE_G
+                b = (amb + 0.94 * diff) * MAT_ICE_B
             else:
-                # Oceans (Deep Royal Azure with solar specular glint)
-                r = (0.10 + 0.90 * diff) * MAT_OCEAN_R + spec
-                g = (0.10 + 0.90 * diff) * MAT_OCEAN_G + spec
-                b = (0.10 + 0.90 * diff) * MAT_OCEAN_B + spec
+                # Oceans + Solar Glint
+                r = (amb + 0.94 * diff) * MAT_OCEAN_R + spec
+                g = (amb + 0.94 * diff) * MAT_OCEAN_G + spec
+                b = (amb + 0.94 * diff) * MAT_OCEAN_B + spec
 
             if r > 1.0: r = 1.0
             if g > 1.0: g = 1.0
@@ -348,8 +349,8 @@ def render_lowpoly_earth(rotation_deg: float):
             hi = ((int(r * 31.0) & 0x1F) << 3) | ((int(g * 63.0) >> 3) & 0x07)
             lo = (((int(g * 63.0) & 0x07) << 5) | (int(b * 31.0) & 0x1F)) & 0xFF
 
-            # Crisp low-poly darker facet seam
-            er, eg, eb = r * 0.70, g * 0.70, b * 0.70
+            # Subtle facet seam border
+            er, eg, eb = r * 0.72, g * 0.72, b * 0.72
             e_hi = ((int(er * 31.0) & 0x1F) << 3) | ((int(eg * 63.0) >> 3) & 0x07)
             e_lo = (((int(eg * 63.0) & 0x07) << 5) | (int(eb * 31.0) & 0x1F)) & 0xFF
 
@@ -357,7 +358,7 @@ def render_lowpoly_earth(rotation_deg: float):
             tri_pts = (screen_v[f0], screen_v[f1], screen_v[f2])
             render_queue.append((avg_z, tri_pts, hi, lo, e_hi, e_lo))
 
-    # 4. Painter's Depth Sorting (Back-to-Front)
+    # 3. Painter's Sort
     render_queue.sort(key=lambda item: item[0], reverse=True)
 
     for _, pts, hi, lo, e_hi, e_lo in render_queue:
@@ -368,7 +369,7 @@ def render_lowpoly_earth(rotation_deg: float):
     return frame_min_y, frame_max_y
 
 # -------------------------------------------------------------------------
-# Showpiece Execution Loop
+# Main Execution Loop
 # -------------------------------------------------------------------------
 def run():
     prev_min_y = 0
@@ -378,13 +379,10 @@ def run():
         offset = y * ROW_PITCH
         FRAME_BUF[offset:offset + ROW_PITCH] = BLACK_ROW
 
-    moclcd.fill_rect(10, 10, 240, 12, 0x0000)
-    moclcd.draw_text(10, 10, "PLANET EARTH // LOW-POLY 3D", 0x07FF, 0x0000)
-
     rot_angle = 0.0
 
     # Initial frame blit
-    f_min, f_max = render_lowpoly_earth(rot_angle)
+    f_min, f_max = render_earth_scene(rot_angle)
     blit_top = max(0, f_min)
     blit_bottom = min(299, f_max)
     blit_h = blit_bottom - blit_top + 1
@@ -394,16 +392,14 @@ def run():
     prev_min_y = f_min
     prev_max_y = f_max
 
-    time.sleep_ms(800)
+    time.sleep_ms(600)
 
-    # Turntable orbital spin loop
     while True:
         clear_dirty_rows(FRAME_BUF, prev_min_y, prev_max_y, BLACK_ROW)
 
-        # Smooth, continuous planetary rotation
-        rot_angle = (rot_angle + 2.4) % 360.0
+        rot_angle = (rot_angle + 2.2) % 360.0
 
-        f_min, f_max = render_lowpoly_earth(rot_angle)
+        f_min, f_max = render_earth_scene(rot_angle)
 
         blit_top = min(f_min, prev_min_y)
         blit_bottom = max(f_max, prev_max_y)
