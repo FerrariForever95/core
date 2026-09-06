@@ -1,12 +1,7 @@
 // =====================================================================================
 //  FILE:         modsolarsys.c
 //  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 Bus via DMA
-//  DESCRIPTION:  Full-Screen (480x320) Native C Solar System Engine:
-//                - Continuous radial exponential Sun gradient
-//                - Multi-tier twinkling procedural starfield (200 stars)
-//                - 8 Planets with individual radii, speeds, and correct axial tilts
-//                - Depth-sorted rendering with accurate ring occlusion for Saturn
-//                - Exposes Python API: solarsystem.start(), solarsystem.stop()
+//  DESCRIPTION:  Direct-Execution Synchronous Full-Screen (480x320) Solar System Engine
 // =====================================================================================
 
 #include <stdint.h>
@@ -18,8 +13,6 @@
 #include "py/obj.h"
 #include "py/mphal.h"
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 
@@ -70,9 +63,6 @@ static planet_cfg_t s_planets[8] = {
 };
 
 static star_node_t s_stars[NUM_STARS];
-static uint8_t *s_chunk_buf = NULL;
-static TaskHandle_t s_ss_task_handle = NULL;
-static volatile bool s_ss_running = false;
 
 static uint32_t s_rng_seed = 0x6B18D3C1;
 static inline uint32_t lcg_rand(void) {
@@ -306,14 +296,11 @@ static int compare_planets(const void *a, const void *b) {
     return 0;
 }
 
-static void solarsystem_render_task(void *pvParameters) {
-    if (!s_chunk_buf) {
-        s_chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-        if (!s_chunk_buf) {
-            s_ss_running = false;
-            vTaskDelete(NULL);
-            return;
-        }
+// solarsystem.start() - Synchronous direct-execution loop with Ctrl+C interrupt handling
+static mp_obj_t mod_solarsystem_start(void) {
+    uint8_t *chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!chunk_buf) {
+        mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("Failed to allocate chunk DMA buffer"));
     }
 
     moclcd_init_internal();
@@ -327,7 +314,9 @@ static void solarsystem_render_task(void *pvParameters) {
     float cam_cos = cosf(34.0f * 3.14159f / 180.0f);
     float cam_sin = sinf(34.0f * 3.14159f / 180.0f);
 
-    while (s_ss_running) {
+    while (true) {
+        mp_handle_pending(true); // Enables clean Ctrl+C interruption back to REPL
+
         star_timer += 0.05f;
 
         projected_planet_t proj[8];
@@ -365,66 +354,35 @@ static void solarsystem_render_task(void *pvParameters) {
             int y_start = c * CHUNK_H;
             int y_end = y_start + CHUNK_H;
 
-            memset(s_chunk_buf, 0x00, CHUNK_SIZE);
+            memset(chunk_buf, 0x00, CHUNK_SIZE);
 
-            render_stars_chunk(star_timer, y_start, y_end, s_chunk_buf);
-            render_smooth_sun_chunk(y_start, y_end, s_chunk_buf);
+            render_stars_chunk(star_timer, y_start, y_end, chunk_buf);
+            render_smooth_sun_chunk(y_start, y_end, chunk_buf);
 
             for (int i = 0; i < 8; ++i) {
                 int p_id = proj[i].idx;
                 if (p_id == 5) { // Saturn
-                    render_detailed_planet_chunk(y_start, y_end, s_chunk_buf, p_id, proj[i].sx, proj[i].sy, proj[i].sr, proj[i].lx, proj[i].ly, proj[i].lz, proj[i].cos_t, proj[i].sin_t);
-                    render_saturn_rings_unified_chunk(y_start, y_end, s_chunk_buf, proj[i].sx, proj[i].sy, proj[i].sr, proj[i].cos_t, proj[i].sin_t);
+                    render_detailed_planet_chunk(y_start, y_end, chunk_buf, p_id, proj[i].sx, proj[i].sy, proj[i].sr, proj[i].lx, proj[i].ly, proj[i].lz, proj[i].cos_t, proj[i].sin_t);
+                    render_saturn_rings_unified_chunk(y_start, y_end, chunk_buf, proj[i].sx, proj[i].sy, proj[i].sr, proj[i].cos_t, proj[i].sin_t);
                 } else {
-                    render_detailed_planet_chunk(y_start, y_end, s_chunk_buf, p_id, proj[i].sx, proj[i].sy, proj[i].sr, proj[i].lx, proj[i].ly, proj[i].lz, proj[i].cos_t, proj[i].sin_t);
+                    render_detailed_planet_chunk(y_start, y_end, chunk_buf, p_id, proj[i].sx, proj[i].sy, proj[i].sr, proj[i].lx, proj[i].ly, proj[i].lz, proj[i].cos_t, proj[i].sin_t);
                 }
             }
 
-            moclcd_blit_internal(0, y_start, WIDTH, CHUNK_H, s_chunk_buf);
+            moclcd_blit_internal(0, y_start, WIDTH, CHUNK_H, chunk_buf);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(8));
+        mp_hal_delay_ms(8);
     }
 
-    if (s_chunk_buf) {
-        heap_caps_free(s_chunk_buf);
-        s_chunk_buf = NULL;
-    }
-    s_ss_task_handle = NULL;
-    vTaskDelete(NULL);
-}
-
-// -------------------------------------------------------------------------
-// MicroPython C-Module Interface
-// -------------------------------------------------------------------------
-static mp_obj_t mod_solarsystem_start(void) {
-    if (s_ss_running) return mp_const_none;
-    s_ss_running = true;
-
-    BaseType_t res = xTaskCreatePinnedToCore(solarsystem_render_task, "ss_task", 8192, NULL, 5, &s_ss_task_handle, 1);
-    if (res != pdPASS) {
-        s_ss_running = false;
-        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to start solar system task"));
-    }
+    heap_caps_free(chunk_buf);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_0(mod_solarsystem_start_obj, mod_solarsystem_start);
 
-static mp_obj_t mod_solarsystem_stop(void) {
-    if (s_ss_running) {
-        s_ss_running = false;
-        while (s_ss_task_handle != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-    return mp_const_none;
-}
-static MP_DEFINE_CONST_FUN_OBJ_0(mod_solarsystem_stop_obj, mod_solarsystem_stop);
-
 static const mp_rom_map_elem_t solarsystem_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_solarsystem) },
     { MP_ROM_QSTR(MP_QSTR_start),    MP_ROM_PTR(&mod_solarsystem_start_obj) },
-    { MP_ROM_QSTR(MP_QSTR_stop),     MP_ROM_PTR(&mod_solarsystem_stop_obj) },
 };
 static MP_DEFINE_CONST_DICT(solarsystem_globals, solarsystem_globals_table);
 
