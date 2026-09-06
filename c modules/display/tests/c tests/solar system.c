@@ -1,5 +1,5 @@
 // =====================================================================================
-//  FILE:         modsolarsystem.c
+//  FILE:         modsolarsys.c
 //  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 Bus via DMA
 //  DESCRIPTION:  Full-Screen (480x320) Native C Solar System Engine:
 //                - Continuous radial exponential Sun gradient
@@ -204,7 +204,7 @@ static void render_detailed_planet_chunk(int y_start, int y_end, uint8_t *buf, i
                     float br = 0.5f, bg = 0.5f, bb = 0.5f;
                     if (p_id == 2) { // Earth
                         if (abs_lat > 0.78f) { br = 1.f; bg = 1.f; bb = 1.f; }
-                        else if (absf(sinf(nx * 4.0f + lat * 3.0f)) > 0.40f) { br = 0.18f; bg = 0.74f; bb = 0.28f; }
+                        else if (fabsf(sinf(nx * 4.0f + lat * 3.0f)) > 0.40f) { br = 0.18f; bg = 0.74f; bb = 0.28f; }
                         else { br = 0.08f; bg = 0.48f; bb = 0.98f; }
                     } else if (p_id == 4) { // Jupiter
                         if (((int)(abs_lat * 7.0f) & 1) == 0) { br = 0.92f; bg = 0.74f; bb = 0.52f; }
@@ -223,7 +223,9 @@ static void render_detailed_planet_chunk(int y_start, int y_end, uint8_t *buf, i
                     float g = (amb + diff * 1.65f) * bg;
                     float b = (amb + diff * 1.65f) * bb;
 
-                    if (r > 1.f) r = 1.f; if (g > 1.f) g = 1.f; if (b > 1.f) b = 1.f;
+                    if (r > 1.f) r = 1.f;
+                    if (g > 1.f) g = 1.f;
+                    if (b > 1.f) b = 1.f;
 
                     uint16_t r_int = (uint16_t)(r * 31.0f);
                     uint16_t g_int = (uint16_t)(g * 63.0f);
