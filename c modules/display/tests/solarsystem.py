@@ -3,6 +3,7 @@
 #  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 interface
 #  DRIVER:       moclcd v1.5.0-STABLE (Native C driver module via DMA)
 #  DESCRIPTION:  Real-time 3D Solar System Simulation on ESP32-S3:
+#                - 160+ Procedural pseudo-random stars with multi-tier twinkling
 #                - Glowing central Sun radiating omnidirectional light & solar corona
 #                - Strict radial order: Mercury, Venus, Earth, Mars, Jupiter, Saturn,
 #                  Uranus, Neptune with relative scaling for MCU resolution
@@ -51,9 +52,7 @@ CAM_SIN = math.sin(math.radians(CAM_TILT_DEG))
 
 # -------------------------------------------------------------------------
 # Planetary Configuration: [OrbitRadius, RelRadius, OrbitalSpeed, BaseColor(R,G,B)]
-# Radii & Distances scaled perceptually so all 8 planets remain visible on 480x320
 # -------------------------------------------------------------------------
-# Central Sun
 SUN_RADIUS = 24
 
 PLANETS = [
@@ -75,16 +74,28 @@ PLANETS = [
     {"name": "neptune", "dist": 3.10, "r": 0.120, "speed": 0.007, "col": (0.18, 0.38, 0.92), "angle": 4.7},
 ]
 
-# Random Distant Starfield Background (60 Stars)
-STARS = []
-for i in range(60):
-    sx = (i * 113 + 23) % (BB_W - 4) + 2
-    sy = (i * 149 + 37) % (BB_H - 4) + 2
-    col = 0xFFFF if (i % 3 == 0) else (0x9CD3 if (i % 2 == 0) else 0x4A49)
-    STARS.append((sx, sy, col))
+# -------------------------------------------------------------------------
+# Random Starfield Generation (160 Stars across the entire frame)
+# -------------------------------------------------------------------------
+NUM_STARS = 160
+STAR_DATA = []
+
+seed = 0x5A17A8C9
+def lcg_rand():
+    global seed
+    seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+    return seed
+
+for i in range(NUM_STARS):
+    sx = int((lcg_rand() % (BB_W - 8)) + 4)
+    sy = int((lcg_rand() % (BB_H - 8)) + 4)
+    tier = i % 4
+    twinkle_phase = float((lcg_rand() % 628)) * 0.01
+    twinkle_speed = 0.06 + float((lcg_rand() % 120)) * 0.001
+    STAR_DATA.append((sx, sy, tier, twinkle_phase, twinkle_speed))
 
 # -------------------------------------------------------------------------
-# Low-Level Rasterizers
+# Low-Level Fast Rasterizers
 # -------------------------------------------------------------------------
 @micropython.native
 def clear_dirty_rows(buf, y0: int, y1: int, black_row):
@@ -94,9 +105,21 @@ def clear_dirty_rows(buf, y0: int, y1: int, black_row):
         buf[offset:offset + 760] = black_row
 
 @micropython.native
-def draw_starfield(buf):
+def render_twinkling_stars(t: float, buf):
     pitch = 760
-    for sx, sy, col in STARS:
+    for sx, sy, tier, phase, spd in STAR_DATA:
+        tw = math.sin(t * spd + phase)
+        
+        # Color tiers: Diamond White, Cyan tint, Mid Silver, Distant Grey
+        if tier == 0:
+            col = 0xFFFF if tw > -0.2 else 0xCE79
+        elif tier == 1:
+            col = 0x9E7F if tw > 0.0 else 0x52AA
+        elif tier == 2:
+            col = 0x8410 if tw > 0.2 else 0x4208
+        else:
+            col = 0x5ACB if tw > 0.4 else 0x2104
+
         offset = sy * pitch + (sx << 1)
         buf[offset]     = (col >> 8) & 0xFF
         buf[offset + 1] = col & 0xFF
@@ -124,29 +147,22 @@ def render_sun_core(buf, cx: int, cy: int, r_sun: int):
                 d2 = dx * dx + dy2
 
                 if d2 <= r2_sun:
-                    # White-hot incandescent solar plasma core
                     if d2 < (r2_sun * 0.45):
                         buf[offset + (x << 1)]     = 0xFF
                         buf[offset + (x << 1) + 1] = 0xFF
                     else:
-                        # Golden yellow limb
                         buf[offset + (x << 1)]     = 0xFF
                         buf[offset + (x << 1) + 1] = 0xE0
                 elif d2 <= r2_corona:
-                    # Glowing radial amber corona rim
                     buf[offset + (x << 1)]     = 0xFC
                     buf[offset + (x << 1) + 1] = 0x00
 
-# -------------------------------------------------------------------------
-# Analytical Planet Sphere Rasterizer (Lit from Central Sun)
-# -------------------------------------------------------------------------
 @micropython.native
 def render_planet_sphere(buf, sx: int, sy: int, sr: int,
                          lx: float, ly: float, lz: float,
                          base_r: float, base_g: float, base_b: float):
     pitch = 760
     if sr < 2:
-        # Sub-pixel fallback: simple point
         if 0 <= sx < 380 and 0 <= sy < 300:
             hi = ((int(base_r * 31.0) & 0x1F) << 3) | ((int(base_g * 63.0) >> 3) & 0x07)
             lo = (((int(base_g * 63.0) & 0x07) << 5) | (int(base_b * 31.0) & 0x1F)) & 0xFF
@@ -186,11 +202,9 @@ def render_planet_sphere(buf, sx: int, sy: int, sr: int,
                 if nz2 > 0.0:
                     nz = math.sqrt(nz2)
 
-                    # Directional diffuse from Sun position
                     dot_l = nx * lx + l_dot_y + nz * lz
                     diff = dot_l if dot_l > 0.0 else 0.0
 
-                    # Solar ambient baseline
                     amb = 0.12
                     r = (amb + diff * 1.55) * base_r
                     g = (amb + diff * 1.55) * base_g
@@ -207,9 +221,6 @@ def render_planet_sphere(buf, sx: int, sy: int, sr: int,
 
     return y_min, y_max
 
-# -------------------------------------------------------------------------
-# Saturn's Analytical Tilted Ring Arc Rasterizer
-# -------------------------------------------------------------------------
 @micropython.native
 def render_saturn_rings(buf, pcx: int, pcy: int, sr: int, is_front: int):
     pitch = 760
@@ -239,22 +250,20 @@ def render_saturn_rings(buf, pcx: int, pcy: int, sr: int, is_front: int):
                 r_plane2 = dx * dx + plane_y2
 
                 if r_in2 <= r_plane2 <= r_out2:
-                    # Main ring color with subtle brightness roll-off
                     buf[offset + (x << 1)]     = 0xDE
                     buf[offset + (x << 1) + 1] = 0x54
 
 # -------------------------------------------------------------------------
 # Scene Rendering Pipeline
 # -------------------------------------------------------------------------
-def render_solar_system():
+def render_solar_system(star_timer: float):
     frame_min_y = 300
     frame_max_y = 0
 
-    # 1. Distant space starfield
-    draw_starfield(FRAME_BUF)
+    # 1. Distant space starfield with random twinkle
+    render_twinkling_stars(star_timer, FRAME_BUF)
 
-    # 2. Project Sun (Dead Center: 0, 0, 0)
-    sun_wz = CAM_Z
+    # 2. Project Central Sun (0, 0, 0)
     sun_sx = 190
     sun_sy = 150
     render_sun_core(FRAME_BUF, sun_sx, sun_sy, SUN_RADIUS)
@@ -263,15 +272,12 @@ def render_solar_system():
     render_queue = []
 
     for p in PLANETS:
-        # Advance orbital angle along plane
         p["angle"] += p["speed"]
 
-        # Planetary position in coplanar XZ orbital plane
         px = math.cos(p["angle"]) * (p["dist"] * 1.15)
         pz = math.sin(p["angle"]) * (p["dist"] * 1.15)
         py = 0.0
 
-        # Tilt scene towards camera view
         cam_x = px
         cam_y = py * CAM_COS - pz * CAM_SIN
         cam_z = py * CAM_SIN + pz * CAM_COS + CAM_Z
@@ -281,8 +287,7 @@ def render_solar_system():
         sy = int(150 - (cam_y * FOV * inv_wz))
         sr = max(1, int(p["r"] * FOV * inv_wz * 1.1))
 
-        # Solar lighting unit vector from Sun (0,0,0) to Planet in camera space
-        # Inverted so dot product points toward the light source
+        # Unit lighting vector from Sun toward Planet
         lx = -cam_x
         ly = -cam_y
         lz = -(cam_z - CAM_Z)
@@ -293,13 +298,12 @@ def render_solar_system():
 
         render_queue.append((cam_z, p["name"], sx, sy, sr, lx, ly, lz, p["col"]))
 
-    # 4. Painter's Depth Sorting (Back-to-Front: Largest Z rendered first)
+    # 4. Painter's Depth Sorting
     render_queue.sort(key=lambda item: item[0], reverse=True)
 
     # 5. Render Orbiting Bodies
     for z, name, sx, sy, sr, lx, ly, lz, col in render_queue:
         if name == "saturn":
-            # Back ring arc
             render_saturn_rings(FRAME_BUF, sx, sy, sr, 0)
 
         p_min, p_max = render_planet_sphere(FRAME_BUF, sx, sy, sr, lx, ly, lz, col[0], col[1], col[2])
@@ -307,10 +311,8 @@ def render_solar_system():
         if p_max > frame_max_y: frame_max_y = p_max
 
         if name == "saturn":
-            # Front ring arc sweeps across planet
             render_saturn_rings(FRAME_BUF, sx, sy, sr, 1)
 
-    # Ensure Sun region is included in bounding update
     if (sun_sy - SUN_RADIUS - 8) < frame_min_y: frame_min_y = sun_sy - SUN_RADIUS - 8
     if (sun_sy + SUN_RADIUS + 8) > frame_max_y: frame_max_y = sun_sy + SUN_RADIUS + 8
 
@@ -327,10 +329,13 @@ def run():
         offset = y * ROW_PITCH
         FRAME_BUF[offset:offset + ROW_PITCH] = BLACK_ROW
 
+    star_timer = 0.0
+
     while True:
         clear_dirty_rows(FRAME_BUF, prev_min_y, prev_max_y, BLACK_ROW)
 
-        f_min, f_max = render_solar_system()
+        star_timer += 0.05
+        f_min, f_max = render_solar_system(star_timer)
 
         blit_top = min(f_min, prev_min_y)
         blit_bottom = max(f_max, prev_max_y)
