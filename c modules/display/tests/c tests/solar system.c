@@ -2,6 +2,7 @@
 //  FILE:         modsolarsys.c
 //  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 Bus via DMA
 //  DESCRIPTION:  Direct-Execution Synchronous Full-Screen (480x320) Solar System Engine
+//                with adjustable target FPS (e.g., solarsystem.start(50))
 // =====================================================================================
 
 #include <stdint.h>
@@ -296,8 +297,16 @@ static int compare_planets(const void *a, const void *b) {
     return 0;
 }
 
-// solarsystem.start() - Synchronous direct-execution loop with Ctrl+C interrupt handling
-static mp_obj_t mod_solarsystem_start(void) {
+// solarsystem.start([fps]) - Synchronous direct loop with frame pacing & Ctrl+C check
+static mp_obj_t mod_solarsystem_start(size_t n_args, const mp_obj_t *args) {
+    uint32_t target_fps = 60;
+    if (n_args > 0) {
+        target_fps = (uint32_t)mp_obj_get_int(args[0]);
+        if (target_fps < 1) target_fps = 1;
+        if (target_fps > 120) target_fps = 120;
+    }
+    uint32_t target_delay_ms = 1000 / target_fps;
+
     uint8_t *chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     if (!chunk_buf) {
         mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("Failed to allocate chunk DMA buffer"));
@@ -316,6 +325,7 @@ static mp_obj_t mod_solarsystem_start(void) {
 
     while (true) {
         mp_handle_pending(true); // Enables clean Ctrl+C interruption back to REPL
+        int64_t frame_start = esp_timer_get_time();
 
         star_timer += 0.05f;
 
@@ -372,13 +382,16 @@ static mp_obj_t mod_solarsystem_start(void) {
             moclcd_blit_internal(0, y_start, WIDTH, CHUNK_H, chunk_buf);
         }
 
-        mp_hal_delay_ms(8);
+        int64_t elapsed_ms = (esp_timer_get_time() - frame_start) / 1000;
+        if (elapsed_ms < target_delay_ms) {
+            mp_hal_delay_ms(target_delay_ms - elapsed_ms);
+        }
     }
 
     heap_caps_free(chunk_buf);
     return mp_const_none;
 }
-static MP_DEFINE_CONST_FUN_OBJ_0(mod_solarsystem_start_obj, mod_solarsystem_start);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_solarsystem_start_obj, 0, 1, mod_solarsystem_start);
 
 static const mp_rom_map_elem_t solarsystem_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_solarsystem) },
