@@ -1,25 +1,28 @@
 // =====================================================================================
-//  FILE:         saturn_wobble.c
-//  TARGET:       ESP32-S3 (Xtensa Dual-Core LX7 @ 240 MHz), ILI9488 8-bit Parallel Bus
-//  DESCRIPTION:  High-performance native C Analytical Saturn with Precession Wobble.
-//                - Zero-allocation direct DMA frame rasterizer
-//                - Double-buffered or single sub-box DMA streaming via Intel 8080 bus
-//                - Pure analytical ray/quadric sphere & ring intersection pipeline
-//                - High-intensity specular flare and dynamic Cassini Division gap
+//  FILE:         modsaturn.c
+//  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 Bus via DMA
+//  DESCRIPTION:  Complete MicroPython Native C Module for Analytical Saturn
+//                with Precession Wobble & Random Twinkling Starfield.
+//                - Zero-heap allocation render loop in internal DMA SRAM
+//                - Direct DMA window blits via moclcd bindings
+//                - Exposes Python API: saturn.start(fps=60), saturn.stop()
 // =====================================================================================
 
-#include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+
+#include "py/runtime.h"
+#include "py/obj.h"
+#include "py/mphal.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 
-// External hooks to your native moclcd driver
+// External hardware hooks provided by native moclcd driver
 extern void moclcd_init(void);
 extern void moclcd_panel_init(void);
 extern void moclcd_backlight(uint8_t state);
@@ -33,11 +36,10 @@ extern void moclcd_blit(int16_t x, int16_t y, int16_t w, int16_t h, const uint8_
 
 #define BB_W            380
 #define BB_H            300
-#define BB_X            (CX - (BB_W / 2)) // 50
+#define BB_X            (CX - (BB_W / 2))  // 50
 #define BB_Y            10
-#define ROW_PITCH       (BB_W * 2)        // 760 bytes
+#define ROW_PITCH       (BB_W * 2)         // 760 bytes
 
-// Geometry constants
 #define SPHERE_R        66
 #define SPHERE_R2       (SPHERE_R * SPHERE_R)
 
@@ -50,19 +52,22 @@ extern void moclcd_blit(int16_t x, int16_t y, int16_t w, int16_t h, const uint8_
 #define RING_A_IN2      20449.0f
 #define RING_A_OUT2     30976.0f
 
-// Static frame buffer allocated in DMA-accessible internal SRAM
-static uint8_t *s_frame_buf = NULL;
+#define NUM_STARS       128
 
-// Procedural deep space stars
-#define NUM_STARS 55
 typedef struct {
     int16_t x;
     int16_t y;
-    uint16_t col;
+    uint8_t tier;
+    float phase;
+    float speed;
 } star_t;
-static star_t s_stars[NUM_STARS];
 
-// Inline RGB565 packing
+static star_t s_stars[NUM_STARS];
+static uint8_t *s_frame_buf = NULL;
+static TaskHandle_t s_saturn_task_handle = NULL;
+static volatile bool s_running = false;
+static uint32_t s_target_delay_ms = 16;
+
 static inline uint16_t rgb565(float r, float g, float b) {
     if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
     if (g < 0.0f) g = 0.0f; else if (g > 1.0f) g = 1.0f;
@@ -74,11 +79,20 @@ static inline uint16_t rgb565(float r, float g, float b) {
     return (r_int << 11) | (g_int << 5) | b_int;
 }
 
+static uint32_t s_rng_seed = 0x1337BEEF;
+static inline uint32_t lcg_rand(void) {
+    s_rng_seed = (s_rng_seed * 1664525u + 1013904223u);
+    return s_rng_seed;
+}
+
 static void init_starfield(void) {
+    s_rng_seed = 0x1337BEEF;
     for (int i = 0; i < NUM_STARS; ++i) {
-        s_stars[i].x = (int16_t)((i * 113 + 19) % (BB_W - 4) + 2);
-        s_stars[i].y = (int16_t)((i * 149 + 37) % (BB_H - 4) + 2);
-        s_stars[i].col = (i % 3 == 0) ? 0xFFFF : 0x7BEF;
+        s_stars[i].x = (int16_t)((lcg_rand() % (BB_W - 8)) + 4);
+        s_stars[i].y = (int16_t)((lcg_rand() % (BB_H - 8)) + 4);
+        s_stars[i].tier = (uint8_t)(i % 4);
+        s_stars[i].phase = (float)(lcg_rand() % 628) * 0.01f;
+        s_stars[i].speed = 0.08f + (float)(lcg_rand() % 100) * 0.001f;
     }
 }
 
@@ -92,17 +106,27 @@ static inline void clear_dirty_rows(int y0, int y1) {
     memset(&s_frame_buf[offset], 0x00, length);
 }
 
-static inline void draw_stars(void) {
+static inline void render_twinkling_stars(float t) {
     for (int i = 0; i < NUM_STARS; ++i) {
-        size_t off = ((size_t)s_stars[i].y * ROW_PITCH) + (s_stars[i].x << 1);
-        s_frame_buf[off]     = (uint8_t)(s_stars[i].col >> 8);
-        s_frame_buf[off + 1] = (uint8_t)(s_stars[i].col & 0xFF);
+        float tw = sinf(t * s_stars[i].speed + s_stars[i].phase);
+        uint16_t col;
+
+        if (s_stars[i].tier == 0) {
+            col = (tw > -0.2f) ? 0xFFFF : 0xCE79;
+        } else if (s_stars[i].tier == 1) {
+            col = (tw > 0.0f) ? 0x9E7F : 0x52AA;
+        } else if (s_stars[i].tier == 2) {
+            col = (tw > 0.2f) ? 0x8410 : 0x4208;
+        } else {
+            col = (tw > 0.4f) ? 0x5ACB : 0x2104;
+        }
+
+        size_t off = ((size_t)s_stars[i].y * ROW_PITCH) + ((size_t)s_stars[i].x << 1);
+        s_frame_buf[off]     = (uint8_t)(col >> 8);
+        s_frame_buf[off + 1] = (uint8_t)(col & 0xFF);
     }
 }
 
-// -------------------------------------------------------------------------
-// Analytical Ring Section Rasterizer (Arc: 0 = Back/Behind, 1 = Front/Ahead)
-// -------------------------------------------------------------------------
 static void render_rings_arc(int is_front, float tilt_y, float roll_x) {
     const int pcx = 190;
     const int pcy = 150;
@@ -125,22 +149,20 @@ static void render_rings_arc(int is_front, float tilt_y, float roll_x) {
         for (int x = 0; x < BB_W; ++x) {
             float dx = (float)(x - pcx);
 
-            // Precession wobbling coordinate frame
             float rx = dx * cos_roll - dy * sin_roll;
             float ry = (dx * sin_roll + dy * cos_roll) * inv_tilt;
             float r_plane2 = rx * rx + ry * ry;
 
             float ring_base = 0.0f;
             if (r_plane2 >= RING_B_IN2 && r_plane2 <= RING_B_OUT2) {
-                ring_base = 1.00f; // High-albedo B-ring
+                ring_base = 1.00f;
             } else if (r_plane2 >= RING_A_IN2 && r_plane2 <= RING_A_OUT2) {
-                ring_base = 0.80f; // Outer A-ring
+                ring_base = 0.80f;
             }
 
             if (ring_base > 0.0f) {
-                size_t offset = x << 1;
+                size_t offset = (size_t)x << 1;
 
-                // Spherical cylinder shadow cast by the body onto rear rings
                 if (!is_front && (dx * dx + dy * dy < 4356.0f)) {
                     line_ptr[offset]     = 0x08;
                     line_ptr[offset + 1] = 0x41;
@@ -161,9 +183,6 @@ static void render_rings_arc(int is_front, float tilt_y, float roll_x) {
     }
 }
 
-// -------------------------------------------------------------------------
-// Analytical Smooth Planet Sphere Rasterizer (Wobble-Tilted Atmosphere)
-// -------------------------------------------------------------------------
 static void render_smooth_saturn_sphere(float tilt_y, float roll_x) {
     const int pcx = 190;
     const int pcy = 150;
@@ -204,24 +223,21 @@ static void render_smooth_saturn_sphere(float tilt_y, float roll_x) {
                 if (nz2 > 0.0f) {
                     float nz = sqrtf(nz2);
 
-                    // Latitude banding locked to precessing pole
                     float lat_y = dx * sin_roll + (float)dy * cos_roll;
                     float lat = fabsf(lat_y * inv_sr);
 
                     float base_r, base_g, base_b;
                     if (lat < 0.28f) {
-                        base_r = 1.00f; base_g = 0.88f; base_b = 0.58f; // Equatorial Cream
+                        base_r = 1.00f; base_g = 0.88f; base_b = 0.58f;
                     } else if (lat < 0.68f) {
-                        base_r = 0.90f; base_g = 0.74f; base_b = 0.44f; // Ochre Band
+                        base_r = 0.90f; base_g = 0.74f; base_b = 0.44f;
                     } else {
-                        base_r = 0.70f; base_g = 0.60f; base_b = 0.38f; // Polar Storm Cap
+                        base_r = 0.70f; base_g = 0.60f; base_b = 0.38f;
                     }
 
-                    // Sunlight lighting
                     float dot_s = nx * 0.62f + l_dot_y - nz * (-0.48f);
                     float diff = (dot_s > 0.0f) ? (dot_s * 1.85f) : 0.0f;
 
-                    // Specular sun glint
                     float dot_h = nx * 0.52f + h_dot_y - nz * (-0.68f);
                     float spec = 0.0f;
                     if (dot_h > 0.0f && diff > 0.10f) {
@@ -235,7 +251,7 @@ static void render_smooth_saturn_sphere(float tilt_y, float roll_x) {
                         (amb + diff) * base_b + spec
                     );
 
-                    size_t offset = x << 1;
+                    size_t offset = (size_t)x << 1;
                     line_ptr[offset]     = (uint8_t)(col >> 8);
                     line_ptr[offset + 1] = (uint8_t)(col & 0xFF);
                 }
@@ -244,15 +260,14 @@ static void render_smooth_saturn_sphere(float tilt_y, float roll_x) {
     }
 }
 
-// -------------------------------------------------------------------------
-// Main Render Task
-// -------------------------------------------------------------------------
-void saturn_wobble_task(void *pvParameters) {
-    s_frame_buf = (uint8_t *)heap_caps_malloc(BB_W * BB_H * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+static void saturn_render_task(void *pvParameters) {
     if (!s_frame_buf) {
-        printf("ERROR: Failed to allocate DMA frame buffer!\n");
-        vTaskDelete(NULL);
-        return;
+        s_frame_buf = (uint8_t *)heap_caps_malloc(BB_W * BB_H * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (!s_frame_buf) {
+            s_running = false;
+            vTaskDelete(NULL);
+            return;
+        }
     }
     memset(s_frame_buf, 0x00, BB_W * BB_H * 2);
 
@@ -267,30 +282,20 @@ void saturn_wobble_task(void *pvParameters) {
     int prev_min_y = 0;
     int prev_max_y = BB_H - 1;
 
-    int64_t last_time = esp_timer_get_time();
-    int frame_count = 0;
+    while (s_running) {
+        int64_t t_start = esp_timer_get_time();
 
-    while (1) {
         time_phase += 0.045f;
-
-        // Nutation & precession dynamics
         float tilt_val = 0.38f + sinf(time_phase) * 0.10f;
         float roll_val = cosf(time_phase) * 0.18f;
 
-        // Dirty row clearance
         clear_dirty_rows(prev_min_y, prev_max_y);
-        draw_stars();
+        render_twinkling_stars(time_phase);
 
-        // 1. Back Ring Arc (Occluded behind sphere)
         render_rings_arc(0, tilt_val, roll_val);
-
-        // 2. Analytical Gas Giant Sphere
         render_smooth_saturn_sphere(tilt_val, roll_val);
-
-        // 3. Front Ring Arc (Sweeps across front hemisphere)
         render_rings_arc(1, tilt_val, roll_val);
 
-        // Calculate dynamic bounding box
         int extent = (int)(176.0f * tilt_val) + 6;
         int f_min = 150 - extent;
         int f_max = 150 + extent;
@@ -303,27 +308,91 @@ void saturn_wobble_task(void *pvParameters) {
         if (blit_bottom >= BB_H) blit_bottom = BB_H - 1;
         int blit_h = blit_bottom - blit_top + 1;
 
-        // Blit updated scanlines directly via DMA
         size_t start_offset = (size_t)blit_top * ROW_PITCH;
         moclcd_blit(BB_X, BB_Y + blit_top, BB_W, blit_h, &s_frame_buf[start_offset]);
 
         prev_min_y = f_min;
         prev_max_y = f_max;
 
-        // Frame rate monitoring
-        frame_count++;
-        int64_t now = esp_timer_get_time();
-        if (now - last_time >= 1000000) {
-            printf("Saturn Native C Render: %d FPS\n", frame_count);
-            frame_count = 0;
-            last_time = now;
+        int64_t elapsed_ms = (esp_timer_get_time() - t_start) / 1000;
+        if (elapsed_ms < s_target_delay_ms) {
+            vTaskDelay(pdMS_TO_TICKS(s_target_delay_ms - elapsed_ms));
+        } else {
+            vTaskDelay(1);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
     }
+
+    if (s_frame_buf) {
+        heap_caps_free(s_frame_buf);
+        s_frame_buf = NULL;
+    }
+    s_saturn_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
-void app_main(void) {
-    // Pin to Core 1 to leave Core 0 open for system events & WiFi/BLE
-    xTaskCreatePinnedToCore(saturn_wobble_task, "saturn_task", 8192, NULL, 5, NULL, 1);
+// -------------------------------------------------------------------------
+// MicroPython C-Module Interface
+// -------------------------------------------------------------------------
+
+// saturn.start([fps])
+STATIC mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
+    if (s_running) {
+        return mp_const_none;
+    }
+
+    uint32_t target_fps = 60;
+    if (n_args > 0) {
+        target_fps = (uint32_t)mp_obj_get_int(args[0]);
+        if (target_fps < 1) target_fps = 1;
+        if (target_fps > 120) target_fps = 120;
+    }
+    s_target_delay_ms = 1000 / target_fps;
+    s_running = true;
+
+    // Pin task directly to Core 1 to avoid contending with MicroPython on Core 0
+    BaseType_t res = xTaskCreatePinnedToCore(
+        saturn_render_task,
+        "saturn_task",
+        8192,
+        NULL,
+        5,
+        &s_saturn_task_handle,
+        1
+    );
+
+    if (res != pdPASS) {
+        s_running = false;
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("Failed to create saturn worker task"));
+    }
+
+    return mp_const_none;
 }
+STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_saturn_start_obj, 0, 1, mod_saturn_start);
+
+// saturn.stop()
+STATIC mp_obj_t mod_saturn_stop(void) {
+    if (s_running) {
+        s_running = false;
+        while (s_saturn_task_handle != NULL) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_0(mod_saturn_stop_obj, mod_saturn_stop);
+
+// Module globals dictionary
+STATIC const mp_rom_map_elem_t saturn_module_globals_table[] = {
+    { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_saturn) },
+    { MP_ROM_QSTR(MP_QSTR_start),    MP_ROM_PTR(&mod_saturn_start_obj) },
+    { MP_ROM_QSTR(MP_QSTR_stop),     MP_ROM_PTR(&mod_saturn_stop_obj) },
+};
+STATIC MP_DEFINE_CONST_DICT(saturn_module_globals, saturn_module_globals_table);
+
+// Module definition
+const mp_obj_module_t saturn_user_cmodule = {
+    .base = { &mp_type_module },
+    .globals = (mp_obj_dict_t *)&saturn_module_globals,
+};
+
+MP_REGISTER_MODULE(MP_QSTR_saturn, saturn_user_cmodule);
