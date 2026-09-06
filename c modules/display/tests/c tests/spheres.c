@@ -4,11 +4,16 @@
  *  MODULE:       billiards (MicroPython native C module)
  *  TARGET:       ESP32-S3, ILI9488 8-bit Parallel i80 (moclcd v1.5.0-STABLE)
  *  DESCRIPTION:  High-performance Multi-Body 3D Billiard Spheres simulation in C.
- *                Features 3 Glossy Colored Spheres (Ruby Red, Cyan Teal, Liquid Gold)
+ *                3 Glossy Colored Spheres (Ruby Red, Cyan Teal, Liquid Gold)
  *                with 3D elastic collisions, momentum transfer, dynamic squash/stretch,
- *                additive shadow blending, back-to-front depth sorting, and a 72 FPS cap.
- *                Includes multi-tier DMA buffer allocation fallback (Internal SRAM -> 
- *                PSRAM / SPIRAM -> General 8-bit heap) to prevent allocation crashes.
+ *                additive shadow blending, back-to-front depth sorting, and configurable
+ *                target FPS limiter.
+ *
+ *  USAGE:
+ *      import billiards
+ *      billiards.start()       # Runs at default 72 FPS cap
+ *      billiards.start(30)     # Sets dynamic frame rate cap to 30 FPS
+ *      billiards.start(60)     # Sets dynamic frame rate cap to 60 FPS
  * =====================================================================================
  */
 
@@ -61,8 +66,7 @@ extern void moclcd_draw_text_internal(uint16_t x, uint16_t y, const char *str, u
 #define SPHERE_RADIUS         (0.44f)
 #define NUM_SPHERES           3
 
-/* Target 72 FPS: 13,888 microseconds per frame */
-#define TARGET_FRAME_TIME_US  13888
+#define DEFAULT_FPS           72
 
 static uint8_t *s_frame_buf = NULL;
 
@@ -222,19 +226,26 @@ static void render_sphere_squash(int cx, int cy, int r_screen, float sx, float s
 }
 
 /* -------------------------------------------------------------------------
- * Execution Loop: billiards.start()
+ * Execution Loop: billiards.start(target_fps=72)
  * ------------------------------------------------------------------------- */
 static mp_obj_t billiards_start(size_t n_args, const mp_obj_t *args)
 {
-    int max_frames = (n_args > 0) ? mp_obj_get_int(args[0]) : -1;
+    int target_fps = DEFAULT_FPS;
+    if (n_args > 0) {
+        target_fps = mp_obj_get_int(args[0]);
+        if (target_fps < 1) target_fps = 1;
+        if (target_fps > 120) target_fps = 120;
+    }
+
+    uint32_t target_frame_time_us = (uint32_t)(1000000 / target_fps);
 
     if (s_frame_buf == NULL) {
         size_t buf_size = (size_t)BB_W * BB_H * 2;
         
-        /* Step 1: Attempt allocation in high-speed Internal DMA SRAM */
+        /* Step 1: High-speed Internal DMA SRAM */
         s_frame_buf = (uint8_t *)heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
 
-        /* Step 2: Fallback to PSRAM (SPIRAM) with 64-byte alignment */
+        /* Step 2: Fallback to PSRAM (SPIRAM) */
         if (s_frame_buf == NULL) {
             s_frame_buf = (uint8_t *)heap_caps_aligned_alloc(64, buf_size, MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
         }
@@ -284,15 +295,15 @@ static mp_obj_t billiards_start(size_t n_args, const mp_obj_t *args)
     int prev_min_y = 0;
     int prev_max_y = BB_H - 1;
 
-    int frame_count = 0;
     int fps_frame_count = 0;
     int64_t t_last_fps = esp_timer_get_time();
-    char fps_str[36] = "FPS: -- | Capped to 72";
+    char fps_str[36];
+    snprintf(fps_str, sizeof(fps_str), "FPS: -- | Capped to %d", target_fps);
 
     moclcd_fill_rect_internal(10, 10, 160, 12, COLOR_WHITE);
     moclcd_draw_text_internal(10, 10, fps_str, COLOR_BLACK, COLOR_WHITE);
 
-    while (max_frames < 0 || frame_count < max_frames) {
+    while (true) {
         int64_t frame_start = esp_timer_get_time();
 
         /* Trap Ctrl+C (KeyboardInterrupt) cleanly to return to REPL */
@@ -459,10 +470,10 @@ static mp_obj_t billiards_start(size_t n_args, const mp_obj_t *args)
         prev_min_y = frame_min_y;
         prev_max_y = frame_max_y;
 
-        /* Precision 72 FPS Frame Rate Limiter */
+        /* Dynamic Frame Rate Limiter */
         int64_t elapsed_us = esp_timer_get_time() - frame_start;
-        if (elapsed_us < TARGET_FRAME_TIME_US) {
-            esp_rom_delay_us((uint32_t)(TARGET_FRAME_TIME_US - elapsed_us));
+        if (elapsed_us < (int64_t)target_frame_time_us) {
+            esp_rom_delay_us((uint32_t)((int64_t)target_frame_time_us - elapsed_us));
         }
 
         fps_frame_count++;
@@ -471,15 +482,13 @@ static mp_obj_t billiards_start(size_t n_args, const mp_obj_t *args)
             int64_t dt = now - t_last_fps;
             if (dt > 0) {
                 float fps = (fps_frame_count * 1000000.0f) / (float)dt;
-                snprintf(fps_str, sizeof(fps_str), "FPS: %.1f | Capped to 72", fps);
+                snprintf(fps_str, sizeof(fps_str), "FPS: %.1f | Capped to %d", fps, target_fps);
                 moclcd_fill_rect_internal(10, 10, 160, 10, COLOR_WHITE);
                 moclcd_draw_text_internal(10, 10, fps_str, COLOR_BLACK, COLOR_WHITE);
             }
             t_last_fps = now;
             fps_frame_count = 0;
         }
-
-        frame_count++;
     }
 
     return mp_const_none;
