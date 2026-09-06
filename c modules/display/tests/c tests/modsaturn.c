@@ -3,9 +3,6 @@
 //  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 Bus via DMA
 //  DESCRIPTION:  Complete MicroPython Native C Module for Analytical Saturn
 //                with Precession Wobble & Random Twinkling Starfield.
-//                - Zero-heap allocation render loop in internal DMA SRAM
-//                - Direct DMA window blits via moclcd bindings
-//                - Exposes Python API: saturn.start(fps=60), saturn.stop()
 // =====================================================================================
 
 #include <stdint.h>
@@ -36,17 +33,13 @@ extern void moclcd_blit(int16_t x, int16_t y, int16_t w, int16_t h, const uint8_
 
 #define BB_W            380
 #define BB_H            300
-#define BB_X            (CX - (BB_W / 2))  // 50
+#define BB_X            (CX - (BB_W / 2))
 #define BB_Y            10
-#define ROW_PITCH       (BB_W * 2)         // 760 bytes
+#define ROW_PITCH       (BB_W * 2)
 
 #define SPHERE_R        66
 #define SPHERE_R2       (SPHERE_R * SPHERE_R)
 
-// Ring Boundaries (Equatorial Plane Radius Squared)
-// B-Ring: 86 to 134 -> 7396 to 17956
-// Cassini Gap: 134 to 143
-// A-Ring: 143 to 176 -> 20449 to 30976
 #define RING_B_IN2      7396.0f
 #define RING_B_OUT2     17956.0f
 #define RING_A_IN2      20449.0f
@@ -331,11 +324,9 @@ static void saturn_render_task(void *pvParameters) {
 }
 
 // -------------------------------------------------------------------------
-// MicroPython C-Module Interface
+// MicroPython C-Module Interface (Using standard C static storage)
 // -------------------------------------------------------------------------
-
-// saturn.start([fps])
-STATIC mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
+static mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
     if (s_running) {
         return mp_const_none;
     }
@@ -349,7 +340,6 @@ STATIC mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
     s_target_delay_ms = 1000 / target_fps;
     s_running = true;
 
-    // Pin task directly to Core 1 to avoid contending with MicroPython on Core 0
     BaseType_t res = xTaskCreatePinnedToCore(
         saturn_render_task,
         "saturn_task",
@@ -367,10 +357,9 @@ STATIC mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
 
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_saturn_start_obj, 0, 1, mod_saturn_start);
+static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_saturn_start_obj, 0, 1, mod_saturn_start);
 
-// saturn.stop()
-STATIC mp_obj_t mod_saturn_stop(void) {
+static mp_obj_t mod_saturn_stop(void) {
     if (s_running) {
         s_running = false;
         while (s_saturn_task_handle != NULL) {
@@ -379,17 +368,15 @@ STATIC mp_obj_t mod_saturn_stop(void) {
     }
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_0(mod_saturn_stop_obj, mod_saturn_stop);
+static MP_DEFINE_CONST_FUN_OBJ_0(mod_saturn_stop_obj, mod_saturn_stop);
 
-// Module globals dictionary
-STATIC const mp_rom_map_elem_t saturn_module_globals_table[] = {
+static const mp_rom_map_elem_t saturn_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR___name__), MP_ROM_QSTR(MP_QSTR_saturn) },
     { MP_ROM_QSTR(MP_QSTR_start),    MP_ROM_PTR(&mod_saturn_start_obj) },
     { MP_ROM_QSTR(MP_QSTR_stop),     MP_ROM_PTR(&mod_saturn_stop_obj) },
 };
-STATIC MP_DEFINE_CONST_DICT(saturn_module_globals, saturn_module_globals_table);
+static MP_DEFINE_CONST_DICT(saturn_module_globals, saturn_module_globals_table);
 
-// Module definition
 const mp_obj_module_t saturn_user_cmodule = {
     .base = { &mp_type_module },
     .globals = (mp_obj_dict_t *)&saturn_module_globals,
