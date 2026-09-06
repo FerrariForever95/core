@@ -19,12 +19,12 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 
-// External hardware hooks provided by native moclcd driver
-extern void moclcd_init(void);
-extern void moclcd_panel_init(void);
-extern void moclcd_backlight(uint8_t state);
-extern void moclcd_fill_screen(uint16_t color);
-extern void moclcd_blit(int16_t x, int16_t y, int16_t w, int16_t h, const uint8_t *buf);
+// External hardware hooks pointing to original moclcd internal drivers
+extern void moclcd_init_internal(void);
+extern void moclcd_panel_init_internal(void);
+extern void moclcd_backlight_internal(bool on);
+extern void moclcd_fill_screen_internal(uint16_t color);
+extern void moclcd_blit_internal(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const void *buf);
 
 #define LCD_WIDTH       480
 #define LCD_HEIGHT      320
@@ -264,10 +264,10 @@ static void saturn_render_task(void *pvParameters) {
     }
     memset(s_frame_buf, 0x00, BB_W * BB_H * 2);
 
-    moclcd_init();
-    moclcd_panel_init();
-    moclcd_backlight(1);
-    moclcd_fill_screen(0x0000);
+    moclcd_init_internal();
+    moclcd_panel_init_internal();
+    moclcd_backlight_internal(true);
+    moclcd_fill_screen_internal(0x0000);
 
     init_starfield();
 
@@ -302,7 +302,7 @@ static void saturn_render_task(void *pvParameters) {
         int blit_h = blit_bottom - blit_top + 1;
 
         size_t start_offset = (size_t)blit_top * ROW_PITCH;
-        moclcd_blit(BB_X, BB_Y + blit_top, BB_W, blit_h, &s_frame_buf[start_offset]);
+        moclcd_blit_internal(BB_X, BB_Y + blit_top, BB_W, blit_h, &s_frame_buf[start_offset]);
 
         prev_min_y = f_min;
         prev_max_y = f_max;
@@ -324,7 +324,7 @@ static void saturn_render_task(void *pvParameters) {
 }
 
 // -------------------------------------------------------------------------
-// MicroPython C-Module Interface (Using standard C static storage)
+// MicroPython C-Module Interface
 // -------------------------------------------------------------------------
 static mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
     if (s_running) {
