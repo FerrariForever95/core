@@ -1,8 +1,9 @@
 // =====================================================================================
 //  FILE:         modsaturn.c
 //  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 Bus via DMA
-//  DESCRIPTION:  Synchronous Native C Module for Analytical Saturn with Precession Wobble,
-//                Dirty-Row Bounding Box DMA, and Adjustable FPS (e.g. saturn.start(50)).
+//  DESCRIPTION:  Synchronous Native C Module for Analytical Saturn with Precession Wobble
+//                - Uses 32-line streaming DMA chunks (Zero heap fragmentation / No MemoryError)
+//                - Exposes Python API: saturn.start(fps=60), press Ctrl+C to exit
 // =====================================================================================
 
 #include <stdint.h>
@@ -28,7 +29,10 @@ extern void moclcd_blit_internal(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
 #define BB_H            300
 #define BB_X            (240 - (BB_W / 2))
 #define BB_Y            10
-#define ROW_PITCH       (BB_W * 2)
+
+#define CHUNK_H         32
+#define CHUNK_ROWS      (BB_H / CHUNK_H) // 9 chunks total
+#define CHUNK_SIZE      (BB_W * CHUNK_H * 2) // ~24 KB per chunk (easily fits internal DMA SRAM)
 
 #define SPHERE_R        66
 #define SPHERE_R2       (SPHERE_R * SPHERE_R)
@@ -78,50 +82,46 @@ static void init_starfield(void) {
     }
 }
 
-static inline void clear_dirty_rows(uint8_t *frame_buf, int y0, int y1) {
-    if (y0 < 0) y0 = 0;
-    if (y1 >= BB_H) y1 = BB_H - 1;
-    if (y0 > y1) return;
-
-    size_t offset = (size_t)y0 * ROW_PITCH;
-    size_t length = (size_t)(y1 - y0 + 1) * ROW_PITCH;
-    memset(&frame_buf[offset], 0x00, length);
-}
-
-static inline void render_twinkling_stars(uint8_t *frame_buf, float t) {
+static inline void render_stars_chunk(uint8_t *chunk_buf, int y_start, int y_end, float t) {
+    int pitch = BB_W * 2;
     for (int i = 0; i < NUM_STARS; ++i) {
-        float tw = sinf(t * s_stars[i].speed + s_stars[i].phase);
-        uint16_t col;
+        if (s_stars[i].y >= y_start && s_stars[i].y < y_end) {
+            float tw = sinf(t * s_stars[i].speed + s_stars[i].phase);
+            uint16_t col;
 
-        if (s_stars[i].tier == 0) col = (tw > -0.2f) ? 0xFFFF : 0xCE79;
-        else if (s_stars[i].tier == 1) col = (tw > 0.0f) ? 0x9E7F : 0x52AA;
-        else if (s_stars[i].tier == 2) col = (tw > 0.2f) ? 0x8410 : 0x4208;
-        else col = (tw > 0.4f) ? 0x5ACB : 0x2104;
+            if (s_stars[i].tier == 0) col = (tw > -0.2f) ? 0xFFFF : 0xCE79;
+            else if (s_stars[i].tier == 1) col = (tw > 0.0f) ? 0x9E7F : 0x52AA;
+            else if (s_stars[i].tier == 2) col = (tw > 0.2f) ? 0x8410 : 0x4208;
+            else col = (tw > 0.4f) ? 0x5ACB : 0x2104;
 
-        size_t off = ((size_t)s_stars[i].y * ROW_PITCH) + ((size_t)s_stars[i].x << 1);
-        frame_buf[off]     = (uint8_t)(col >> 8);
-        frame_buf[off + 1] = (uint8_t)(col & 0xFF);
+            int local_y = s_stars[i].y - y_start;
+            size_t off = (size_t)local_y * pitch + ((size_t)s_stars[i].x << 1);
+            chunk_buf[off]     = (uint8_t)(col >> 8);
+            chunk_buf[off + 1] = (uint8_t)(col & 0xFF);
+        }
     }
 }
 
-static void render_rings_arc(uint8_t *frame_buf, int is_front, float tilt_y, float roll_x) {
+static void render_rings_arc_chunk(uint8_t *chunk_buf, int y_start, int y_end, int is_front, float tilt_y, float roll_x) {
     const int pcx = 190;
     const int pcy = 150;
+    int pitch = BB_W * 2;
 
     const float inv_tilt = 1.0f / tilt_y;
     const int max_y_extent = (int)(176.0f * tilt_y) + 4;
-    int y_start = is_front ? pcy : (pcy - max_y_extent);
-    int y_end   = is_front ? (pcy + max_y_extent + 1) : pcy;
+    int arc_y0 = is_front ? pcy : (pcy - max_y_extent);
+    int arc_y1 = is_front ? (pcy + max_y_extent + 1) : pcy;
 
-    if (y_start < 0) y_start = 0;
-    if (y_end > BB_H) y_end = BB_H;
+    int c_min = (y_start > arc_y0) ? y_start : arc_y0;
+    int c_max = (y_end - 1 < arc_y1) ? (y_end - 1) : arc_y1;
+    if (c_min > c_max) return;
 
     const float cos_roll = cosf(roll_x);
     const float sin_roll = sinf(roll_x);
 
-    for (int y = y_start; y < y_end; ++y) {
+    for (int y = c_min; y <= c_max; ++y) {
         float dy = (float)(y - pcy);
-        uint8_t *line_ptr = &frame_buf[y * ROW_PITCH];
+        uint8_t *line_ptr = &chunk_buf[(y - y_start) * pitch];
 
         for (int x = 0; x < BB_W; ++x) {
             float dx = (float)(x - pcx);
@@ -160,15 +160,15 @@ static void render_rings_arc(uint8_t *frame_buf, int is_front, float tilt_y, flo
     }
 }
 
-static void render_smooth_saturn_sphere(uint8_t *frame_buf, float tilt_y, float roll_x) {
+static void render_smooth_saturn_sphere_chunk(uint8_t *chunk_buf, int y_start, int y_end, float tilt_y, float roll_x) {
     const int pcx = 190;
     const int pcy = 150;
     const float inv_sr = 1.0f / (float)SPHERE_R;
+    int pitch = BB_W * 2;
 
-    int y_min = pcy - SPHERE_R;
-    int y_max = pcy + SPHERE_R;
-    if (y_min < 0) y_min = 0;
-    if (y_max >= BB_H) y_max = BB_H - 1;
+    int y_min = (y_start > pcy - SPHERE_R) ? y_start : (pcy - SPHERE_R);
+    int y_max = (y_end - 1 < pcy + SPHERE_R) ? (y_end - 1) : (pcy + SPHERE_R);
+    if (y_min > y_max) return;
 
     const float cos_roll = cosf(roll_x);
     const float sin_roll = sinf(roll_x);
@@ -189,7 +189,7 @@ static void render_smooth_saturn_sphere(uint8_t *frame_buf, float tilt_y, float 
             float l_dot_y = ny * 0.62f;
             float h_dot_y = ny * 0.52f;
 
-            uint8_t *line_ptr = &frame_buf[y * ROW_PITCH];
+            uint8_t *line_ptr = &chunk_buf[(y - y_start) * pitch];
 
             for (int x = x0; x <= x1; ++x) {
                 float dx = (float)(x - pcx);
@@ -235,7 +235,7 @@ static void render_smooth_saturn_sphere(uint8_t *frame_buf, float tilt_y, float 
     }
 }
 
-// saturn.start([fps]) - Synchronous loop with frame pacing & Ctrl+C check
+// saturn.start([fps]) - Chunked streaming DMA loop with zero memory fragmentation
 static mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
     uint32_t target_fps = 60;
     if (n_args > 0) {
@@ -245,11 +245,11 @@ static mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
     }
     uint32_t target_delay_ms = 1000 / target_fps;
 
-    uint8_t *frame_buf = (uint8_t *)heap_caps_malloc(BB_W * BB_H * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    if (!frame_buf) {
-        mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("Failed to allocate DMA frame buffer"));
+    // Allocate lightweight 32-line chunk buffer (~24 KB) instead of 228 KB full buffer
+    uint8_t *chunk_buf = (uint8_t *)heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!chunk_buf) {
+        mp_raise_msg(&mp_type_MemoryError, MP_ERROR_TEXT("Failed to allocate chunk DMA buffer"));
     }
-    memset(frame_buf, 0x00, BB_W * BB_H * 2);
 
     moclcd_init_internal();
     moclcd_panel_init_internal();
@@ -259,41 +259,29 @@ static mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
     init_starfield();
 
     float time_phase = 0.0f;
-    int prev_min_y = 0;
-    int prev_max_y = BB_H - 1;
 
     while (true) {
-        mp_handle_pending(true); // Allows clean Ctrl+C interruption back to REPL
+        mp_handle_pending(true); // Clean Ctrl+C interruption back to REPL
         int64_t frame_start = esp_timer_get_time();
 
         time_phase += 0.045f;
         float tilt_val = 0.38f + sinf(time_phase) * 0.10f;
         float roll_val = cosf(time_phase) * 0.18f;
 
-        clear_dirty_rows(frame_buf, prev_min_y, prev_max_y);
-        render_twinkling_stars(frame_buf, time_phase);
+        // Render and stream frame sequentially in 32-line chunks via DMA
+        for (int c = 0; c < CHUNK_ROWS; ++c) {
+            int y_start = c * CHUNK_H;
+            int y_end = y_start + CHUNK_H;
 
-        render_rings_arc(frame_buf, 0, tilt_val, roll_val);
-        render_smooth_saturn_sphere(frame_buf, tilt_val, roll_val);
-        render_rings_arc(frame_buf, 1, tilt_val, roll_val);
+            memset(chunk_buf, 0x00, CHUNK_SIZE);
 
-        int extent = (int)(176.0f * tilt_val) + 6;
-        int f_min = 150 - extent;
-        int f_max = 150 + extent;
-        if (f_min < 0) f_min = 0;
-        if (f_max >= BB_H) f_max = BB_H - 1;
+            render_stars_chunk(chunk_buf, y_start, y_end, time_phase);
+            render_rings_arc_chunk(chunk_buf, y_start, y_end, 0, tilt_val, roll_val);
+            render_smooth_saturn_sphere_chunk(chunk_buf, y_start, y_end, tilt_val, roll_val);
+            render_rings_arc_chunk(chunk_buf, y_start, y_end, 1, tilt_val, roll_val);
 
-        int blit_top = (f_min < prev_min_y) ? f_min : prev_min_y;
-        int blit_bottom = (f_max > prev_max_y) ? f_max : prev_max_y;
-        if (blit_top < 0) blit_top = 0;
-        if (blit_bottom >= BB_H) blit_bottom = BB_H - 1;
-        int blit_h = blit_bottom - blit_top + 1;
-
-        size_t start_offset = (size_t)blit_top * ROW_PITCH;
-        moclcd_blit_internal(BB_X, BB_Y + blit_top, BB_W, blit_h, &frame_buf[start_offset]);
-
-        prev_min_y = f_min;
-        prev_max_y = f_max;
+            moclcd_blit_internal(BB_X, BB_Y + y_start, BB_W, CHUNK_H, chunk_buf);
+        }
 
         int64_t elapsed_ms = (esp_timer_get_time() - frame_start) / 1000;
         if (elapsed_ms < target_delay_ms) {
@@ -301,7 +289,7 @@ static mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
         }
     }
 
-    heap_caps_free(frame_buf);
+    heap_caps_free(chunk_buf);
     return mp_const_none;
 }
 static MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(mod_saturn_start_obj, 0, 1, mod_saturn_start);
