@@ -297,7 +297,7 @@ static int compare_planets(const void *a, const void *b) {
     return 0;
 }
 
-// solarsystem.start([fps]) - Synchronous direct loop with frame pacing & Ctrl+C check
+// solarsystem.start([fps]) - Synchronous loop with frame pacing & Ctrl+C check
 static mp_obj_t mod_solarsystem_start(size_t n_args, const mp_obj_t *args) {
     uint32_t target_fps = 60;
     if (n_args > 0) {
