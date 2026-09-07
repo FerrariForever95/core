@@ -1,8 +1,8 @@
 // =====================================================================================
 //  FILE:         modsaturn.c
 //  TARGET:       ESP32-S3, ILI9488 8-bit Parallel Intel 8080 Bus via DMA
-//  DESCRIPTION:  Synchronous Native C Module for Analytical Saturn with Precession Wobble
-//                and Optimized Dirty-Row Bounding Box DMA Streaming.
+//  DESCRIPTION:  Synchronous Native C Module for Analytical Saturn with Precession Wobble,
+//                Dirty-Row Bounding Box DMA, and Adjustable FPS (e.g. saturn.start(50)).
 // =====================================================================================
 
 #include <stdint.h>
@@ -235,7 +235,7 @@ static void render_smooth_saturn_sphere(uint8_t *frame_buf, float tilt_y, float 
     }
 }
 
-// saturn.start([fps]) - Synchronous loop using the dirty bounding box DMA update technique
+// saturn.start([fps]) - Synchronous loop with frame pacing & Ctrl+C check
 static mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
     uint32_t target_fps = 60;
     if (n_args > 0) {
@@ -270,7 +270,6 @@ static mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
         float tilt_val = 0.38f + sinf(time_phase) * 0.10f;
         float roll_val = cosf(time_phase) * 0.18f;
 
-        // Clear only the modified bounding box rows from the previous frame
         clear_dirty_rows(frame_buf, prev_min_y, prev_max_y);
         render_twinkling_stars(frame_buf, time_phase);
 
@@ -290,7 +289,6 @@ static mp_obj_t mod_saturn_start(size_t n_args, const mp_obj_t *args) {
         if (blit_bottom >= BB_H) blit_bottom = BB_H - 1;
         int blit_h = blit_bottom - blit_top + 1;
 
-        // Stream only the active sub-region via DMA
         size_t start_offset = (size_t)blit_top * ROW_PITCH;
         moclcd_blit_internal(BB_X, BB_Y + blit_top, BB_W, blit_h, &frame_buf[start_offset]);
 
