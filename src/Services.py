@@ -1,9 +1,15 @@
 """
 Services.py -- Zeno OS core services, single file.
 
-Unified kernel services architecture for ESP32-S3 (8MB PSRAM / 16MB Flash).
-Handles Logging, Power Management, VFS, CFS Process Scheduling,
-Security, Wi-Fi Networking, Storage Subsystems, and Lazy Package Management.
+Version: 5.2.0
+Description:
+    Unified kernel services architecture for ESP32-S3 (8MB PSRAM / 16MB Flash).
+    Handles Logging, Power Management, VFS, CFS Process Scheduling,
+    Security, Wi-Fi Networking, Storage Subsystems, and Lazy Package Management.
+
+Changelog / History:
+    v5.2.0 - Introduced standardized internal OS & Services semantic versioning,
+             metadata accessors, and execution environment verification constants.
 """
 
 import os
@@ -17,6 +23,21 @@ import urequests
 import micropython
 import machine
 from machine import Pin, SPI, I2C
+
+# ============================================================================
+# SYSTEM VERSIONING & METADATA
+# ============================================================================
+SERVICES_VERSION = "5.2.0"
+SERVICES_VERSION_INFO = (5, 2, 0)
+ZENO_OS_VERSION = "5.2.0"
+
+def get_services_version():
+    """Return the current semantic version string of Services.py."""
+    return SERVICES_VERSION
+
+def get_version_info():
+    """Return the version as a comparable tuple: (major, minor, patch)."""
+    return SERVICES_VERSION_INFO
 
 try:
     import ubluetooth as bt
@@ -90,7 +111,7 @@ class Logger:
 
         if self.boot:
             self._write(self._boot_marker)
-            self.debug("Logger initialized. Boot starting...", source="BOOT")
+            self.debug(f"Logger initialized. Boot starting... (Services v{SERVICES_VERSION})", source="BOOT")
 
     def _ensure_dir(self, path):
         try:
@@ -800,7 +821,12 @@ class Disk:
 class BootConfig:
     def __init__(self):
         self.cfg_path = "/LOGS/bootcfg.json"
-        self.default = {"BOOT_MODE": "NORMAL", "WIFI_AUTOCONNECT": True, "MODE": "PERFORMANCE"}
+        self.default = {
+            "BOOT_MODE": "NORMAL",
+            "WIFI_AUTOCONNECT": True,
+            "MODE": "PERFORMANCE",
+            "SERVICES_VERSION": SERVICES_VERSION
+        }
         self.config = self._load()
 
     def _load(self):
@@ -832,12 +858,14 @@ class BootConfig:
 class system:
     def __init__(self, opt_level=0, debug=False):
         self.log = Logger()
+        self.version = SERVICES_VERSION
 
     def restart(self):
         machine.reset()
 
     def info(self):
         print(f"Architecture: {sys.platform} (MicroPython {sys.version})")
+        print(f"Zeno OS Core Services Version: v{SERVICES_VERSION}")
         print(f"CPU Frequency: {machine.freq() // 1_000_000} MHz")
         free, alloc = gc.mem_free(), gc.mem_alloc()
         print(f"PSRAM/Heap: Total={(free+alloc)/(1024*1024):.2f}MB | Free={free/(1024*1024):.2f}MB")
@@ -960,3 +988,11 @@ class IoTManager:
 
     def status(self):
         return "IoT Bus Offline"
+
+
+# ============================================================================
+# GLOBAL MODULE HELPERS
+# ============================================================================
+def get_version():
+    """Module-level helper to query Services version directly from ZenCMD."""
+    return SERVICES_VERSION
