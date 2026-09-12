@@ -5,7 +5,7 @@
  *  TARGET:      ESP32-S3, ESP-IDF esp_lcd i80 (Intel 8080) parallel bus, 8-bit data
  *  PANEL:       ILI9488, 320 x 480, MIPI DCS Rev.1 command set
  *
- *  VERSION:     1.6.0-dev
+ *  VERSION:     1.9.0-dev
  *  BUILD STATUS: UNVERIFIED / DEV  <-- has NOT been confirmed working on real hardware
  *               (Per project rule: this string only changes to "STABLE" after the
  *                developer explicitly tests on the target board and confirms it.)
@@ -28,23 +28,140 @@
  *      RD            -> GPIO 41
  *      RST           -> GPIO 12
  *      BL            -> GPIO 38   (digital on/off in Stage 1; LEDC PWM optional, see backlight())
- *      CS  (YP)      -> GPIO 21   (moved off GND in v1.6.0-dev; see NOTE ON CS below)
+ *      CS  (YP)      -> GPIO 21   (moved off GND in v1.6.0-dev; driven manually as of
+ *                                  v1.8.0-dev, NOT by esp_lcd -- see NOTE ON CS below)
  *
  *  NOTE ON CS: CS was originally hard-wired to GND on the PCB (LCD_PIN_NUM_CS = -1,
- *  esp_lcd never drove it, panel permanently selected). As of v1.6.0-dev CS has been
- *  rewired to GPIO 21 -- chosen because it is not a strapping pin (0/3/45/46), not
- *  USB-JTAG (19/20), and not committed to SPI flash/PSRAM (26-37 on many ESP32-S3
- *  modules/boards) -- so esp_lcd now drives it as a real chip-select per transaction.
- *  This was done ahead of Stage 2 touch: 4-wire resistive touch (XP/XM/YP/YM, sharing
- *  D7/DC/D6 with the display bus per the classic MCUFRIEND shield wiring) needs to
- *  temporarily reconfigure those shared pins as ADC inputs during a touch read, and
- *  having a real CS line lets the panel be deliberately deselected during that window
- *  instead of relying on it "not noticing" bus glitches, which was the old (CS-on-GND)
- *  design's only defense.
+ *  esp_lcd never drove it, panel permanently selected). v1.6.0-dev rewired CS to GPIO
+ *  21 -- chosen because it is not a strapping pin (0/3/45/46), not USB-JTAG (19/20),
+ *  and not committed to SPI flash/PSRAM (26-37 on many ESP32-S3 modules/boards) -- and
+ *  handed it to esp_lcd as cs_gpio_num so esp_lcd would drive it as a real chip-select
+ *  per transaction. THAT DID NOT WORK ON HARDWARE: the display failed to initialize,
+ *  and a multimeter check showed GPIO 21 sitting at ~2.46V after init() instead of a
+ *  clean 3.3V logic high -- esp_lcd was not driving that pin with a strong push-pull
+ *  level. v1.8.0-dev reverts cs_gpio_num to -1 (esp_lcd does not touch CS at all) and
+ *  instead drives GPIO 21 manually as a plain GPIO, exactly like RD/RST/BL, bracketing
+ *  every bus transaction with moclcd_cs_assert()/moclcd_cs_deassert(). GPIO 21 itself
+ *  is still the pin used -- only *how* it's driven changed. This was done ahead of
+ *  Stage 2 touch: 4-wire resistive touch (XP/XM/YP/YM, sharing D7/DC/D6 with the
+ *  display bus per the classic MCUFRIEND shield wiring) needs to temporarily
+ *  reconfigure those shared pins as ADC inputs during a touch read, and having a real,
+ *  reliably-driven CS line lets the panel be deliberately deselected during that
+ *  window instead of relying on it "not noticing" bus glitches, which was the old
+ *  (CS-on-GND) design's only defense.
  *
  *  -------------------------------------------------------------------------------
  *  CHANGELOG
  *  -------------------------------------------------------------------------------
+ *  v1.9.0-dev (this file)
+ *    - SIMPLIFICATION per explicit instruction: v1.8.0-dev bracketed every
+ *      single bus transaction (moclcd_send_cmd, moclcd_send_pixels,
+ *      moclcd_read_reg) with CS assert-before/deassert-after, mirroring how
+ *      esp_lcd itself would have toggled a real cs_gpio_num. Since Stage 2
+ *      touch (the only reason CS ever needs to move) is not implemented yet,
+ *      that per-transaction toggling was unnecessary complexity for a driver
+ *      that only ever talks to one device on this bus -- and functionally
+ *      different from the confirmed-working CS-on-GND behavior this project
+ *      started from. CS is now asserted (driven LOW) exactly once, inside
+ *      moclcd_gpio_init(), and left there permanently for the rest of the
+ *      driver's display-only lifetime -- functionally identical to the old
+ *      hard-wired-to-GND behavior, just via a GPIO (21) instead of a
+ *      permanently grounded trace.
+ *    - moclcd_send_cmd(), moclcd_send_pixels(), and moclcd_read_reg() no
+ *      longer call moclcd_cs_assert()/moclcd_cs_deassert() around individual
+ *      transactions. Correspondingly, moclcd_send_pixels() no longer needs
+ *      (and no longer performs) the v1.8.0-dev synchronization workaround --
+ *      a zero-length tx_param() forced after every tx_color() purely to
+ *      block until the DMA transfer finished before dropping CS. That
+ *      workaround only existed to make deasserting CS safe right after an
+ *      async tx_color() call; with CS never toggled during normal display
+ *      operation, the risk it guarded against doesn't apply.
+ *    - moclcd_cs_assert()/moclcd_cs_deassert() are NOT removed -- they remain
+ *      as the entry points Stage 2 touch will call to actually deselect the
+ *      panel while D6/D7/DC are temporarily reconfigured as ADC inputs for a
+ *      resistive touch read. Until that code exists, moclcd_cs_deassert() is
+ *      simply unused.
+ *    - moclcd_gpio_init() now calls moclcd_cs_assert() as part of its
+ *      steady-state pin setup (CS join RD/RST/BL under direct GPIO control).
+ *      moclcd.reset() (the exposed MicroPython function) does the same.
+ *      moclcd_bus_pins_safe_idle() is UNCHANGED in behavior -- CS still
+ *      starts deasserted/high during the pre-RST-release bring-up window,
+ *      which remains the safer choice while other pins are still being
+ *      forced to known levels; only the comment describing that window was
+ *      updated for accuracy.
+ *    - This has NOT yet been re-tested on hardware after this change --
+ *      version stays dev/unverified per project rules until confirmed.
+ *
+ *  v1.8.0-dev
+ *    - BUG FIX, reported on hardware: display failed to initialize after the
+ *      v1.6.0-dev CS-to-GPIO-21 change. Root cause confirmed by multimeter:
+ *      GPIO 21 sat at ~2.46V after init() instead of a clean 3.3V logic high --
+ *      esp_lcd was not driving that pin with a strong push-pull level when it
+ *      owned it via cs_gpio_num. This is a known category of issue with
+ *      esp_lcd's i80 CS handling.
+ *    - Fix: esp_lcd_panel_io_i80_config_t.cs_gpio_num reverted to -1 (esp_lcd
+ *      no longer touches CS at all). GPIO 21 is still the CS pin, but it is now
+ *      driven manually as a plain GPIO output, exactly like RD/RST/BL already
+ *      were -- new moclcd_cs_assert()/moclcd_cs_deassert() helpers pull it low
+ *      (active) before a transaction and release it high (inactive) after.
+ *    - moclcd_send_cmd() now brackets its esp_lcd_panel_io_tx_param() call with
+ *      assert/deassert. tx_param() is documented as fully synchronous (blocks
+ *      until the transfer completes, and drains any pending tx_color() queue
+ *      first), so deasserting CS immediately afterward is safe.
+ *    - moclcd_send_pixels() required more care: esp_lcd_panel_io_tx_color() is
+ *      documented as ASYNCHRONOUS ("the real transmission is performed in the
+ *      background (DMA+interrupt)") -- deasserting CS immediately after it
+ *      returns could drop CS while the DMA transfer is still in flight,
+ *      corrupting the write. Per Espressif's own docs, tx_param() is the only
+ *      documented synchronization point (it blocks until pending tx_color()
+ *      transfers finish and the queue is empty), so moclcd_send_pixels() now
+ *      issues a zero-length tx_param() on the same RAMWRC command immediately
+ *      after queuing the pixel payload, purely to block until that transfer is
+ *      confirmed complete, before deasserting CS.
+ *    - moclcd_read_reg()'s manual bit-banged read path now also brackets its
+ *      entire command+read-strobe sequence with CS assert/deassert, since CS
+ *      no longer defaults to "always selected" the way GND-tied CS did.
+ *    - moclcd_bus_pins_safe_idle(), moclcd_gpio_init(), and the exposed
+ *      moclcd.reset() now configure GPIO 21 as a plain output and hold it
+ *      deasserted (high, since CS is active-low) as part of their existing
+ *      safe-idle bring-up, alongside RD/RST/BL.
+ *    - This has NOT yet been re-tested on hardware after this fix -- version
+ *      stays dev/unverified per project rules until confirmed.
+ *
+ *  v1.7.0-dev (this file)
+ *    - BUILD FIX: restored the plain-C, non-static "_internal" export surface
+ *      (moclcd_init_internal, moclcd_panel_init_internal, moclcd_backlight_internal,
+ *      moclcd_fill_screen_internal, moclcd_fill_rect_internal, moclcd_blit_internal,
+ *      moclcd_draw_text_internal) that other native C modules in this build
+ *      (modcube.c, modsaturn.c, modsolarsys.c, modsphere.c, modballs.c, modgyro.c,
+ *      modcar.c) link against directly, bypassing the MicroPython mp_obj_t layer
+ *      entirely. This surface existed in a prior working build
+ *      (working_display_code.c, tagged 1.5.0-STABLE there) but was missing from
+ *      this file, causing "undefined reference to moclcd_*_internal" link errors
+ *      across every one of those caller modules.
+ *    - Signatures and bodies were taken directly from working_display_code.c
+ *      (the confirmed-working reference) rather than re-derived, since its
+ *      helper function names/signatures (moclcd_gpio_init, moclcd_bus_init,
+ *      moclcd_hw_reset, moclcd_panel_init_seq, moclcd_fill_window,
+ *      moclcd_set_window, moclcd_send_pixels) and its moclcd_state_t struct
+ *      layout (i80_bus, io, initialized, width, height, pclk_hz, madctl,
+ *      bl_state) match this file's exactly -- confirmed field-by-field before
+ *      inserting, so no adaptation was needed or performed.
+ *    - Per explicit instruction: the _internal functions themselves are
+ *      unchanged from the reference (not "improved" or reconciled with this
+ *      file's newer RAMWR/RAMWRC or CS-on-GPIO-21 behavior beyond what they
+ *      already get for free by calling the same shared helpers those other
+ *      fixes live in). No moclcd.h header was added -- the caller modules
+ *      already declare their own extern prototypes for these functions.
+ *    - Added missing #include <stdbool.h> (needed for moclcd_backlight_internal's
+ *      bool parameter) and #include "esp_rom_sys.h" (needed for
+ *      esp_rom_delay_us(), already used by read_reg()'s bit-banging but
+ *      previously relying on a transitive include rather than declaring it
+ *      directly) -- both confirmed present in working_display_code.c's include
+ *      list and missing from this file before this change.
+ *    - No changes to CS/GPIO 21 (v1.6.0-dev), RAMWR/RAMWRC pixel streaming
+ *      (v1.5.0-dev), or any other previously-verified behavior.
+ *
  *  v1.6.0-dev (this file)
  *    - HARDWARE CHANGE, not a bug fix: CS moved from hard-wired GND to a real
  *      GPIO (GPIO 21), in preparation for Stage 2 touch. LCD_PIN_NUM_CS changed
@@ -285,6 +402,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 #include "py/runtime.h"
 #include "py/obj.h"
@@ -300,6 +418,7 @@
 #include "esp_lcd_types.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -311,7 +430,7 @@ static const char *TAG = "moclcd";
  *  on real hardware and explicitly confirmed it. Leave at 0 ("dev/unverified") for
  *  every iteration until that happens.
  * =================================================================================== */
-#define MOCLCD_VERSION_STRING   "1.6.0-dev"
+#define MOCLCD_VERSION_STRING   "1.9.0-dev"
 #define MOCLCD_BUILD_STABLE     0   /* 0 = dev/unverified, 1 = STABLE (only after user confirms) */
 
 #if MOCLCD_BUILD_STABLE
@@ -336,7 +455,7 @@ static const char *TAG = "moclcd";
 #define LCD_PIN_NUM_RD      41
 #define LCD_PIN_NUM_RST     12
 #define LCD_PIN_NUM_BL      38
-#define LCD_PIN_NUM_CS      21   /* moved from GND to a dedicated GPIO for Stage 2 touch multiplexing */
+#define LCD_PIN_NUM_CS      21   /* moved from GND to a dedicated GPIO for Stage 2 touch multiplexing; driven manually as of v1.8.0-dev, NOT handed to esp_lcd */
 
 /* ILI9488 MIPI DCS Rev.1 default RAM addressing registers (from MCUFRIEND_kbv) */
 #define ILI9488_CMD_CASET   0x2A
@@ -394,9 +513,59 @@ static inline void moclcd_check_ready(void)
     }
 }
 
+/* ===================================================================================
+ *  MANUAL CS CONTROL (v1.8.0-dev fix, v1.9.0-dev simplified to permanent-low)
+ *
+ *  BACKGROUND: v1.6.0-dev moved CS from hard-wired GND to a real GPIO (21) and
+ *  handed it to esp_lcd via cs_gpio_num, expecting esp_lcd to drive it as a
+ *  normal chip-select. On real hardware this did not work -- the display
+ *  failed to initialize at all. A multimeter check showed GPIO 21 sitting at
+ *  ~2.46V after init() instead of a clean 3.3V logic high, indicating esp_lcd
+ *  was not driving that pin with a strong push-pull level the way a direct
+ *  gpio_set_level() does. This is a known category of issue with esp_lcd's
+ *  i80 CS handling on some ESP-IDF versions/targets -- the documented fix,
+ *  and the one used here, is to NOT hand CS to esp_lcd at all (cs_gpio_num
+ *  is -1, see moclcd_bus_init() below) and instead drive it as a plain GPIO,
+ *  exactly like RD/RST/BL already are.
+ *
+ *  v1.9.0-dev SIMPLIFICATION: v1.8.0-dev bracketed every single bus
+ *  transaction with assert-before/deassert-after, mirroring how esp_lcd
+ *  itself would toggle a real cs_gpio_num. That level of care is only
+ *  actually needed once Stage 2 touch exists and needs to deliberately
+ *  deselect the panel while D6/D7/DC are temporarily reconfigured as ADC
+ *  inputs for a resistive touch read -- which is NOT implemented yet. Until
+ *  that lands, per-transaction toggling is unnecessary complexity (and,
+ *  per the confirmed-working reference behavior when CS was hard-wired to
+ *  GND, unnecessary risk) for a driver that only ever talks to one device on
+ *  this bus. CS is therefore now asserted ONCE, during moclcd_gpio_init(),
+ *  and simply left low for the entire display-only lifetime of the driver --
+ *  functionally identical to the old CS-on-GND behavior, just via a GPIO
+ *  that Stage 2 can later start toggling instead of a permanently grounded
+ *  trace. moclcd_send_cmd()/moclcd_send_pixels()/moclcd_read_reg() no longer
+ *  call moclcd_cs_assert()/moclcd_cs_deassert() around individual
+ *  transactions -- those two functions are kept below, unused for now, as
+ *  the entry points Stage 2 touch will call to actually deselect the panel
+ *  during a touch read. */
+
+static inline void moclcd_cs_assert(void)
+{
+    gpio_set_level(LCD_PIN_NUM_CS, 0);
+}
+
+static inline void moclcd_cs_deassert(void)
+{
+    gpio_set_level(LCD_PIN_NUM_CS, 1);
+}
+
 /* Send a command byte (D/C driven low internally by lcd_cmd), optionally followed by
  * parameter bytes (D/C driven high internally by lcd_cmd's param argument). This
- * matches WriteCmdParamN() in MCUFRIEND_kbv.cpp. */
+ * matches WriteCmdParamN() in MCUFRIEND_kbv.cpp.
+ *
+ * v1.9.0-dev: CS is held permanently LOW (asserted) for the entire display-only
+ * lifetime of this driver -- see moclcd_cs_assert()/moclcd_cs_deassert() above
+ * for the full rationale. No per-transaction CS toggling happens here; that
+ * only becomes necessary once Stage 2 touch needs to deselect the panel while
+ * reconfiguring shared pins for an ADC read, which is not implemented yet. */
 static void moclcd_send_cmd(uint8_t cmd, const uint8_t *params, size_t len)
 {
     esp_err_t err = esp_lcd_panel_io_tx_param(s_lcd.io, cmd, params, len);
@@ -409,32 +578,18 @@ static void moclcd_send_cmd(uint8_t cmd, const uint8_t *params, size_t len)
 /* Stream raw pixel/data bytes with D/C high, prefixed by a Write Memory Continue
  * (0x3C) command.
  *
- * IMPORTANT FIX (v1.5.0-dev): v1.4.0-dev fixed the "-1 no command" bug (see that
- * changelog entry) by making this function pass ILI9488_CMD_RAMWR (0x2C) as the
- * tx_color() command. That was still wrong. Per the ILI9488 datasheet (Memory
- * Write, 0x2C, Section 5.2.24, p.179): "the column and page registers are reset
- * to the Start Column (SC) and Start Page (SP)" EVERY time 0x2C is sent. Using
- * 0x2C as the command for every chunk of a multi-chunk pixel stream resets the
- * write pointer back to the top-left of the window on every single chunk,
- * instead of continuing where the previous chunk left off -- so anything beyond
- * a single DMA-sized chunk collapses back onto the first few rows/columns
- * repeatedly. This was confirmed against two previously-working reference
- * drivers for this exact panel/pin config (modlcd_nopool.c, lcd_min.c), both of
- * which use ILI9488_CMD_RAMWRC (0x3C, "Write Memory Continue") for every
- * tx_color() call, not 0x2C.
+ * [... v1.4.0-dev / v1.5.0-dev RAMWR/RAMWRC history retained above in the
+ * v1.5.0-dev changelog entry, unchanged by this edit ...]
  *
- * Per the datasheet (Memory Write Continue, 0x3C, Section 5.2.35, p.201): 0x3C
- * "makes no change to the other driver status" and explicitly does NOT reset
- * the column/page registers to SC/SP the way 0x2C does -- it continues writing
- * from the current counter position, wrapping row-to-row inside the active
- * CASET/PASET window until the host sends another command. This is the correct
- * command for every pixel-payload transaction, including the first one,
- * PROVIDED a bare 0x2C (no parameters) was already sent once via tx_param() to
- * arm the counters at (SC,SP) -- which is exactly what moclcd_set_window() does
- * below. In other words: set_window() sends bare RAMWR (0x2C) to reset the
- * pointer to the window's top-left corner, and every subsequent pixel payload
- * -- first chunk and all following chunks alike -- goes out under RAMWRC
- * (0x3C) so the pointer just keeps advancing instead of snapping back. */
+ * v1.9.0-dev: CS is held permanently LOW for the entire display-only lifetime
+ * of this driver (see moclcd_cs_assert()/moclcd_cs_deassert() and the note
+ * above them) -- no per-call assert/deassert here, and therefore no need for
+ * the v1.8.0-dev synchronization workaround (a zero-length tx_param() forced
+ * after every tx_color() purely to block until the DMA transfer finished
+ * before dropping CS). That workaround only existed to make it safe to
+ * deassert CS right after an async tx_color() call; with CS never toggled
+ * during normal display operation, that risk doesn't apply and the extra
+ * synchronous bus transaction per pixel-stream call is not needed. */
 static void moclcd_send_pixels(const void *data, size_t len_bytes)
 {
     esp_err_t err = esp_lcd_panel_io_tx_color(s_lcd.io, ILI9488_CMD_RAMWRC, data, len_bytes);
@@ -562,7 +717,7 @@ static void moclcd_bus_init(uint32_t pclk_hz)
     }
 
     esp_lcd_panel_io_i80_config_t io_config = {
-        .cs_gpio_num = LCD_PIN_NUM_CS,          /* GPIO 21: esp_lcd now drives CS itself per transaction */
+        .cs_gpio_num = -1,                      /* v1.8.0-dev: CS driven manually, see moclcd_cs_assert/deassert */
         .pclk_hz = pclk_hz,
         .trans_queue_depth = 10,
         .dc_levels = {
@@ -605,20 +760,21 @@ static const int k_data_pins_fwd[8] = {
  * toggling pins was "free" the way it would be with a floating/inactive CS.
  * That constraint drove moclcd_bus_pins_safe_idle() below.
  *
- * v1.6.0-dev CHANGE: CS has been rewired to GPIO 21 and esp_lcd now drives it
- * as a real chip-select per transaction (cs_gpio_num is no longer -1). This
- * means the panel genuinely stops listening whenever CS is deasserted between
- * esp_lcd transactions -- a real safety margin the old design didn't have.
- * However, moclcd_bus_pins_safe_idle() below is INTENTIONALLY left unchanged
- * for now: CS is owned entirely by esp_lcd once esp_lcd_new_panel_io_i80() has
- * run, so this function (which only runs before that, during the pre-bus-init
- * GPIO bring-up) still has no CS protection available to it -- the same
- * "bring every other bus pin to a known level before RST releases" discipline
- * still applies at that specific stage regardless of what CS can do once the
- * bus is live. The real payoff of moving CS to a GPIO shows up in Stage 2
- * touch: it lets the panel be deliberately deselected while D6/D7/DC are
- * temporarily reconfigured as ADC inputs for a touch read, instead of hoping
- * a mid-read bus glitch doesn't land on a real command byte.
+ * v1.6.0-dev CHANGE (SUPERSEDED by v1.8.0-dev, see below): CS was rewired to
+ * GPIO 21 with the intent of letting esp_lcd drive it as a real chip-select
+ * per transaction (cs_gpio_num set to 21 instead of -1). This did not work on
+ * hardware -- esp_lcd did not drive that pin with a clean logic level -- so
+ * v1.8.0-dev reverted cs_gpio_num to -1 and CS is now driven manually instead
+ * (see moclcd_cs_assert()/moclcd_cs_deassert() above moclcd_send_cmd()).
+ * moclcd_bus_pins_safe_idle() below now DOES include CS in its GPIO mask
+ * (deasserted/high, alongside RD/RST/BL) since this function owns CS directly
+ * now rather than handing it to esp_lcd's bus setup. The original point still
+ * holds independent of which approach drives CS: whenever CS is deasserted
+ * between transactions, the panel genuinely stops listening -- a real safety
+ * margin the CS-on-GND design never had. The payoff of moving CS to a GPIO
+ * shows up in Stage 2 touch: it lets the panel be deliberately deselected
+ * while D6/D7/DC are temporarily reconfigured as ADC inputs for a touch read,
+ * instead of hoping a mid-read bus glitch doesn't land on a real command byte.
  *
  * Original rationale (still accurate for the pre-bus-init window this function
  * runs in):
@@ -656,7 +812,8 @@ static void moclcd_bus_pins_safe_idle(void)
                        | (1ULL << LCD_PIN_NUM_WR)
                        | (1ULL << LCD_PIN_NUM_RD)
                        | (1ULL << LCD_PIN_NUM_RST)
-                       | (1ULL << LCD_PIN_NUM_BL),
+                       | (1ULL << LCD_PIN_NUM_BL)
+                       | (1ULL << LCD_PIN_NUM_CS),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -667,7 +824,12 @@ static void moclcd_bus_pins_safe_idle(void)
     /* Set levels BEFORE anything can toggle WR: data=0, DC=1(data-ish/inert),
      * WR=1(idle,no latch edge pending), RD=1(idle), RST=0(hold in reset while we
      * finish bringing up the bus), BL=0(backlight off until we're ready to show
-     * something deliberate, avoids flashing garbage frames). */
+     * something deliberate, avoids flashing garbage frames), CS=1(deasserted --
+     * kept high/inactive here deliberately, before RST is even released, so the
+     * panel is not selected while WR/DC are still being forced to known levels;
+     * moclcd_gpio_init() asserts CS low right after this and it then stays low
+     * permanently for the display-only lifetime of the driver, see the MANUAL
+     * CS CONTROL note above moclcd_cs_assert()). */
     for (int i = 0; i < 8; i++) {
         gpio_set_level(k_data_pins_fwd[i], 0);
     }
@@ -676,6 +838,7 @@ static void moclcd_bus_pins_safe_idle(void)
     gpio_set_level(LCD_PIN_NUM_RD, 1);
     gpio_set_level(LCD_PIN_NUM_RST, 0);
     gpio_set_level(LCD_PIN_NUM_BL, 0);
+    gpio_set_level(LCD_PIN_NUM_CS, 1);
 }
 
 static void moclcd_gpio_init(void)
@@ -686,13 +849,18 @@ static void moclcd_gpio_init(void)
      * starting point, rather than from whatever level RST happened to power up at. */
     moclcd_bus_pins_safe_idle();
 
-    /* Hand RD/BL/RST management back to their normal steady-state configuration.
+    /* Hand RD/BL/RST/CS management back to their normal steady-state configuration.
      * D0-D7/DC/WR remain owned by esp_lcd once moclcd_bus_init() runs immediately
-     * after this in init(); RD/RST/BL stay under our direct GPIO control for the
+     * after this in init(); RD/RST/BL/CS stay under our direct GPIO control for the
      * lifetime of the driver (RD is briefly reclaimed for bit-banged reads and
-     * restored afterward, see read_reg()). */
+     * restored afterward, see read_reg()). v1.9.0-dev: CS is asserted (driven LOW)
+     * here and left there permanently -- no per-transaction toggling happens during
+     * normal display operation, see the MANUAL CS CONTROL block above
+     * moclcd_send_cmd() for the full rationale. moclcd_cs_assert()/
+     * moclcd_cs_deassert() remain available, unused for now, for Stage 2 touch. */
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << LCD_PIN_NUM_RST) | (1ULL << LCD_PIN_NUM_BL) | (1ULL << LCD_PIN_NUM_RD),
+        .pin_bit_mask = (1ULL << LCD_PIN_NUM_RST) | (1ULL << LCD_PIN_NUM_BL)
+                       | (1ULL << LCD_PIN_NUM_RD) | (1ULL << LCD_PIN_NUM_CS),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -705,6 +873,7 @@ static void moclcd_gpio_init(void)
     gpio_set_level(LCD_PIN_NUM_RD, 1);
     gpio_set_level(LCD_PIN_NUM_BL, 0);
     gpio_set_level(LCD_PIN_NUM_RST, 0); /* stay held in reset until moclcd_hw_reset() runs */
+    moclcd_cs_assert(); /* CS LOW, permanently, for the display-only lifetime of this driver */
 }
 
 /* ===================================================================================
@@ -828,7 +997,8 @@ static mp_obj_t moclcd_reset(void)
      * full init() re-run. */
     moclcd_bus_pins_safe_idle();
     gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << LCD_PIN_NUM_RST) | (1ULL << LCD_PIN_NUM_RD) | (1ULL << LCD_PIN_NUM_BL),
+        .pin_bit_mask = (1ULL << LCD_PIN_NUM_RST) | (1ULL << LCD_PIN_NUM_RD)
+                       | (1ULL << LCD_PIN_NUM_BL) | (1ULL << LCD_PIN_NUM_CS),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -836,6 +1006,7 @@ static mp_obj_t moclcd_reset(void)
     };
     gpio_config(&io_conf);
     gpio_set_level(LCD_PIN_NUM_RD, 1);
+    moclcd_cs_assert(); /* v1.9.0-dev: CS held LOW permanently, see MANUAL CS CONTROL note */
     moclcd_hw_reset();
     return mp_const_none;
 }
@@ -1008,6 +1179,11 @@ static mp_obj_t moclcd_read_reg(size_t n_args, const mp_obj_t *args)
 
     /* 1) Release esp_lcd's ownership of D0-D7/DC/WR so we can bit-bang them. */
     moclcd_bus_deinit_if_needed();
+
+    /* v1.9.0-dev: CS is held permanently low (asserted) for the whole
+     * display-only lifetime of this driver -- see moclcd_cs_assert() and the
+     * note above it -- so no assert/deassert bracketing is needed here; CS is
+     * already low from init() and stays that way through this manual read. */
 
     /* 2) Manual command phase (D/C low, strobe WR) -- see moclcd_manual_send_cmd_only(). */
     moclcd_manual_send_cmd_only(command);
@@ -1434,6 +1610,105 @@ static const uint8_t k_font5x7[][5] = {
     {0x00,0x41,0x36,0x08,0x00}, /* } */
     {0x08,0x08,0x2A,0x1C,0x08}, /* -> (~ substitute) */
 };
+
+/* ===================================================================================
+ *  EXPORTED C-LINKAGE INTERFACES (v1.7.0-dev)
+ *
+ *  Plain-C, non-static entry points with no MicroPython/mp_obj_t dependency,
+ *  callable directly from other native C modules in this build (modcube.c,
+ *  modsaturn.c, modsolarsys.c, modsphere.c, modballs.c, modgyro.c, modcar.c,
+ *  and any other C module that wants to draw to the panel without going
+ *  through the MicroPython object/argument-parsing layer).
+ *
+ *  These are a thin, direct pass-through to the same internal helpers the
+ *  MP wrappers below call (moclcd_gpio_init, moclcd_bus_init, moclcd_hw_reset,
+ *  moclcd_panel_init_seq, moclcd_fill_window, moclcd_set_window,
+ *  moclcd_send_pixels) -- there is exactly one code path per operation
+ *  underneath, whether it's reached from Python or from another C module, so
+ *  a bug fix in one of those helpers (e.g. the v1.5.0-dev RAMWR/RAMWRC fix)
+ *  automatically applies to both call surfaces with no duplication.
+ *
+ *  Signatures match the pre-existing caller expectations exactly (confirmed
+ *  against working_display_code.c, the last known-linking version of this
+ *  file, rather than guessed): moclcd_init_internal() and
+ *  moclcd_panel_init_internal() take no arguments and use the same
+ *  hard-coded defaults moclcd.init()'s MicroPython wrapper defaults to
+ *  (10MHz, 480x320, MADCTL 0x28) -- a caller needing different parameters
+ *  should go through the MicroPython-facing init() instead, since these
+ *  _internal entry points intentionally have no argument-parsing overhead.
+ * =================================================================================== */
+
+void moclcd_init_internal(void)
+{
+    if (s_lcd.initialized) {
+        return;
+    }
+    s_lcd.pclk_hz = 10000000;
+    s_lcd.width   = 480;
+    s_lcd.height  = 320;
+    s_lcd.madctl  = 0x28;
+
+    moclcd_gpio_init();
+    moclcd_bus_init(s_lcd.pclk_hz);
+    moclcd_hw_reset();
+    s_lcd.initialized = true;
+}
+
+void moclcd_panel_init_internal(void)
+{
+    moclcd_panel_init_seq(s_lcd.madctl);
+}
+
+void moclcd_backlight_internal(bool on)
+{
+    s_lcd.bl_state = on;
+    gpio_set_level(LCD_PIN_NUM_BL, on ? 1 : 0);
+}
+
+void moclcd_fill_screen_internal(uint16_t color)
+{
+    moclcd_fill_window(0, 0, s_lcd.width - 1, s_lcd.height - 1, color);
+}
+
+void moclcd_fill_rect_internal(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
+{
+    if (w == 0 || h == 0) {
+        return;
+    }
+    moclcd_fill_window(x, y, x + w - 1, y + h - 1, color);
+}
+
+void moclcd_blit_internal(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const void *buf)
+{
+    if (w == 0 || h == 0) {
+        return;
+    }
+    moclcd_set_window(x, y, x + w - 1, y + h - 1);
+    moclcd_send_pixels(buf, (size_t)w * h * 2);
+}
+
+void moclcd_draw_text_internal(uint16_t x, uint16_t y, const char *str, uint16_t fg, uint16_t bg)
+{
+    uint16_t be_fg = __builtin_bswap16(fg);
+    uint16_t be_bg = __builtin_bswap16(bg);
+    uint16_t cur_x = x;
+
+    for (const char *p = str; *p; p++) {
+        char ch = *p;
+        int idx = (ch >= MOCLCD_FONT_FIRST && ch <= MOCLCD_FONT_LAST) ? (ch - MOCLCD_FONT_FIRST) : 0;
+        const uint8_t *glyph = k_font5x7[idx];
+        uint16_t buf[MOCLCD_FONT_W * MOCLCD_FONT_H];
+        for (int col = 0; col < MOCLCD_FONT_W; col++) {
+            uint8_t bits = glyph[col];
+            for (int row = 0; row < MOCLCD_FONT_H; row++) {
+                buf[row * MOCLCD_FONT_W + col] = (bits & (1 << row)) ? be_fg : be_bg;
+            }
+        }
+        moclcd_set_window(cur_x, y, cur_x + MOCLCD_FONT_W - 1, y + MOCLCD_FONT_H - 1);
+        moclcd_send_pixels(buf, sizeof(buf));
+        cur_x += MOCLCD_FONT_W + 1;
+    }
+}
 
 /* draw_char(x, y, character, fg_color, bg_color)
  * Renders one 5x7 glyph scaled 1:1 by building a small local pixel buffer and
