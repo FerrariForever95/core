@@ -1,145 +1,169 @@
 """
-zeno_gfx.py — UI widget stack built directly on top of moclcd.
+Graphics.py -- Complete Orientation-Aware UI Widget Stack for Zeno `lcd` + `touch`
+(ILI9488 8-bit parallel panel, 4-wire resistive touch, ESP32-S3). MicroPython.
 
-Every widget talks to the panel through the module-level functions below
-(fill_rect, draw_text8x8, draw_bmp, get_touch, ...), which in turn call
-moclcd directly. No extra wrapper object required.
-
-Defaults to LANDSCAPE (480x320). Call init_display() once at boot; it
-sets WIDTH/HEIGHT and runs moclcd.init()/reset()/panel_init() for you.
-
-Touch: moclcd has no touch input, so touch is decoupled via
-set_touch_handler(fn) — fn() should return (x, y) or None.
-
-    import zeno_gfx as gfx
-    gfx.init_display()                 # landscape 480x320
-    gfx.set_touch_handler(my_touch.read)
-
-Text and images: moclcd.c implements both natively in C (font_petme128_8x8
-for text, a minimal uncompressed-24-bit-BMP loader for images), each
-sent to the panel as DMA transfers. draw_text8x8() and draw_bmp() here
-are thin wrappers over moclcd.draw_text8x8()/moclcd.draw_bmp() — no
-Python-side pixel loops or framebuf scratch buffers involved.
-  - draw_text8x8(x, y, text, fg, bg=None) draws opaque by default
-    (bg falls back to the module `background`); pass bg=None via
-    draw_text8x8_transparent() for the native per-pixel transparent mode.
-  - draw_bmp() forwards straight to moclcd.draw_bmp(); only uncompressed
-    24-bit BMP is supported (raises ValueError otherwise).
-  - draw_logo() wraps draw_bmp() for a common "brand mark" use case
-    (centering, scaling to fit a box, optional caption underneath).
-
-Notifications: NotificationBadge draws a small dot/count marker that
-can be pinned to the corner of any widget (button, icon, tab, avatar)
-to indicate unread/pending state — the classic "red dot" pattern.
-Toast() gives a non-blocking, stackable banner for transient messages;
-call Toast.update() once per frame from your main loop.
-
-Backlight: moclcd.backlight_set() requires moclcd.backlight_init() to
-have run first, or it raises OSError. init_display(dimmable=True) (or
-a standalone enable_dimming() call) sets up the LEDC PWM channel so
-brightness()/backlight_set() work; without it, brightness() raises a
-clear RuntimeError instead of letting that OSError surface from moclcd.
-
-Pixels: set_pixel(x, y, color) (alias draw_pixel()) wraps moclcd's
-native draw_pixel() for one-off dots — cheaper and clearer than
-fill_rect(x, y, 1, 1, color), and clip-safe like every other primitive
-here. Participates in begin_capture()/end_capture() and the genie
-animations the same as circles/lines/rects do.
+Supports automatic orientation switching (Portrait 320x480 & Landscape 480x320)
+across rotations 0, 1, 2, and 3.
 """
 
 import time
-import urandom
-import moclcd
+import math
+import json
+import micropython
+import lcd
+import touch
+from machine import Pin
+
+pin = Pin(38, Pin.OUT)                # backlight enable
 
 # ---------------------------------------------------------------------
-# Display setup / globals
+# Globals & Dynamic Orientation State
 # ---------------------------------------------------------------------
 
 WIDTH = 480
 HEIGHT = 320
+ROTATION = 1                          # 0=Portrait, 1=Landscape, 2=Portrait Inv, 3=Landscape Inv
+
+# Design reference dimensions (if your UI layouts were written for 480x320 or 320x480)
+REF_WIDTH = 480
+REF_HEIGHT = 320
+AUTO_ADAPT_LAYOUT = True              # automatically scale/reflow widgets when rotation changes
 
 active_screen = None
+_registered_widgets = []
 
-_dimmable = False  # set True once backlight_init() has actually run
+FONT_8X8 = "8x8"
+FONT_MONO12 = lcd.FONT_MONO12
+FONT_MONO16 = lcd.FONT_MONO16
+FONT_SANS16 = lcd.FONT_SANS16
+FONT_SANS24B = lcd.FONT_SANS24B
+FONT_DIGITS48 = lcd.FONT_DIGITS48
 
-
-def brightness(value):
-    """Set backlight brightness as a 0.0-1.0 fraction.
-
-    Requires PWM dimming to be enabled first -- either pass dimmable=True
-    to init_display(), or call enable_dimming() yourself. moclcd.backlight_set()
-    raises OSError if backlight_init() was never called, so this checks
-    the flag up front and gives a clearer error instead of a bare
-    OSError bubbling out of the C module.
-    """
-    if not _dimmable:
-        raise RuntimeError(
-            "brightness() needs PWM dimming: call init_display(dimmable=True) "
-            "or enable_dimming() first"
-        )
-    moclcd.backlight_set(value)
-
-
-def enable_dimming(freq_hz=5000, resolution_bits=8):
-    """Set up LEDC PWM on the backlight pin so brightness()/backlight_set()
-    can dim smoothly instead of only supporting on/off. Safe to call more
-    than once. After this, moclcd.backlight(on) also drives PWM duty to
-    max/0 rather than toggling the raw GPIO."""
-    global _dimmable
-    moclcd.backlight_init(freq_hz=freq_hz, resolution_bits=resolution_bits)
-    _dimmable = True
-
-
-def init_display(pclk=10_000_000, width=480, height=320, madctl=0x28, dimmable=False):
-    """Bring up the panel in landscape by default and sync WIDTH/HEIGHT.
-    Pass width=320, height=480, madctl=0x48 for portrait instead.
-
-    dimmable=True also calls enable_dimming() so brightness()/backlight_set()
-    work immediately instead of raising; leave False if you only ever need
-    a hard on/off backlight.
-    """
-    global WIDTH, HEIGHT
-    WIDTH, HEIGHT = width, height
-    moclcd.init(pclk=pclk, width=width, height=height, madctl=madctl)
-    moclcd.reset()
-    moclcd.panel_init()
-    if dimmable:
-        enable_dimming()
-    moclcd.backlight(True)
+DEFAULT_FONT = FONT_8X8
+TRANSPARENT = -1
 
 # ---------------------------------------------------------------------
-# Colors — an iOS-ish default palette, small and consistent
+# Colours
 # ---------------------------------------------------------------------
 
 def color565(r, g, b):
-    """Return RGB565 color value."""
     return (r & 0xf8) << 8 | (g & 0xfc) << 3 | b >> 3
 
 
-WHITE      = color565(255, 255, 255)
-BLACK      = color565(0, 0, 0)
-GRAY       = color565(128, 128, 128)
-DARK_GRAY  = color565(60, 60, 60)
-LIGHT_GRAY = color565(200, 200, 200)
+def blend(c0, c1, alpha):
+    """alpha 0..255: 0 -> c0, 255 -> c1."""
+    return lcd.blend(c0, c1, alpha)
 
-BLUE       = color565(0, 122, 255)
-GREEN      = color565(52, 199, 89)
-RED        = color565(255, 59, 48)
-ORANGE     = color565(255, 149, 0)
-YELLOW     = color565(255, 204, 0)
-PURPLE     = color565(175, 82, 222)
 
-SURFACE       = color565(28, 28, 30)   # dark card/panel background
-SURFACE_ALT   = color565(44, 44, 46)   # slightly lighter surface
+# Base Grayscale
+WHITE         = color565(255, 255, 255)
+SNOW          = color565(255, 250, 250)
+IVORY         = color565(255, 255, 240)
+SILVER        = color565(192, 192, 192)
+GRAY          = color565(128, 128, 128)
+DARK_GRAY     = color565(60, 60, 60)
+LIGHT_GRAY    = color565(200, 200, 200)
+CHARCOAL      = color565(34, 34, 34)
+BLACK         = color565(0, 0, 0)
+
+# Reds & Pinks
+RED           = color565(255, 59, 48)
+DARK_RED      = color565(139, 0, 0)
+CRIMSON       = color565(220, 20, 60)
+CORAL         = color565(255, 127, 80)
+SALMON        = color565(250, 128, 114)
+PINK          = color565(255, 192, 203)
+HOT_PINK      = color565(255, 105, 180)
+DEEP_PINK     = color565(255, 20, 147)
+
+# Oranges & Browns
+ORANGE        = color565(255, 149, 0)
+DARK_ORANGE   = color565(255, 140, 0)
+TOMATO        = color565(255, 99, 71)
+GOLD          = color565(255, 215, 0)
+BROWN         = color565(165, 42, 42)
+SADDLE_BROWN  = color565(139, 69, 19)
+CHOCOLATE     = color565(210, 105, 30)
+PERU          = color565(205, 133, 63)
+SANDY_BROWN   = color565(244, 164, 96)
+
+# Yellows
+YELLOW        = color565(255, 204, 0)
+LIGHT_YELLOW  = color565(255, 255, 224)
+LEMON_CHIFFON = color565(255, 250, 205)
+KHAKI         = color565(240, 230, 140)
+GOLDENROD     = color565(218, 165, 32)
+
+# Greens
+GREEN         = color565(52, 199, 89)
+DARK_GREEN    = color565(0, 100, 0)
+LIME          = color565(0, 255, 0)
+LIME_GREEN    = color565(50, 205, 50)
+FOREST_GREEN  = color565(34, 139, 34)
+PALE_GREEN    = color565(152, 251, 152)
+SPRING_GREEN  = color565(0, 255, 127)
+SEA_GREEN     = color565(46, 139, 87)
+OLIVE         = color565(128, 128, 0)
+DARK_OLIVE    = color565(85, 107, 47)
+
+# Cyans & Blues
+CYAN          = color565(0, 255, 255)
+LIGHT_CYAN    = color565(224, 255, 255)
+DARK_CYAN     = color565(0, 139, 139)
+AQUAMARINE    = color565(127, 255, 212)
+TURQUOISE     = color565(64, 224, 208)
+BLUE          = color565(0, 122, 255)
+DARK_BLUE     = color565(0, 0, 139)
+NAVY          = color565(0, 0, 128)
+MEDIUM_BLUE   = color565(0, 0, 205)
+SKY_BLUE      = color565(135, 206, 235)
+DEEP_SKY_BLUE = color565(0, 191, 255)
+DODGER_BLUE   = color565(30, 144, 255)
+CORNFLOWER    = color565(100, 149, 237)
+ROYAL_BLUE    = color565(65, 105, 225)
+
+# Purples, Violets & Magentas
+PURPLE        = color565(175, 82, 222)
+MAGENTA       = color565(255, 0, 255)
+INDIGO        = color565(75, 0, 130)
+VIOLET        = color565(238, 130, 238)
+PLUM          = color565(221, 160, 221)
+ORCHID        = color565(218, 112, 214)
+MEDIUM_PURPLE = color565(147, 112, 219)
+DARK_MAGENTA  = color565(139, 0, 139)
+THISTLE       = color565(216, 191, 216)
+
+# UI System Palettes
+SURFACE       = color565(28, 28, 30)
+SURFACE_ALT   = color565(44, 44, 46)
 BORDER        = color565(70, 70, 72)
 TEXT_MUTED    = color565(150, 150, 155)
+ACCENT_BLUE   = color565(10, 132, 255)
+ACCENT_GREEN  = color565(48, 209, 88)
+ACCENT_RED    = color565(255, 69, 58)
+ACCENT_ORANGE = color565(255, 159, 10)
+ACCENT_YELLOW = color565(255, 214, 10)
+ACCENT_PURPLE = color565(191, 90, 242)
 
-background = BLACK  # module-wide default background, override with set_background()
+background = BLACK
+
+
+def lighten(c, amount=60):
+    return lcd.blend(c, WHITE, amount)
+
+
+def darken(c, amount=60):
+    return lcd.blend(c, BLACK, amount)
 
 
 def set_background(color):
     global background
     background = color
+
+
+def set_default_font(font):
+    global DEFAULT_FONT
+    DEFAULT_FONT = font
 
 
 def log_error(msg):
@@ -150,23 +174,292 @@ def log_warn(msg):
     print("[UI WARN]", msg)
 
 
+_touch_ok = False
+_touch_last = None
+_touch_t = None
+_cal_loaded = False
+
+
 # ---------------------------------------------------------------------
-# Touch (moclcd has none — plug your driver in here)
+# Bounds & Orientation Helpers
 # ---------------------------------------------------------------------
 
-_touch_fn = None
+def _clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
 
 
-def set_touch_handler(fn):
-    """fn() should return (x, y) or None."""
-    global _touch_fn
-    _touch_fn = fn
+def _clip(x, y, w, h):
+    x0 = x if x > 0 else 0
+    y0 = y if y > 0 else 0
+    x1 = x + w
+    y1 = y + h
+    if x1 > WIDTH:
+        x1 = WIDTH
+    if y1 > HEIGHT:
+        y1 = HEIGHT
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def set_reference_size(w, h):
+    """Set the reference resolution your UI coordinates were designed for
+    (e.g., set_reference_size(320, 480) if designed in Portrait, or (480, 320) for Landscape).
+    Widgets will automatically scale from (REF_WIDTH, REF_HEIGHT) to (WIDTH, HEIGHT)."""
+    global REF_WIDTH, REF_HEIGHT
+    REF_WIDTH = max(1, int(w))
+    REF_HEIGHT = max(1, int(h))
+
+
+def _resolve_coord(val, total, ref_total):
+    if isinstance(val, float) and 0.0 <= val <= 1.0:
+        return int(round(val * total))
+    if val < 0:
+        return max(0, total + int(val))
+    if AUTO_ADAPT_LAYOUT and total != ref_total and val > ref_total:
+        return int(round(val * total / ref_total))
+    return int(val)
+
+
+# ---------------------------------------------------------------------
+# Display Setup & Dynamic Rotation
+# ---------------------------------------------------------------------
+
+def init_display(rotation=1):
+    """Bring up the panel and touch in any orientation (0=Portrait, 1=Landscape, 2=Inv Portrait, 3=Inv Landscape).
+    Returns (WIDTH, HEIGHT)."""
+    global WIDTH, HEIGHT, ROTATION, REF_WIDTH, REF_HEIGHT, _touch_ok, _touch_last, _touch_t
+
+    ROTATION = rotation & 3
+    lcd.init(rotation=ROTATION)
+    pin.on()
+    WIDTH, HEIGHT = lcd.width(), lcd.height()
+    REF_WIDTH, REF_HEIGHT = WIDTH, HEIGHT
+
+    _touch_ok = False
+    _touch_last = None
+    _touch_t = None
+    try:
+        touch.init()
+        _touch_ok = True
+    except OSError as e:
+        log_warn("touch init failed: {}".format(e))
+    if _touch_ok:
+        _load_touch_cal()
+        if not _cal_loaded:
+            log_warn("touch is not calibrated -- run calibrate_touch() once")
+    return WIDTH, HEIGHT
+
+
+def set_rotation(rotation, redraw=True):
+    """Dynamically change display rotation at runtime (0, 1, 2, 3) and reflow all UI widgets."""
+    global WIDTH, HEIGHT, ROTATION, _touch_last, _touch_t
+    old_w, old_h = WIDTH, HEIGHT
+    ROTATION = rotation & 3
+    lcd.init(rotation=ROTATION)
+    WIDTH, HEIGHT = lcd.width(), lcd.height()
+    _touch_last = None
+    _touch_t = None
+
+    if _touch_ok:
+        _load_touch_cal()
+
+    if old_w != WIDTH or old_h != HEIGHT:
+        for w in _registered_widgets:
+            w._relayout(old_w, old_h, WIDTH, HEIGHT)
+
+    if redraw:
+        clear()
+        if active_screen is not None:
+            active_screen.draw()
+        else:
+            for w in _registered_widgets:
+                if w.visible and w.parent is None:
+                    w.draw()
+    return WIDTH, HEIGHT
+
+
+# ---------------------------------------------------------------------
+# Touch & Orientation-Independent Calibration
+# ---------------------------------------------------------------------
+
+TOUCH_MIN_INTERVAL_MS = 5
+CAL_FILE = "/touch_cal.json"
+
+
+def _map_cal_point(mx, my, from_rot, to_rot, from_w, from_h):
+    """Transform screen calibration target (mx, my) from `from_rot` to `to_rot`."""
+    if from_rot == to_rot:
+        return mx, my
+    pw = min(from_w, from_h)
+    ph = max(from_w, from_h)
+    # Convert to Rotation 0 (Portrait 320x480)
+    if from_rot == 0:
+        x0, y0 = mx, my
+    elif from_rot == 1:
+        x0, y0 = pw - 1 - my, mx
+    elif from_rot == 2:
+        x0, y0 = pw - 1 - mx, ph - 1 - my
+    else:
+        x0, y0 = my, ph - 1 - mx
+
+    # Convert from Rotation 0 to `to_rot`
+    if to_rot == 0:
+        return x0, y0
+    elif to_rot == 1:
+        return y0, pw - 1 - x0
+    elif to_rot == 2:
+        return pw - 1 - x0, ph - 1 - y0
+    else:
+        return ph - 1 - y0, x0
 
 
 def get_touch():
-    if _touch_fn is None:
+    """Debounced, calibrated (x, y) clamped to current screen bounds, or None."""
+    global _touch_last, _touch_t
+    if not _touch_ok:
         return None
-    return _touch_fn()
+    now = time.ticks_ms()
+    if _touch_t is None or time.ticks_diff(now, _touch_t) >= TOUCH_MIN_INTERVAL_MS:
+        _touch_t = now
+        pt = touch.read()
+        if pt is not None:
+            _touch_last = (_clamp(pt[0], 0, WIDTH - 1), _clamp(pt[1], 0, HEIGHT - 1))
+        else:
+            _touch_last = None
+    return _touch_last
+
+
+def touch_raw():
+    try:
+        return touch.raw()
+    except OSError:
+        return (0, 0, 0, False)
+
+
+def _cal_read():
+    try:
+        with open(CAL_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _cal_write(d):
+    with open(CAL_FILE, "w") as f:
+        json.dump(d, f)
+
+
+def _load_touch_cal():
+    """Load and solve touch calibration for current ROTATION, automatically rotating
+    saved Portrait or Landscape points if needed."""
+    global _cal_loaded
+    _cal_loaded = False
+    d = _cal_read()
+    rot_key = str(ROTATION)
+    cal_map = d.get("cal", {})
+    pts = None
+    src_rot = ROTATION
+    src_w, src_h = WIDTH, HEIGHT
+
+    if rot_key in cal_map:
+        pts = cal_map[rot_key]
+    elif "points" in d:
+        pts = d["points"]
+        src_rot = d.get("rotation", 0 if d["points"][2][2] < d["points"][2][3] else 1)
+        src_w = 480 if (src_rot & 1) else 320
+        src_h = 320 if (src_rot & 1) else 480
+    elif cal_map:
+        k0 = list(cal_map.keys())[0]
+        pts = cal_map[k0]
+        src_rot = int(k0)
+        src_w = 480 if (src_rot & 1) else 320
+        src_h = 320 if (src_rot & 1) else 480
+
+    if pts:
+        try:
+            touch.calib_begin()
+            for p in pts:
+                tx, ty = _map_cal_point(p[2], p[3], src_rot, ROTATION, src_w, src_h)
+                touch.calib_add_point(p[0], p[1], tx, ty)
+            touch.calib_solve()
+            _cal_loaded = True
+        except (ValueError, OSError, TypeError) as e:
+            log_warn("saved touch calibration rejected: {}".format(e))
+    elif touch.calib_active():
+        _cal_loaded = True
+
+
+def _sample_mark(n=8, timeout_ms=30000):
+    t0 = time.ticks_ms()
+    pts = []
+    while True:
+        if time.ticks_diff(time.ticks_ms(), t0) > timeout_ms:
+            raise OSError("touch calibration timed out")
+        rx, ry, _z, ok = touch_raw()
+        if ok:
+            if pts and (abs(rx - pts[-1][0]) > 150 or abs(ry - pts[-1][1]) > 150):
+                pts = [(rx, ry)]
+            else:
+                pts.append((rx, ry))
+            if len(pts) >= n:
+                break
+        else:
+            pts = []
+        time.sleep_ms(5)
+    xs = sorted([p[0] for p in pts])
+    ys = sorted([p[1] for p in pts])
+    return xs[len(xs) // 2], ys[len(ys) // 2]
+
+
+def _wait_release(timeout_ms=10000):
+    t0 = time.ticks_ms()
+    quiet = 0
+    while quiet < 15:
+        if time.ticks_diff(time.ticks_ms(), t0) > timeout_ms:
+            raise OSError("touch did not release")
+        if touch_raw()[3]:
+            quiet = 0
+        else:
+            quiet += 1
+        time.sleep_ms(5)
+
+
+def calibrate_touch(inset=24):
+    global _cal_loaded
+    if not _touch_ok:
+        raise RuntimeError("touch is not running")
+    inset = _clamp(inset, 8, min(WIDTH, HEIGHT) // 4)
+    marks = ((inset, inset), (WIDTH - 1 - inset, inset), (WIDTH // 2, HEIGHT // 2),
+             (inset, HEIGHT - 1 - inset), (WIDTH - 1 - inset, HEIGHT - 1 - inset))
+    pairs = []
+    for i in range(len(marks)):
+        mx, my = marks[i]
+        clear(BLACK)
+        draw_line(mx - 12, my, mx + 12, my, WHITE)
+        draw_line(mx, my - 12, mx, my + 12, WHITE)
+        draw_text_centered(WIDTH // 2, HEIGHT // 2 + 24,
+                           "Touch the cross ({}/{})".format(i + 1, len(marks)), WHITE, BLACK)
+        _wait_release()
+        rx, ry = _sample_mark()
+        pairs.append([int(rx), int(ry), mx, my])
+        _wait_release()
+
+    touch.calib_begin()
+    for p in pairs:
+        touch.calib_add_point(p[0], p[1], p[2], p[3])
+    rms, worst = touch.calib_solve()
+    try:
+        touch.calib_save()
+    except OSError as e:
+        log_warn("NVS save failed: {}".format(e))
+    d = _cal_read()
+    cal_map = d.get("cal", {})
+    cal_map[str(ROTATION)] = pairs
+    _cal_write({"points": pairs, "rotation": ROTATION, "cal": cal_map})
+    _cal_loaded = True
+    clear()
+    return rms, worst
 
 
 def _point_in_rect(px, py, x, y, w, h, margin=0):
@@ -175,26 +468,30 @@ def _point_in_rect(px, py, x, y, w, h, margin=0):
 
 
 # ---------------------------------------------------------------------
-# Safe drawing primitives (moclcd.fill_rect()/blit() raise on
-# out-of-bounds; these clip silently instead)
+# Drawing Primitives
 # ---------------------------------------------------------------------
 
+_capturing = False
+_capture_ops = []
+
+
+def begin_capture():
+    global _capturing, _capture_ops
+    _capturing = True
+    _capture_ops = []
+
+
+def end_capture():
+    global _capturing
+    _capturing = False
+    return _capture_ops
+
+
 def fill_rect(x, y, w, h, color):
-    if w <= 0 or h <= 0:
-        return
-    if x < 0:
-        w += x
-        x = 0
-    if y < 0:
-        h += y
-        y = 0
-    if x + w > WIDTH:
-        w = WIDTH - x
-    if y + h > HEIGHT:
-        h = HEIGHT - y
-    if w <= 0 or h <= 0 or x >= WIDTH or y >= HEIGHT:
-        return
-    moclcd.fill_rect(x, y, w, h, color)
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    c = _clip(x, y, w, h)
+    if c is not None:
+        lcd.fill_rect(c[0], c[1], c[2], c[3], color)
     if _capturing:
         _capture_ops.append(('rect', x, y, w, h, color))
 
@@ -208,266 +505,519 @@ def clear(color=None):
 
 
 def draw_hline(x, y, w, color):
-    fill_rect(x, y, w, 1, color)
+    x, y, w = int(x), int(y), int(w)
+    if 0 <= y < HEIGHT:
+        c = _clip(x, y, w, 1)
+        if c is not None:
+            lcd.fill_rect(c[0], c[1], c[2], 1, color)
 
 
 def draw_vline(x, y, h, color):
-    fill_rect(x, y, 1, h, color)
-
-
-def blit(x, y, w, h, buf):
-    """Safe blit: skips (rather than raises) if it doesn't fully fit."""
-    if x < 0 or y < 0 or x + w > WIDTH or y + h > HEIGHT:
-        return
-    moclcd.blit(x, y, w, h, buf)
-
-
-def draw_rounded_rect(x, y, w, h, r, color, filled=True):
-    """Rounded rectangle built from a center cross plus four corner
-    circles. Falls back to a plain rect if r is too big/small."""
-    r = max(0, min(r, w // 2, h // 2))
-    if r == 0:
-        if filled:
-            fill_rect(x, y, w, h, color)
-        else:
-            draw_rect(x, y, w, h, color)
-        return
-
-    if filled:
-        fill_rect(x + r, y, w - 2 * r, h, color)
-        fill_rect(x, y + r, w, h - 2 * r, color)
-        fill_circle(x + r, y + r, r, color)
-        fill_circle(x + w - r - 1, y + r, r, color)
-        fill_circle(x + r, y + h - r - 1, r, color)
-        fill_circle(x + w - r - 1, y + h - r - 1, r, color)
-    else:
-        draw_hline(x + r, y, w - 2 * r, color)
-        draw_hline(x + r, y + h - 1, w - 2 * r, color)
-        draw_vline(x, y + r, h - 2 * r, color)
-        draw_vline(x + w - 1, y + r, h - 2 * r, color)
-        draw_circle(x + r, y + r, r, color)
-        draw_circle(x + w - r - 1, y + r, r, color)
-        draw_circle(x + r, y + h - r - 1, r, color)
-        draw_circle(x + w - r - 1, y + h - r - 1, r, color)
-
-
-# ---------------------------------------------------------------------
-# Capture-aware wrappers for circle/line/outline-rect primitives.
-#
-# These exist for two reasons: they clip-safe wrap moclcd's raw calls
-# (like fill_rect/blit already did), and -- the new part -- they log
-# themselves into the module-level "op list" when capture is active
-# (see begin_capture()/end_capture() below). Every widget in this file
-# has been switched from calling moclcd.fill_circle/draw_circle/
-# draw_line/draw_rect directly to calling these instead, so that a
-# UIScreen.snapshot() faithfully records everything drawn on it.
-# ---------------------------------------------------------------------
-
-_capturing = False
-_capture_ops = []
-
-
-def begin_capture():
-    """Start recording every fill_rect/draw_rect/fill_circle/draw_circle/
-    draw_line/draw_text8x8/draw_bmp call as a lightweight op list,
-    instead of (or in addition to) sending it to the panel. Each call
-    still draws normally -- capture just also logs it -- so you can
-    call this right before a normal draw pass and get a replayable
-    snapshot "for free"."""
-    global _capturing, _capture_ops
-    _capturing = True
-    _capture_ops = []
-
-
-def end_capture():
-    """Stop recording and return the captured op list."""
-    global _capturing
-    _capturing = False
-    return _capture_ops
+    x, y, h = int(x), int(y), int(h)
+    if 0 <= x < WIDTH:
+        c = _clip(x, y, 1, h)
+        if c is not None:
+            lcd.fill_rect(c[0], c[1], 1, c[3], color)
 
 
 def set_pixel(x, y, color):
-    """Plot a single pixel via moclcd's native draw_pixel() -- silently
-    clipped if off-panel, same as the other primitives here. Cheaper and
-    clearer than fill_rect(x, y, 1, 1, color) for one-off dots (custom
-    shapes, crosshairs, sparse plots, per-pixel effects)."""
-    moclcd.draw_pixel(x, y, color)
+    x, y = int(x), int(y)
+    if 0 <= x < WIDTH and 0 <= y < HEIGHT:
+        lcd.pixel(x, y, color)
     if _capturing:
         _capture_ops.append(('pixel', x, y, color))
 
 
-draw_pixel = set_pixel  # alias matching moclcd's own naming
+draw_pixel = set_pixel
+
+
+def draw_line(x0, y0, x1, y1, color, width=1):
+    x0, y0, x1, y1 = int(x0), int(y0), int(x1), int(y1)
+    if not ((x0 < 0 and x1 < 0) or (y0 < 0 and y1 < 0) or
+            (x0 >= WIDTH and x1 >= WIDTH) or (y0 >= HEIGHT and y1 >= HEIGHT)):
+        lcd.line(x0, y0, x1, y1, color, max(1, int(width)))
+    if _capturing:
+        _capture_ops.append(('line', x0, y0, x1, y1, color, width))
+
+
+def draw_rect(x, y, w, h, color, fill=False):
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    if w <= 0 or h <= 0:
+        return
+    if fill:
+        fill_rect(x, y, w, h, color)
+        return
+    if x >= 0 and y >= 0 and x + w <= WIDTH and y + h <= HEIGHT:
+        lcd.rect(x, y, w, h, color)
+    else:
+        draw_hline(x, y, w, color)
+        draw_hline(x, y + h - 1, w, color)
+        draw_vline(x, y, h, color)
+        draw_vline(x + w - 1, y, h, color)
+    if _capturing:
+        _capture_ops.append(('rect_outline', x, y, w, h, color))
 
 
 def fill_circle(cx, cy, r, color):
-    moclcd.fill_circle(cx, cy, r, color)
+    cx, cy, r = int(cx), int(cy), int(r)
+    if r >= 1 and not (cx + r < 0 or cy + r < 0 or cx - r >= WIDTH or cy - r >= HEIGHT):
+        lcd.circle(cx, cy, r, color, True)
     if _capturing:
         _capture_ops.append(('circle', cx, cy, r, color, True))
 
 
 def draw_circle(cx, cy, r, color):
-    moclcd.draw_circle(cx, cy, r, color)
+    cx, cy, r = int(cx), int(cy), int(r)
+    if r >= 1 and not (cx + r < 0 or cy + r < 0 or cx - r >= WIDTH or cy - r >= HEIGHT):
+        lcd.circle(cx, cy, r, color)
     if _capturing:
         _capture_ops.append(('circle', cx, cy, r, color, False))
 
 
-def draw_line(x0, y0, x1, y1, color):
-    moclcd.draw_line(x0, y0, x1, y1, color)
+def draw_ellipse(cx, cy, rx, ry, color, fill=False):
+    cx, cy, rx, ry = int(cx), int(cy), int(rx), int(ry)
+    if rx >= 1 and ry >= 1 and not (cx + rx < 0 or cy + ry < 0 or cx - rx >= WIDTH or cy - ry >= HEIGHT):
+        lcd.ellipse(cx, cy, rx, ry, color, fill)
     if _capturing:
-        _capture_ops.append(('line', x0, y0, x1, y1, color))
+        _capture_ops.append(('ellipse', cx, cy, rx, ry, color, fill))
 
 
-def draw_rect(x, y, w, h, color):
-    moclcd.draw_rect(x, y, w, h, color)
+def draw_rounded_rect(x, y, w, h, r, color, filled=True):
+    x, y, w, h, r = int(x), int(y), int(w), int(h), int(r)
+    if w > 0 and h > 0:
+        r = _clamp(r, 0, min(w, h) // 2)
+        if _clip(x, y, w, h) is not None:
+            lcd.round_rect(x, y, w, h, r, color, filled)
     if _capturing:
-        _capture_ops.append(('rect_outline', x, y, w, h, color))
+        _capture_ops.append(('rrect', x, y, w, h, r, color, filled))
 
 
-def draw_text8x8(x, y, text, fg, bg=None):
-    """Render text using moclcd's native 8x8 font blitter.
+def draw_triangle(x0, y0, x1, y1, x2, y2, color, filled=False):
+    x0, y0, x1, y1, x2, y2 = int(x0), int(y0), int(x1), int(y1), int(x2), int(y2)
+    if not ((x0 < 0 and x1 < 0 and x2 < 0) or (y0 < 0 and y1 < 0 and y2 < 0) or
+            (x0 >= WIDTH and x1 >= WIDTH and x2 >= WIDTH) or
+            (y0 >= HEIGHT and y1 >= HEIGHT and y2 >= HEIGHT)):
+        lcd.triangle(x0, y0, x1, y1, x2, y2, color, filled)
+    if _capturing:
+        _capture_ops.append(('tri', x0, y0, x1, y1, x2, y2, color, filled))
 
-    moclcd.draw_text8x8() is implemented in C (font_petme128_8x8, the
-    same table MicroPython's framebuf.text() uses) and sends each glyph
-    as a single DMA transfer instead of building the string in a Python
-    framebuf and manually byte-swapping it — this is the fast path.
 
-    bg semantics: zeno_gfx keeps its own default of an OPAQUE background
-    (the module-wide `background`, or whatever is passed), matching the
-    old behavior most app code was written against. Pass bg=None
-    explicitly if you want moclcd's native transparent mode (only
-    foreground pixels are plotted, one address-window per lit pixel —
-    slower, but leaves whatever's already drawn behind the text alone).
-    """
-    if not text:
+def draw_polygon(points, color, filled=False):
+    flat = []
+    if points and not isinstance(points[0], int):
+        for p in points:
+            flat.append(int(p[0]))
+            flat.append(int(p[1]))
+    else:
+        flat = [int(v) for v in points]
+    if len(flat) > 128:
+        flat = flat[:128]
+    if len(flat) & 1:
+        flat = flat[:-1]
+    if len(flat) >= 4:
+        lcd.polygon(flat, color, filled)
+    if _capturing:
+        _capture_ops.append(('poly', tuple(flat), color, filled))
+
+
+def draw_ring(cx, cy, r_in, r_out, color, start=0, end=360):
+    cx, cy, r_in, r_out = int(cx), int(cy), max(0, int(r_in)), int(r_out)
+    if r_out <= r_in or r_out < 1:
         return
+    if end - start >= 360:
+        start, end = 0, 360
+    if not (cx + r_out < 0 or cy + r_out < 0 or cx - r_out >= WIDTH or cy - r_out >= HEIGHT):
+        lcd.ring(cx, cy, r_in, r_out, color, int(start), int(end))
+    if _capturing:
+        _capture_ops.append(('ring', cx, cy, r_in, r_out, color, start, end))
+
+
+def draw_arc(cx, cy, r, start, end, color, thick=1):
+    draw_ring(cx, cy, max(1, int(r) - max(1, int(thick)) + 1), int(r), color, start, end)
+
+
+def draw_pie(cx, cy, r, start, end, color):
+    draw_ring(cx, cy, 0, int(r), color, start, end)
+
+
+def draw_bezier(x0, y0, x1, y1, x2, y2, x3, y3, color):
+    lcd.bezier(int(x0), int(y0), int(x1), int(y1), int(x2), int(y2), int(x3), int(y3), color)
+
+
+def draw_qbezier(x0, y0, x1, y1, x2, y2, color):
+    lcd.qbezier(int(x0), int(y0), int(x1), int(y1), int(x2), int(y2), color)
+
+
+def draw_gradient_rect(x, y, w, h, c0, c1, vertical=True):
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    if w > 0 and h > 0 and _clip(x, y, w, h) is not None:
+        lcd.gradient(x, y, w, h, c0, c1, vertical)
+    if _capturing:
+        _capture_ops.append(('grad', x, y, w, h, c0, c1, vertical))
+
+
+def blit(x, y, w, h, buf):
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    if w <= 0 or h <= 0:
+        return
+    if x >= 0 and y >= 0 and x + w <= WIDTH and y + h <= HEIGHT:
+        lcd.blit(x, y, w, h, buf)
+        return
+    vx0 = max(0, -x)
+    vx1 = min(w, WIDTH - x)
+    vy0 = max(0, -y)
+    vy1 = min(h, HEIGHT - y)
+    if vx1 <= vx0 or vy1 <= vy0:
+        return
+    mv = memoryview(buf)
+    stride = w * 2
+    cw = vx1 - vx0
+    for r in range(vy0, vy1):
+        o = r * stride + vx0 * 2
+        lcd.blit(x + vx0, y + r, cw, 1, mv[o:o + cw * 2])
+
+
+def draw_bitmap(x, y, w, h, bits, fg, bg=None, scale=1):
+    x, y, w, h = int(x), int(y), int(w), int(h)
+    scale = max(1, int(scale))
+    if w <= 0 or h <= 0:
+        return
+    if _clip(x, y, w * scale, h * scale) is None:
+        return
+    lcd.blit_mono(x, y, w, h, bits, fg, bg, scale)
+
+
+# ---------------------------------------------------------------------
+# Text API
+# ---------------------------------------------------------------------
+
+def _build_font():
+    import framebuf
+    buf = bytearray(8)
+    fb = framebuf.FrameBuffer(buf, 8, 8, framebuf.MONO_HLSB)
+    out = bytearray(95 * 8)
+    for i in range(95):
+        fb.fill(0)
+        fb.text(chr(32 + i), 0, 0, 1)
+        out[i * 8:i * 8 + 8] = buf
+    return bytes(out)
+
+
+_FM = memoryview(_build_font())
+
+
+def _res_font(font):
+    return DEFAULT_FONT if font is None else font
+
+
+def text_size(text, font=None, scale=1):
+    text = text if isinstance(text, str) else str(text)
+    font = _res_font(font)
+    scale = max(1, int(scale))
+    if font == FONT_8X8:
+        lines = text.split("\n")
+        w = 0
+        for ln in lines:
+            if len(ln) > w:
+                w = len(ln)
+        return w * 8 * scale, len(lines) * 8 * scale
+    return lcd.text_size(text, font, scale)
+
+
+def _bitmap_text(x, y, text, fg, bg, scale):
+    cx = x
+    step = 8 * scale
+    for ch in text:
+        o = ord(ch)
+        if o == 10:
+            cx = x
+            y += step
+            continue
+        if y >= HEIGHT:
+            break
+        if cx >= WIDTH:
+            continue
+        if cx + step > 0 and y + step > 0:
+            i = o - 32 if 32 <= o < 127 else 31
+            lcd.blit_mono(cx, y, 8, 8, _FM[i * 8:i * 8 + 8], fg, bg, scale)
+        cx += step
+    return cx
+
+
+def _text(x, y, text, fg, bg, font, scale):
+    if font == FONT_8X8:
+        return _bitmap_text(x, y, text, fg, bg, scale)
+    return lcd.text(x, y, text, fg, bg, font, scale)
+
+
+def draw_text(x, y, text, fg, bg=None, font=None, scale=1):
+    x, y = int(x), int(y)
+    if not isinstance(text, str):
+        text = str(text)
+    if not text:
+        return x
     if bg is None:
         bg = background
-    moclcd.draw_text8x8(x, y, text, fg, bg)
+    elif bg == TRANSPARENT:
+        bg = None
+    font = _res_font(font)
+    scale = max(1, int(scale))
     if _capturing:
-        _capture_ops.append(('text', x, y, text, fg, bg))
+        _capture_ops.append(('text', x, y, text, fg, bg, font, scale))
+    if x >= WIDTH or y >= HEIGHT:
+        return x
+    if y < 0 and y + text_size(text, font, scale)[1] <= 0:
+        return x
+    return _text(x, y, text, fg, bg, font, scale)
 
 
-def draw_text8x8_transparent(x, y, text, fg):
-    """Explicit transparent-background variant (only lit pixels drawn).
-    Slower than draw_text8x8() since each pixel needs its own address
-    window, but doesn't disturb whatever is already behind the glyphs."""
-    if not text:
-        return
-    moclcd.draw_text8x8(x, y, text, fg, None)
+def draw_text_transparent(x, y, text, fg, font=None, scale=1):
+    return draw_text(x, y, text, fg, TRANSPARENT, font, scale)
 
 
-def draw_text_centered(cx, y, text, fg, bg=None, scale=1):
-    """Draw text8x8 horizontally centered on cx. scale repeats each
-    char cell to approximate larger text without a new font."""
-    if not text:
-        return
-    w = len(text) * 8 * scale
-    x = cx - w // 2
-    if scale == 1:
-        draw_text8x8(x, y, text, fg, bg)
-        return
-    # scaled variant: render to a small buffer then blit stretched
-    # (kept simple: just draw at native size repeated on a grid)
-    for i, ch in enumerate(text):
-        cxp = x + i * 8 * scale
-        draw_text8x8(cxp, y, ch, fg, bg)
+def draw_text_centered(cx, y, text, fg, bg=None, scale=1, font=None):
+    text = text if isinstance(text, str) else str(text)
+    w, _h = text_size(text, font, scale)
+    return draw_text(max(0, int(cx) - w // 2), int(y), text, fg, bg, font, scale)
+
+
+def draw_text_right(rx, y, text, fg, bg=None, scale=1, font=None):
+    text = text if isinstance(text, str) else str(text)
+    w, _h = text_size(text, font, scale)
+    return draw_text(max(0, int(rx) - w), int(y), text, fg, bg, font, scale)
+
+
+def draw_text_in_rect(x, y, w, h, text, fg, bg=None, font=None, scale=1):
+    tw, th = text_size(text, font, scale)
+    tx = int(x) + max(0, (int(w) - tw) // 2)
+    ty = int(y) + max(0, (int(h) - th) // 2)
+    return draw_text(tx, ty, text, fg, bg, font, scale)
+
+
+def load_font(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    lcd.font_info(data)
+    return data
+
+
+# ---------------------------------------------------------------------
+# BMP Loading
+# ---------------------------------------------------------------------
+
+@micropython.viper
+def _row24(src: ptr8, out: ptr8, o: int, n: int, xfp: int, step: int):
+    for k in range(n):
+        i = (xfp >> 16) * 3
+        v = ((int(src[i + 2]) & 0xF8) << 8) | ((int(src[i + 1]) & 0xFC) << 3) | (int(src[i]) >> 3)
+        out[o] = v >> 8
+        out[o + 1] = v & 0xFF
+        o += 2
+        xfp += step
+
+
+@micropython.viper
+def _row32(src: ptr8, out: ptr8, o: int, n: int, xfp: int, step: int):
+    for k in range(n):
+        i = (xfp >> 16) * 4
+        v = ((int(src[i + 2]) & 0xF8) << 8) | ((int(src[i + 1]) & 0xFC) << 3) | (int(src[i]) >> 3)
+        out[o] = v >> 8
+        out[o + 1] = v & 0xFF
+        o += 2
+        xfp += step
+
+
+def _row16(src, out, o, n, xfp, step, is565):
+    for _ in range(n):
+        i = (xfp >> 16) * 2
+        lo = src[i]
+        hi = src[i + 1]
+        if is565:
+            out[o] = hi
+            out[o + 1] = lo
+        else:
+            v = (hi << 8) | lo
+            v = ((v & 0x7FE0) << 1) | (v & 0x1F)
+            out[o] = v >> 8
+            out[o + 1] = v & 0xFF
+        o += 2
+        xfp += step
+
+
+def _row8(src, out, o, n, xfp, step, pal):
+    for _ in range(n):
+        j = src[xfp >> 16] * 2
+        out[o] = pal[j]
+        out[o + 1] = pal[j + 1]
+        o += 2
+        xfp += step
+
+
+def _le(b):
+    return int.from_bytes(b, "little")
+
+
+def _s32(b):
+    v = int.from_bytes(b, "little")
+    return v - 0x100000000 if v & 0x80000000 else v
 
 
 def _bmp_native_size(path):
-    """Peek just the BMP header (26 bytes is enough) for native pixel
-    dimensions, without decoding pixel data. Used by draw_logo() to
-    compute a fit-to-box scale before handing the real draw off to the
-    native loader."""
     with open(path, "rb") as f:
-        header = f.read(26)
-        if header[0:2] != b"BM":
+        h = f.read(26)
+        if len(h) < 26 or h[0:2] != b"BM":
             raise ValueError("not a BMP file")
-        bmp_w = int.from_bytes(header[18:22], "little")
-        bmp_h = abs(int.from_bytes(header[22:26], "little"))
-        return bmp_w, bmp_h
+        return _s32(h[18:22]), abs(_s32(h[22:26]))
+
+
+def _bmp_parse(f):
+    h = f.read(54)
+    if len(h) < 54 or h[0:2] != b"BM":
+        raise ValueError("not a BMP file")
+    hdr = _le(h[14:18])
+    if hdr < 40:
+        raise ValueError("unsupported BMP header")
+    data_off = _le(h[10:14])
+    bw = _s32(h[18:22])
+    bh = _s32(h[22:26])
+    bpp = _le(h[28:30])
+    comp = _le(h[30:34])
+    ncol = _le(h[46:50])
+    topdown = bh < 0
+    bh = abs(bh)
+    if bw <= 0 or bh == 0:
+        raise ValueError("bad BMP size")
+    if comp not in (0, 3):
+        raise ValueError("compressed BMP not supported")
+    is565 = False
+    pal = None
+    if bpp == 16:
+        if comp == 3:
+            f.seek(54)
+            is565 = _le(f.read(4)) == 0xF800
+    elif bpp == 8:
+        f.seek(14 + hdr)
+        raw = f.read((ncol or 256) * 4)
+        pal = bytearray(512)
+        for i in range(min(256, len(raw) // 4)):
+            b = raw[i * 4]
+            g = raw[i * 4 + 1]
+            r = raw[i * 4 + 2]
+            v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            pal[i * 2] = v >> 8
+            pal[i * 2 + 1] = v & 0xFF
+    elif bpp not in (24, 32):
+        raise ValueError("unsupported BMP bit depth {}".format(bpp))
+    return bw, bh, topdown, bpp, data_off, pal, is565
 
 
 def draw_bmp(path, x, y, w=None, h=None, max_w=None, max_h=None):
-    """Draw an uncompressed 24-bit BMP via moclcd's native loader.
+    x, y = int(x), int(y)
+    with open(path, "rb") as f:
+        bw, bh, topdown, bpp, data_off, pal, is565 = _bmp_parse(f)
 
-    moclcd.draw_bmp() is implemented in C: it parses the header, decodes
-    straight into a DMA-capable buffer, and sends the whole image as a
-    single transfer — no per-pixel Python loop, no intermediate
-    bytearray copy through this layer. This wrapper just translates
-    Python's None ("unset") into the 0 the C function expects for
-    w/h/max_w/max_h.
+        if w and h:
+            dw, dh = int(w), int(h)
+        elif w:
+            dw = int(w)
+            dh = bh * dw // bw
+        elif h:
+            dh = int(h)
+            dw = bw * dh // bh
+        else:
+            dw, dh = bw, bh
+        if max_w and dw > max_w:
+            dh = dh * int(max_w) // dw
+            dw = int(max_w)
+        if max_h and dh > max_h:
+            dw = dw * int(max_h) // dh
+            dh = int(max_h)
+        dw = max(1, dw)
+        dh = max(1, dh)
 
-    Raises the same errors as before (ValueError for a bad/unsupported
-    BMP, OSError if the path doesn't exist) since moclcd.draw_bmp()
-    raises those natively.
-    """
-    moclcd.draw_bmp(
-        path, x, y,
-        w=w or 0, h=h or 0,
-        max_w=max_w or 0, max_h=max_h or 0,
-    )
-    if _capturing:
-        rw, rh = w, h
-        if not rw or not rh:
-            try:
-                nw, nh = _bmp_native_size(path)
-                rw, rh = rw or nw, rh or nh
-            except Exception:
-                rw, rh = rw or 1, rh or 1
-        _capture_ops.append(('bmp', path, x, y, rw, rh))
+        if _capturing:
+            _capture_ops.append(('bmp', path, x, y, dw, dh))
+
+        vx0 = max(0, -x)
+        vx1 = min(dw, WIDTH - x)
+        vy0 = max(0, -y)
+        vy1 = min(dh, HEIGHT - y)
+        if vx1 <= vx0 or vy1 <= vy0:
+            return dw, dh
+        vw = vx1 - vx0
+
+        stride = ((bw * bpp + 31) // 32) * 4
+        xstep = (bw << 16) // dw
+        xfp0 = vx0 * xstep
+        rps = max(1, 8192 // (vw * 2))
+        strip = bytearray(vw * 2 * rps)
+        src = bytearray(stride)
+        last_sy = -1
+        r = 0
+        top = y + vy0
+
+        for dy in range(vy0, vy1):
+            sy = dy * bh // dh
+            if sy != last_sy:
+                f.seek(data_off + (sy if topdown else bh - 1 - sy) * stride)
+                f.readinto(src)
+                last_sy = sy
+            o = r * vw * 2
+            if bpp == 24:
+                _row24(src, strip, o, vw, xfp0, xstep)
+            elif bpp == 32:
+                _row32(src, strip, o, vw, xfp0, xstep)
+            elif bpp == 16:
+                _row16(src, strip, o, vw, xfp0, xstep, is565)
+            else:
+                _row8(src, strip, o, vw, xfp0, xstep, pal)
+            r += 1
+            if r == rps or dy == vy1 - 1:
+                lcd.blit(x + vx0, top, vw, r,
+                         strip if r == rps else memoryview(strip)[:r * vw * 2])
+                top += r
+                r = 0
+        return dw, dh
 
 
-def draw_logo(path, box_x=0, box_y=0, box_w=WIDTH, box_h=HEIGHT,
-              caption=None, caption_color=WHITE, bg=None):
-    """Draw a BMP logo centered within (box_x, box_y, box_w, box_h),
-    scaled down (not up) to fit, with an optional caption underneath.
-
-    Useful for splash screens / about screens / branded headers:
-
-        gfx.draw_logo("logo.bmp", box_h=200, caption="MyDevice v1.0")
-    """
+def draw_logo(path, box_x=0, box_y=0, box_w=None, box_h=None,
+              caption=None, caption_color=WHITE, bg=None, font=None):
+    if box_w is None:
+        box_w = WIDTH
+    if box_h is None:
+        box_h = HEIGHT
+    box_w = max(1, min(int(box_w), WIDTH - int(box_x)))
+    box_h = max(1, min(int(box_h), HEIGHT - int(box_y)))
     if bg is not None:
         fill_rect(box_x, box_y, box_w, box_h, bg)
 
-    # Peek at native size first without allocating full pixel buffer twice:
-    # draw_bmp already supports max_w/max_h clamping, reuse that for "fit".
-    caption_h = 12 if caption else 0
-    avail_h = box_h - caption_h
-
+    caption_h = (text_size(caption, font)[1] + 4) if caption else 0
+    avail_h = max(1, box_h - caption_h)
     native_w, native_h = _bmp_native_size(path)
-
     scale = min(box_w / native_w, avail_h / native_h, 1.0)
     out_w = max(1, int(native_w * scale))
     out_h = max(1, int(native_h * scale))
-
-    lx = box_x + (box_w - out_w) // 2
-    ly = box_y + (avail_h - out_h) // 2
-
+    lx = int(box_x) + (box_w - out_w) // 2
+    ly = int(box_y) + (avail_h - out_h) // 2
     draw_bmp(path, lx, ly, out_w, out_h)
-
     if caption:
-        draw_text_centered(box_x + box_w // 2, box_y + avail_h + 2,
-                            caption, caption_color, bg)
-
+        draw_text_centered(int(box_x) + box_w // 2, int(box_y) + avail_h + 2,
+                           caption, caption_color, bg, 1, font)
     return lx, ly, out_w, out_h
 
 
 # ---------------------------------------------------------------------
-# Screen transition animations
+# Screen & Widget Animations
 # ---------------------------------------------------------------------
 
 def window_close_animation(duration=0.4, fps=60, color=None, ease=True):
     if color is None:
         color = WHITE
-
     cx = WIDTH // 2
     cy = HEIGHT // 2
-
     fill_rect(0, 0, WIDTH, HEIGHT, color)
-
     frames = max(1, int(duration * fps))
     delay = duration / frames
-
     prev_x0, prev_y0 = 0, 0
     prev_x1, prev_y1 = WIDTH - 1, HEIGHT - 1
 
@@ -476,15 +1026,12 @@ def window_close_animation(duration=0.4, fps=60, color=None, ease=True):
         if ease:
             t = t * t * (3 - 2 * t)
         t = 1 - t
-
         w = max(1, int(WIDTH * t))
         h = max(1, int(HEIGHT * t))
-
         x0 = cx - w // 2
         y0 = cy - h // 2
         x1 = x0 + w - 1
         y1 = y0 + h - 1
-
         if y0 > prev_y0:
             fill_rect(prev_x0, prev_y0, prev_x1 - prev_x0 + 1, y0 - prev_y0, background)
         if y1 < prev_y1:
@@ -493,7 +1040,6 @@ def window_close_animation(duration=0.4, fps=60, color=None, ease=True):
             fill_rect(prev_x0, y0, x0 - prev_x0, y1 - y0 + 1, background)
         if x1 < prev_x1:
             fill_rect(x1 + 1, y0, prev_x1 - x1, y1 - y0 + 1, background)
-
         prev_x0, prev_y0, prev_x1, prev_y1 = x0, y0, x1, y1
         time.sleep(delay)
 
@@ -501,30 +1047,23 @@ def window_close_animation(duration=0.4, fps=60, color=None, ease=True):
 def window_open_animation(duration=0.4, fps=60, color=None, ease=True):
     if color is None:
         color = WHITE
-
     clear()
-
     frames = max(1, int(duration * fps))
     delay = duration / frames
-
     cx = WIDTH // 2
     cy = HEIGHT // 2
-
     prev_x0 = prev_y0 = prev_x1 = prev_y1 = cx
 
     for i in range(frames + 1):
         t = i / frames
         if ease:
             t = 1 - (1 - t) ** 3
-
         w = max(1, int(WIDTH * t))
         h = max(1, int(HEIGHT * t))
-
         x0 = cx - w // 2
         y0 = cy - h // 2
         x1 = x0 + w - 1
         y1 = y0 + h - 1
-
         if y0 < prev_y0:
             fill_rect(x0, y0, w, prev_y0 - y0, color)
         if y1 > prev_y1:
@@ -533,1957 +1072,1155 @@ def window_open_animation(duration=0.4, fps=60, color=None, ease=True):
             fill_rect(x0, prev_y0, prev_x0 - x0, prev_y1 - prev_y0 + 1, color)
         if x1 > prev_x1:
             fill_rect(prev_x1 + 1, prev_y0, x1 - prev_x1, prev_y1 - prev_y0 + 1, color)
-
         prev_x0, prev_y0, prev_x1, prev_y1 = x0, y0, x1, y1
         time.sleep(delay)
 
 
-# ---------------------------------------------------------------------
-# "Genie" animations: shrink/grow the screen's ACTUAL content
-# (taskbar, buttons, text, icons) instead of a flat color block.
-#
-# moclcd has no framebuffer readback (it's a write-only DMA panel), so
-# there's no cheap way to "grab the real pixels and scale them" the
-# way a desktop compositor would -- that needs a full-screen RAM copy
-# (480x320x2 bytes = ~300KB), which most boards don't have spare.
-#
-# Instead these work off a *command list* captured by begin_capture()/
-# end_capture() (or UIScreen.snapshot()): every fill_rect/circle/line/
-# text/bmp call made while capturing is logged as a small tuple. That
-# list gets replayed every frame with each shape's position/size
-# scaled toward an origin point -- rectangles, circles, lines and BMPs
-# all scale correctly since they're just numbers. Text can't be
-# scaled (moclcd's font is a fixed 8x8 bitmap glyph table), so text
-# ops are simply skipped until the animation is almost finished, then
-# they pop in at the very end -- the same trick a lot of embedded UIs
-# use for genie/zoom effects on non-scalable fonts.
-# ---------------------------------------------------------------------
+def _m(v, o, s):
+    return int(o + (v - o) * s)
 
-def replay_ops(ops, scale, origin_x, origin_y, text_reveal=0.92):
-    """Redraw a captured op list scaled toward (origin_x, origin_y).
-    scale=1.0 reproduces the screen as captured; scale=0 collapses
-    everything onto the origin point. Text is only drawn once `scale`
-    passes `text_reveal` (see module docstring above for why)."""
+
+def replay_ops(ops, scale, ox, oy, text_reveal=0.92):
+    """Redraw captured ops scaled about (ox, oy). Text appears once scale >= text_reveal."""
     for op in ops:
-        kind = op[0]
-
-        if kind == 'rect':
-            _, x, y, w, h, color = op
-            nx = origin_x + (x - origin_x) * scale
-            ny = origin_y + (y - origin_y) * scale
-            fill_rect(int(nx), int(ny), max(1, int(w * scale)), max(1, int(h * scale)), color)
-
-        elif kind == 'rect_outline':
-            _, x, y, w, h, color = op
-            nx = origin_x + (x - origin_x) * scale
-            ny = origin_y + (y - origin_y) * scale
-            draw_rect(int(nx), int(ny), max(1, int(w * scale)), max(1, int(h * scale)), color)
-
-        elif kind == 'circle':
-            _, cx, cy, r, color, filled = op
-            ncx = origin_x + (cx - origin_x) * scale
-            ncy = origin_y + (cy - origin_y) * scale
-            nr = max(1, int(r * scale))
-            if filled:
-                fill_circle(int(ncx), int(ncy), nr, color)
+        k = op[0]
+        if k == 'rect':
+            fill_rect(_m(op[1], ox, scale), _m(op[2], oy, scale),
+                      max(1, int(op[3] * scale)), max(1, int(op[4] * scale)), op[5])
+        elif k == 'rect_outline':
+            draw_rect(_m(op[1], ox, scale), _m(op[2], oy, scale),
+                      max(1, int(op[3] * scale)), max(1, int(op[4] * scale)), op[5])
+        elif k == 'rrect':
+            draw_rounded_rect(_m(op[1], ox, scale), _m(op[2], oy, scale),
+                              max(1, int(op[3] * scale)), max(1, int(op[4] * scale)),
+                              max(0, int(op[5] * scale)), op[6], op[7])
+        elif k == 'circle':
+            r = max(1, int(op[3] * scale))
+            if op[5]:
+                fill_circle(_m(op[1], ox, scale), _m(op[2], oy, scale), r, op[4])
             else:
-                draw_circle(int(ncx), int(ncy), nr, color)
-
-        elif kind == 'line':
-            _, x0, y0, x1, y1, color = op
-            draw_line(
-                int(origin_x + (x0 - origin_x) * scale), int(origin_y + (y0 - origin_y) * scale),
-                int(origin_x + (x1 - origin_x) * scale), int(origin_y + (y1 - origin_y) * scale),
-                color,
-            )
-
-        elif kind == 'pixel':
-            _, x, y, color = op
-            nx = origin_x + (x - origin_x) * scale
-            ny = origin_y + (y - origin_y) * scale
-            set_pixel(int(nx), int(ny), color)
-
-        elif kind == 'bmp':
-            _, path, x, y, w, h = op
-            nx = origin_x + (x - origin_x) * scale
-            ny = origin_y + (y - origin_y) * scale
-            try:
-                draw_bmp(path, int(nx), int(ny), max(1, int(w * scale)), max(1, int(h * scale)))
-            except Exception:
-                pass
-
-        elif kind == 'text':
-            if scale < text_reveal:
-                continue
-            _, x, y, text, fg, bg = op
-            draw_text8x8(int(origin_x + (x - origin_x) * scale), int(origin_y + (y - origin_y) * scale),
-                         text, fg, bg)
-
-
-def _ops_bbox(ops):
-    """Bounding box (x0, y0, x1, y1) covering every primitive in a
-    captured op list. Falls back to the full screen if ops is empty."""
-    if not ops:
-        return 0, 0, WIDTH, HEIGHT
-
-    x0 = y0 = 1 << 30
-    x1 = y1 = -(1 << 30)
-
-    for op in ops:
-        kind = op[0]
-        if kind == 'rect' or kind == 'rect_outline':
-            _, x, y, w, h, color = op
-            x0, y0 = min(x0, x), min(y0, y)
-            x1, y1 = max(x1, x + w), max(y1, y + h)
-        elif kind == 'bmp':
-            _, path, x, y, w, h = op
-            x0, y0 = min(x0, x), min(y0, y)
-            x1, y1 = max(x1, x + w), max(y1, y + h)
-        elif kind == 'circle':
-            _, cx, cy, r, color, filled = op
-            x0, y0 = min(x0, cx - r), min(y0, cy - r)
-            x1, y1 = max(x1, cx + r), max(y1, cy + r)
-        elif kind == 'line':
-            _, lx0, ly0, lx1, ly1, color = op
-            x0, y0 = min(x0, lx0, lx1), min(y0, ly0, ly1)
-            x1, y1 = max(x1, lx0, lx1), max(y1, ly0, ly1)
-        elif kind == 'pixel':
-            _, px, py, color = op
-            x0, y0 = min(x0, px), min(y0, py)
-            x1, y1 = max(x1, px + 1), max(y1, py + 1)
-        elif kind == 'text':
-            _, x, y, text, fg, bg = op
-            x0, y0 = min(x0, x), min(y0, y)
-            x1, y1 = max(x1, x + len(text) * 8), max(y1, y + 8)
-
-    if x1 < x0 or y1 < y0:
-        return 0, 0, WIDTH, HEIGHT
-    return x0, y0, x1, y1
+                draw_circle(_m(op[1], ox, scale), _m(op[2], oy, scale), r, op[4])
+        elif k == 'ellipse':
+            draw_ellipse(_m(op[1], ox, scale), _m(op[2], oy, scale),
+                         max(1, int(op[3] * scale)), max(1, int(op[4] * scale)),
+                         op[5], op[6])
+        elif k == 'line':
+            draw_line(_m(op[1], ox, scale), _m(op[2], oy, scale),
+                      _m(op[3], ox, scale), _m(op[4], oy, scale),
+                      op[5], max(1, int(op[6] * scale)))
+        elif k == 'tri':
+            draw_triangle(_m(op[1], ox, scale), _m(op[2], oy, scale),
+                          _m(op[3], ox, scale), _m(op[4], oy, scale),
+                          _m(op[5], ox, scale), _m(op[6], oy, scale),
+                          op[7], op[8])
+        elif k == 'poly':
+            pts = op[1]
+            scaled = []
+            for idx in range(0, len(pts), 2):
+                scaled.append(_m(pts[idx], ox, scale))
+                scaled.append(_m(pts[idx + 1], oy, scale))
+            draw_polygon(scaled, op[2], op[3])
+        elif k == 'ring':
+            draw_ring(_m(op[1], ox, scale), _m(op[2], oy, scale),
+                      max(0, int(op[3] * scale)), max(1, int(op[4] * scale)),
+                      op[5], op[6], op[7])
+        elif k == 'grad':
+            draw_gradient_rect(_m(op[1], ox, scale), _m(op[2], oy, scale),
+                               max(1, int(op[3] * scale)), max(1, int(op[4] * scale)),
+                               op[5], op[6], op[7])
+        elif k == 'bmp':
+            draw_bmp(op[1], _m(op[2], ox, scale), _m(op[3], oy, scale),
+                     max(1, int(op[4] * scale)), max(1, int(op[5] * scale)))
+        elif k == 'text':
+            if scale >= text_reveal:
+                draw_text(_m(op[1], ox, scale), _m(op[2], oy, scale),
+                          op[3], op[4], op[5], op[6], max(1, int(op[7] * scale)))
+        elif k == 'pixel':
+            set_pixel(_m(op[1], ox, scale), _m(op[2], oy, scale), op[3])
 
 
-def window_close_animation_live(ops, duration=0.4, fps=60, origin=None, ease=True, bg=None):
-    """Content-aware close: shrinks the screen's actual captured
-    content (from begin_capture()/end_capture() or UIScreen.snapshot())
-    toward `origin` instead of a flat color block.
-
-    origin defaults to screen center; pass a widget's center (e.g. a
-    taskbar icon) to genie the window into that widget instead.
-    """
-    if bg is None:
-        bg = background
-
-    ox, oy = origin if origin else (WIDTH // 2, HEIGHT // 2)
-    bx0, by0, bx1, by1 = _ops_bbox(ops)
-
-    frames = max(1, int(duration * fps))
-    delay = duration / frames
-
-    prev_x0, prev_y0, prev_x1, prev_y1 = bx0, by0, bx1, by1
-
-    for i in range(frames + 1):
-        t = i / frames
-        if ease:
-            t = t * t * (3 - 2 * t)
-        t = 1 - t  # 1 -> 0
-
-        nx0 = ox + (bx0 - ox) * t
-        ny0 = oy + (by0 - oy) * t
-        nx1 = ox + (bx1 - ox) * t
-        ny1 = oy + (by1 - oy) * t
-        x0, x1 = sorted((int(nx0), int(nx1)))
-        y0, y1 = sorted((int(ny0), int(ny1)))
-
-        # vacate whatever the previous (bigger) frame occupied that
-        # this (smaller) frame no longer covers
-        if y0 > prev_y0:
-            fill_rect(prev_x0, prev_y0, prev_x1 - prev_x0, y0 - prev_y0, bg)
-        if y1 < prev_y1:
-            fill_rect(prev_x0, y1, prev_x1 - prev_x0, prev_y1 - y1, bg)
-        if x0 > prev_x0:
-            fill_rect(prev_x0, y0, x0 - prev_x0, y1 - y0, bg)
-        if x1 < prev_x1:
-            fill_rect(x1, y0, prev_x1 - x1, y1 - y0, bg)
-
-        replay_ops(ops, t, ox, oy)
-
-        prev_x0, prev_y0, prev_x1, prev_y1 = x0, y0, x1, y1
-        time.sleep(delay)
-
-    fill_rect(prev_x0, prev_y0, max(1, prev_x1 - prev_x0), max(1, prev_y1 - prev_y0), bg)
-
-
-def window_open_animation_live(ops, duration=0.1, fps=180, origin=None, ease=True, bg=None):
-    """Content-aware open: grows the screen's actual content in from
-    `origin` (default screen center) instead of a flat color block.
-    Call this with the op list from UIScreen.snapshot() / end_capture()."""
-    if bg is None:
-        bg = background
-
-    ox, oy = origin if origin else (WIDTH // 2, HEIGHT // 2)
-
-    clear(bg)
-
-    frames = max(1, int(duration * fps))
-    delay = duration / frames
-
-    for i in range(frames + 1):
-        t = i / frames
-        if ease:
-            t = 1 - (1 - t) ** 3
-        replay_ops(ops, t, ox, oy)
+def animate_widget_in(widget, duration=0.2, steps=6):
+    """Capture a widget's drawing ops and zoom it in smoothly about its center."""
+    begin_capture()
+    widget.draw()
+    ops = end_capture()
+    ox = widget.x + widget.w // 2
+    oy = widget.y + widget.h // 2
+    delay = duration / max(1, steps)
+    for i in range(1, steps + 1):
+        s = i / steps
+        fill_rect(widget.x, widget.y, widget.w, widget.h, background)
+        replay_ops(ops, s, ox, oy)
         time.sleep(delay)
 
 
 # ---------------------------------------------------------------------
-# Base class: shared touch-rect handling so widgets stop reimplementing
-# "is this point inside me + debounce" from scratch each time.
+# Orientation-Aware Base Widget & Complete UI Component Stack
 # ---------------------------------------------------------------------
 
-class _Touchable:
-    """Mixin providing a standard rectangular hit-test + simple
-    press/release edge detection. Widgets set self.x/y/w/h and can
-    call self._tap() from handle_touch()/get_touch() to get a bool
-    that is True exactly once per press (not held down)."""
+class UIWidget:
+    """Base class for all UI widgets. Automatically adapts coordinates and sizes
+    when the display switches between Portrait (320x480) and Landscape (480x320)."""
+
+    def __init__(self, x, y, w, h):
+        self._raw_x = x
+        self._raw_y = y
+        self._raw_w = w
+        self._raw_h = h
+        self._created_w = WIDTH
+        self._created_h = HEIGHT
+
+        self.x = _resolve_coord(x, WIDTH, REF_WIDTH)
+        self.y = _resolve_coord(y, HEIGHT, REF_HEIGHT)
+        self.w = max(1, _resolve_coord(w, WIDTH, REF_WIDTH))
+        self.h = max(1, _resolve_coord(h, HEIGHT, REF_HEIGHT))
+        self._clamp_bounds()
 
-    _press_active = False
-
-    def _hit(self, margin=0):
-        p = get_touch()
-        if not p:
-            self._press_active = False
-            return None
-        tx, ty = p
-        if _point_in_rect(tx, ty, self.x, self.y, self.w, self.h, margin):
-            return (tx, ty)
-        self._press_active = False
-        return None
-
-    def _tap(self, margin=0):
-        """Edge-triggered: True only on the frame touch first lands inside."""
-        pt = self._hit(margin)
-        if pt is None:
-            return False
-        if self._press_active:
-            return False
-        self._press_active = True
-        return True
-
-
-# =============================
-# UIButton
-# =============================
-class UIButton(_Touchable):
-    def __init__(self, x, y, w, h, label,
-                 color=BLUE, text_color=WHITE,
-                 radius=6, margin=5, action=None):
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.label = str(label)
-        self.color = color
-        self.text_color = text_color
-        self.radius = radius
-        self.margin = margin
-        self.action = action
-        self.badge = None  # optional NotificationBadge attached to this button
-
-    def draw(self):
-        try:
-            draw_rounded_rect(self.x, self.y, self.w, self.h, self.radius, self.color)
-
-            text_w = len(self.label) * 8
-            text_x = self.x + (self.w - text_w) // 2
-            text_y = self.y + (self.h - 8) // 2
-
-            if self.label:
-                draw_text8x8(text_x, text_y, self.label, self.text_color, self.color)
-
-            if self.badge:
-                self.badge.draw_at_corner(self.x, self.y, self.w, self.h)
-
-        except Exception as e:
-            log_error("UIButton draw failed ({}): {}".format(self.label, e))
-            try:
-                fill_rect(self.x, self.y, self.w, self.h, RED)
-            except Exception:
-                pass
-
-    def get_touch(self):
-        pt = self._hit(self.margin)
-        if pt and self.action and not self._press_active:
-            self._press_active = True
-            self.action()
-            return True
-        return pt is not None
-
-
-class UIText:
-    def __init__(self, x, y, text, fg=WHITE, bg=None):
-        self.x = x
-        self.y = y
-        self.text = text
-        self.fg = fg
-        self.bg = bg
-
-    def draw(self):
-        draw_text8x8(self.x, self.y, str(self.text), self.fg, self.bg if self.bg else background)
-
-
-class UIBMPButton(_Touchable):
-    def __init__(self, x, y, w, h, bmp, *, bmp_pressed=None, margin=5, action=None):
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.bmp = bmp
-        self.bmp_pressed = bmp_pressed
-        self.margin = margin
-        self.action = action
-        self.badge = None
-        self._pressed = False
-
-    def draw(self):
-        try:
-            path = self.bmp_pressed if (self._pressed and self.bmp_pressed) else self.bmp
-            draw_bmp(path, self.x, self.y, self.w, self.h)
-            if self.badge:
-                self.badge.draw_at_corner(self.x, self.y, self.w, self.h)
-        except Exception as e:
-            log_error("UIBMPButton draw failed: {}".format(e))
-
-    def get_touch(self):
-        pt = self._hit(self.margin)
-        if not pt:
-            self._pressed = False
-            return False
-
-        if not self._pressed:
-            self._pressed = True
-            if self.bmp_pressed:
-                self.draw()
-        if self.action:
-            self.action()
-        return True
-
-
-class UIScreen:
-    def __init__(self,
-                 fg=WHITE,
-                 background=None,
-                 on_exit=None,
-                 taskbarcolor=SURFACE_ALT,
-                 taskbar_text=None,
-                 taskbar_text_color=WHITE,
-                 taskbar_height=35,
-                 *args, **kwargs):
-
-        self.fg = fg
-        self.background = background
-        self.on_exit = on_exit
-        self.exit_args = args
-        self.exit_kwargs = kwargs
-
-        self.buttons_enabled = True
-        self.exit_box = None
-        self._ops = []
-
-        self.taskbarcolor = taskbarcolor
-        self.taskbar_text = taskbar_text
-        self.taskbar_text_color = taskbar_text_color
-        self.taskbar_height = taskbar_height
-
-    def layer(self, x, y, width, height, color):
-        fill_rect(x, y, width, height, color)
-
-    def _draw_background(self):
-        if self.background is None:
-            return
-        if isinstance(self.background, int):
-            fill_rect(0, 0, WIDTH, HEIGHT, self.background)
-        elif isinstance(self.background, str):
-            draw_bmp(self.background, 0, 0, max_w=WIDTH, max_h=HEIGHT)
-
-    def openscreen(self):
-        window_open_animation(duration=0.1, fps=144, color=self.background, ease=True)
-
-    def closescreen(self, widgets=None, genie=True, origin=None):
-        """Animate the screen away. By default this is the new "genie"
-        effect: it re-snapshots the real content (taskbar, exit box,
-        and whatever's in `widgets`) so it reflects current state
-        (e.g. a toggle you just flipped) and shrinks *that* toward
-        `origin` (default: screen center). Pass genie=False for the
-        old flat-color shrink."""
-        if genie:
-            ops = self.snapshot(widgets)
-            window_close_animation_live(ops, duration=0.4, fps=60, origin=origin, bg=self.background)
-        else:
-            window_close_animation(duration=0.4, fps=60, color=None, ease=True)
-
-    def _draw_chrome(self):
-        """Draws background + taskbar + exit box. Shared by snapshot()
-        (records it) and the non-genie start() path (draws it plain)."""
-        self._draw_background()
-
-        h = self.taskbar_height
-        fill_rect(0, 0, WIDTH, h, self.taskbarcolor)
-
-        btn = 30
-        x0 = WIDTH - btn - 2
-        y0 = 2
-        self.exit_box = (x0, y0, btn, btn)
-
-        draw_rounded_rect(x0, y0, btn, btn, 6, BLUE)
-        draw_line(x0 + 8, y0 + 8, x0 + btn - 8, y0 + btn - 8, WHITE)
-        draw_line(x0 + btn - 8, y0 + 8, x0 + 8, y0 + btn - 8, WHITE)
-
-        if self.taskbar_text:
-            draw_text_centered(WIDTH // 2, (h - 8) // 2,
-                                self.taskbar_text, self.taskbar_text_color, self.taskbarcolor)
-
-    def snapshot(self, widgets=None):
-        """Record the screen's current visual content -- background,
-        taskbar, exit box, plus any extra widgets passed in -- as a
-        lightweight op list for window_open_animation_live() /
-        window_close_animation_live(). Actually draws everything once
-        while recording, so call it right before an animated
-        open/close (after your widgets reflect whatever state they're
-        currently in). `widgets` is any list of objects with .draw().
-        """
-        begin_capture()
-        self._draw_chrome()
-        if widgets:
-            for w in widgets:
-                w.draw()
-        self._ops = end_capture()
-        return self._ops
-
-    def start(self, widgets=None, genie=True, origin=None):
-        """Bring the screen up. By default this is the "genie" open:
-        it draws (and records) the taskbar/exit box/background plus
-        any widgets you pass in, then grows that real content in from
-        `origin` (default: screen center) instead of a flat color
-        block. Pass genie=False for the old flat-color grow, drawn
-        the plain way afterward.
-        """
-        global active_screen
-
-        if genie:
-            ops = self.snapshot(widgets)
-            window_open_animation_live(ops, duration=0.4, fps=60, origin=origin, bg=self.background)
-        else:
-            window_open_animation(duration=0.4, fps=60, color=self.background, ease=True)
-            self._draw_chrome()
-            if widgets:
-                for w in widgets:
-                    w.draw()
-
-        active_screen = self
-
-    def taskbar(self, taskbarcolor, taskbar_text, taskbar_text_color, taskbar_height=35):
-        self.taskbar_text = taskbar_text
-        self.taskbarcolor = taskbarcolor
-        self.taskbar_text_color = taskbar_text_color
-        self.taskbar_height = taskbar_height
-
-        fill_rect(0, 0, WIDTH, self.taskbar_height, self.taskbarcolor)
-        if self.taskbar_text:
-            draw_text_centered(WIDTH // 2, (self.taskbar_height - 8) // 2,
-                                self.taskbar_text, self.taskbar_text_color, self.taskbarcolor)
-
-    def draw_gradient(self, color1, color2, angle=0, block_size=1):
-        """Linear/diagonal gradient. Supported angles: 0,45,90,135,180,270."""
-        w, h = WIDTH, HEIGHT
-
-        def unpack_rgb565(c):
-            r = ((c >> 11) & 0x1F) << 3
-            g = ((c >> 5) & 0x3F) << 2
-            b = (c & 0x1F) << 3
-            return r, g, b
-
-        def pack_rgb565(r, g, b):
-            r = int(max(0, min(255, r)))
-            g = int(max(0, min(255, g)))
-            b = int(max(0, min(255, b)))
-            return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-
-        r1, g1, b1 = unpack_rgb565(color1)
-        r2, g2, b2 = unpack_rgb565(color2)
-
-        diff = abs((r1 + g1 + b1) - (r2 + g2 + b2)) / 765
-        gamma = 2.0 + diff * 0.3
-
-        r1_g, g1_g, b1_g = [(x / 255) ** gamma for x in (r1, g1, b1)]
-        r2_g, g2_g, b2_g = [(x / 255) ** gamma for x in (r2, g2, b2)]
-
-        def cubic_blend(a, b, t):
-            t2 = t * t
-            t3 = t2 * t
-            return a + (b - a) * (3 * t2 - 2 * t3)
-
-        if angle in (0, 90, 180, 270):
-            vertical = angle in (0, 180)
-            steps = h if vertical else w
-
-            for i in range(0, steps, block_size):
-                t = i / steps
-                if angle in (180, 270):
-                    t = 1 - t
-
-                r = pow(cubic_blend(r1_g, r2_g, t), 1 / gamma)
-                g = pow(cubic_blend(g1_g, g2_g, t), 1 / gamma)
-                b = pow(cubic_blend(b1_g, b2_g, t), 1 / gamma)
-
-                r += (urandom.getrandbits(2) - 2) / 512
-                g += (urandom.getrandbits(2) - 2) / 512
-                b += (urandom.getrandbits(2) - 2) / 512
-
-                color = pack_rgb565(r * 255, g * 255, b * 255)
-                if vertical:
-                    fill_rect(0, i, w, block_size, color)
-                else:
-                    fill_rect(i, 0, block_size, h, color)
-            return
-
-        if angle in (45, 135):
-            for y in range(0, h, block_size):
-                for x in range(0, w, block_size):
-                    if angle == 45:
-                        t = (x + (h - y)) / (w + h)
-                    else:
-                        t = (x + y) / (w + h)
-                    t = max(0.0, min(1.0, t))
-
-                    r = pow(cubic_blend(r1_g, r2_g, t), 1 / gamma)
-                    g = pow(cubic_blend(g1_g, g2_g, t), 1 / gamma)
-                    b = pow(cubic_blend(b1_g, b2_g, t), 1 / gamma)
-
-                    r += (urandom.getrandbits(2) - 2) / 512
-                    g += (urandom.getrandbits(2) - 2) / 512
-                    b += (urandom.getrandbits(2) - 2) / 512
-
-                    color = pack_rgb565(r * 255, g * 255, b * 255)
-                    fill_rect(x, y, block_size, block_size, color)
-            return
-
-        log_warn("Unsupported gradient angle. Use 0, 45, 90, 135, 180, 270.")
-
-    def start_withoutexit(self):
-        global active_screen
-        self.exit_box = None
-
-        self._draw_background()
-
-        h = self.taskbar_height
-        fill_rect(0, 0, WIDTH, h, self.taskbarcolor)
-
-        if self.taskbar_text:
-            draw_text_centered(WIDTH // 2, (h - 8) // 2,
-                                self.taskbar_text, self.taskbar_text_color, self.taskbarcolor)
-
-        active_screen = self
-
-    def check(self):
-        if not self.exit_box or not self.buttons_enabled:
-            return False
-
-        p = get_touch()
-        if not p:
-            return False
-
-        tx, ty = p
-        x0, y0, w, h = self.exit_box
-
-        if x0 <= tx <= x0 + w and y0 <= ty <= y0 + h:
-            if self.on_exit:
-                self.on_exit(*self.exit_args, **self.exit_kwargs)
-            return True
-        return False
-
-
-class UITextBoxView:
-    def __init__(self, x, y, w, h, text=None, fg=WHITE, bg=BLACK, padding=4):
-        self.x = x
-        self.y = y
-        self.w = w
-        self.h = h
-        self.fg = fg
-        self.bg = bg
-        self.padding = padding
-
-        self.char_w = 8
-        self.char_h = 8
-
-        self.cols = max(1, (w - padding * 2) // self.char_w)
-        self.rows = max(1, (h - padding * 2) // self.char_h)
-
-        self.scroll_px = 0
-
-        self._touch_active = False
-        self._y0 = 0
-        self._s0_px = 0
-
-        self.enabled = True
-        self.lines = []
-
-        if text:
-            self.set_text(text)
-
-    def _inside(self, x, y):
-        return self.x <= x < self.x + self.w and self.y <= y < self.y + self.h
-
-    def set_text(self, text):
-        self.lines = []
-        self.scroll_px = 0
-        self._touch_active = False
-
-        if not text:
-            return
-
-        cols = self.cols
-        append = self.lines.append
-
-        for raw in str(text).split("\n"):
-            while len(raw) > cols:
-                append(raw[:cols])
-                raw = raw[cols:]
-            if raw:
-                append(raw)
-
-    def draw(self):
-        fill_rect(self.x, self.y, self.w, self.h, self.bg)
-
-        if not self.enabled or not self.lines:
-            return
-
-        total_h = len(self.lines) * self.char_h
-        view_h = self.rows * self.char_h
-        max_scroll = max(0, total_h - view_h)
-
-        if self.scroll_px < 0:
-            self.scroll_px = 0
-        elif self.scroll_px > max_scroll:
-            self.scroll_px = max_scroll
-
-        first = self.scroll_px // self.char_h
-        offset = self.scroll_px % self.char_h
-
-        ty = self.y + self.padding - offset
-        x = self.x + self.padding
-
-        end = min(first + self.rows + 1, len(self.lines))
-
-        for i in range(first, end):
-            line = self.lines[i]
-            if line:
-                draw_text8x8(x, ty, line, self.fg, self.bg)
-            ty += self.char_h
-
-    def handle_touch(self):
-        if not self.enabled or not self.lines:
-            return False
-
-        p = get_touch()
-
-        if p and not self._touch_active:
-            tx, ty = p
-            if not self._inside(tx, ty):
-                return False
-            self._touch_active = True
-            self._y0 = ty
-            self._s0_px = self.scroll_px
-            return True
-
-        if p and self._touch_active:
-            _, ty = p
-            self.scroll_px = self._s0_px + (self._y0 - ty)
-            self.draw()
-            return True
-
-        if not p and self._touch_active:
-            self._touch_active = False
-            return True
-
-        return False
-
-
-class DialogBox:
-    def __init__(self, *, title="Dialog", message="",
-                 btn_yes="Yes", btn_no="No",
-                 on_yes=None, on_no=None, on_exit=None):
-        self.on_yes = on_yes
-        self.on_no = on_no
-        self.on_exit = on_exit
-        self.btn_yes = btn_yes
-        self.btn_no = btn_no
-        self.title = title
-        self.message = message
-
-        self._result = None
-        self._running = False
-
-    def _yes(self):
-        self._result = "yes"
-        self._running = False
-        if self.on_yes:
-            self.on_yes()
-
-    def _no(self):
-        self._result = "no"
-        self._running = False
-        if self.on_no:
-            self.on_no()
-
-    def _exit(self):
-        self._result = None
-        self._running = False
-        if self.on_exit:
-            self.on_exit()
-
-    def show(self):
-        if self._running:
-            return None
-
-        W = 190
-        H = 96
-        X = (WIDTH - W) // 2
-        Y = (HEIGHT - H) // 2
-
-        self.x, self.y, self.w, self.h = X, Y, W, H
-
-        self.texts = []
-        self.buttons = []
-
-        draw_rounded_rect(X, Y, W, H, 10, SURFACE)
-        draw_rounded_rect(X, Y, W, 22, 10, SURFACE_ALT)
-        fill_rect(X, Y + 14, W, 8, SURFACE_ALT)  # square off bottom of header radius
-
-        self.texts.append(UIText(X + 10, Y + 7, self.title, fg=WHITE, bg=SURFACE_ALT))
-        self.texts.append(UIText(X + 10, Y + 44, self.message, fg=TEXT_MUTED, bg=SURFACE))
-
-        self.buttons.append(UIButton(
-            X + W - 20, Y + 3, 15, 15, label="X",
-            color=RED, text_color=WHITE, radius=3, margin=3, action=self._exit
-        ))
-        self.buttons.append(UIButton(
-            X + 14, Y + H - 32, 74, 24, label=self.btn_yes,
-            color=GREEN, text_color=WHITE, margin=5, action=self._yes
-        ))
-        self.buttons.append(UIButton(
-            X + W - 14 - 74, Y + H - 32, 74, 24, label=self.btn_no,
-            color=SURFACE_ALT, text_color=WHITE, margin=5, action=self._no
-        ))
-
-        for t in self.texts:
-            t.draw()
-        for b in self.buttons:
-            b.draw()
-
-        self._running = True
-        while self._running:
-            for b in self.buttons:
-                b.get_touch()
-            time.sleep(0.02)
-
-        return self._result
-
-
-class UIToggleSwitch(_Touchable):
-    def __init__(self, x, y, w=50, h=26, state=False,
-                 on_color=GREEN, off_color=color565(120, 120, 120),
-                 knob=WHITE, action=None):
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.state = state
-        self.on_color = on_color
-        self.off_color = off_color
-        self.knob = knob
-        self.action = action
-
-    def draw(self):
-        r = self.h // 2
-        bg = self.on_color if self.state else self.off_color
-
-        fill_rect(self.x, self.y, self.w, self.h, background)
-
-        fill_circle(self.x + r, self.y + r, r, bg)
-        fill_circle(self.x + self.w - r - 1, self.y + r, r, bg)
-        fill_rect(self.x + r, self.y, self.w - 2 * r, self.h, bg)
-
-        kx = self.x + self.w - r - 1 if self.state else self.x + r
-        fill_circle(kx, self.y + r, r - 2, self.knob)
-
-    def handle_touch(self):
-        if not self._tap():
-            return False
-        self.state = not self.state
-        self.draw()
-        if self.action:
-            self.action(self.state)
-        return True
-
-
-class UISlider(_Touchable):
-    """iOS-style slider: bordered track, filled progress, draggable knob."""
-
-    def __init__(self, x, y, w, min_v=0, max_v=100, value=0,
-                 track_border=DARK_GRAY,
-                 track_fill=SURFACE_ALT,
-                 fill=BLUE,
-                 knob=WHITE,
-                 action=None):
-        self.x, self.y, self.w = x, y, w
-        self.h = 18
-        self.knob_size = 16
-
-        self.min = min_v
-        self.max = max_v
-        self.value = float(value)
-
-        self.track_border = track_border
-        self.track_fill = track_fill
-        self.fill = fill
-        self.knob_color = knob
-        self.action = action
-
-        self.dragging = False
-        self.drag_offset = 0
-        self._last_kx = None
-
-    def draw(self):
-        fill_rect(self.x - 2, self.y - 2, self.w + 4, self.h + 4, background)
-
-        draw_rect(self.x, self.y, self.w, self.h, self.track_border)
-        fill_rect(self.x + 1, self.y + 1, self.w - 2, self.h - 2, self.track_fill)
-
-        travel = self.w - self.knob_size
-        ratio = (self.value - self.min) / (self.max - self.min) if self.max != self.min else 0
-        kx = self.x + int(ratio * travel)
-
-        if kx > self.x + 1:
-            fill_rect(self.x + 1, self.y + 1, kx - self.x, self.h - 2, self.fill)
-
-        self._draw_knob(kx)
-        self._last_kx = kx
-
-    def _draw_knob(self, kx):
-        ky = self.y + 1
-        draw_rounded_rect(kx, ky, self.knob_size, self.knob_size, self.knob_size // 2, BLACK)
-        draw_rounded_rect(kx + 1, ky + 1, self.knob_size - 2, self.knob_size - 2,
-                           (self.knob_size - 2) // 2, self.knob_color)
-
-    def handle_touch(self):
-        p = get_touch()
-        if not p:
-            self.dragging = False
-            return False
-
-        tx, ty = p
-        travel = self.w - self.knob_size
-        ky = self.y + 1
-
-        if self._last_kx is None:
-            return False
-
-        if not self.dragging:
-            if _point_in_rect(tx, ty, self._last_kx, ky, self.knob_size, self.knob_size, 6):
-                self.dragging = True
-                self.drag_offset = tx - self._last_kx
-            else:
-                return False
-
-        new_x = tx - self.drag_offset
-        new_x = max(self.x, min(self.x + travel, new_x))
-        if new_x == self._last_kx:
-            return True
-
-        ratio = (new_x - self.x) / travel if travel else 0
-        self.value = self.min + ratio * (self.max - self.min)
-        self.draw()
-
-        if self.action:
-            self.action(self.value)
-
-        return True
-
-
-class UIPanel:
-    def __init__(self, x, y, w, h, title=None, bg=None, border=None,
-                 title_fg=None, title_bg=None, radius=8):
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.title = title
-        self.radius = radius
-
-        self.bg = bg if bg is not None else SURFACE
-        self.border = border if border is not None else BORDER
-        self.title_fg = title_fg if title_fg is not None else color565(200, 200, 200)
-        self.title_bg = title_bg if title_bg is not None else self.bg
-
-    def draw(self):
-        draw_rounded_rect(self.x, self.y, self.w, self.h, self.radius, self.bg)
-        draw_rounded_rect(self.x, self.y, self.w, self.h, self.radius, self.border, filled=False)
-
-        if self.title:
-            draw_text8x8(self.x + 8, self.y + 8, self.title, self.title_fg, self.title_bg)
-
-    def open(self, steps=8, delay_ms=1):
-        tw = self.w
-        th = self.h
-
-        for i in range(1, steps + 1):
-            cw = (tw * i) // steps
-            ch = (th * i) // steps
-            draw_rounded_rect(self.x, self.y, cw, ch, min(self.radius, cw // 2, ch // 2), self.bg)
-            draw_rounded_rect(self.x, self.y, cw, ch, min(self.radius, cw // 2, ch // 2), self.border, filled=False)
-            if delay_ms:
-                time.sleep_ms(delay_ms)
-
-        self.draw()
-
-
-# Alias: a "Card" is just a panel with a slightly larger default radius
-# and no border — separated for semantic clarity in app code.
-class UICard(UIPanel):
-    def __init__(self, x, y, w, h, title=None, bg=None, radius=12):
-        super().__init__(x, y, w, h, title=title, bg=bg, border=None, radius=radius)
-
-    def draw(self):
-        draw_rounded_rect(self.x, self.y, self.w, self.h, self.radius, self.bg)
-        if self.title:
-            draw_text8x8(self.x + 8, self.y + 8, self.title, self.title_fg, self.bg)
-
-
-class UIProgressBar:
-    def __init__(self, x, y, w, h=12, value=0, bg=SURFACE_ALT, fg=BLUE, radius=4):
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.value = value
-        self.bg = bg
-        self.fg = fg
-        self.radius = radius
-
-    def set(self, val):
-        self.value = max(0, min(100, val))
-        self.draw()
-
-    def draw(self):
-        draw_rounded_rect(self.x, self.y, self.w, self.h, self.radius, self.bg)
-        fw = int(self.w * self.value / 100)
-        if fw >= self.h:
-            draw_rounded_rect(self.x, self.y, fw, self.h, self.radius, self.fg)
-        elif fw > 0:
-            fill_rect(self.x, self.y, fw, self.h, self.fg)
-
-
-class UISpinner:
-    """Simple loading spinner: N dots around a circle, one step per
-    call to draw(). Call draw() repeatedly (e.g. once per loop tick)
-    to animate — it advances its own phase internally."""
-
-    def __init__(self, cx, cy, radius=14, dots=8, color=BLUE, bg=None):
-        self.cx, self.cy, self.radius = cx, cy, radius
-        self.dots = dots
-        self.color = color
-        self.bg = bg
-        self._phase = 0
-
-    def draw(self):
-        box = self.radius + 4
-        fill_rect(self.cx - box, self.cy - box, box * 2, box * 2,
-                  self.bg if self.bg is not None else background)
-
-        import math
-        for i in range(self.dots):
-            angle = (2 * math.pi * i / self.dots) + (2 * math.pi * self._phase / self.dots)
-            dx = int(self.cx + self.radius * math.cos(angle))
-            dy = int(self.cy + self.radius * math.sin(angle))
-            # fade dot size with position so it reads as motion
-            fade = (i / self.dots)
-            r = 1 + int(3 * fade)
-            fill_circle(dx, dy, r, self.color)
-
-        self._phase = (self._phase + 1) % self.dots
-
-    def stop(self):
-        box = self.radius + 4
-        fill_rect(self.cx - box, self.cy - box, box * 2, box * 2,
-                  self.bg if self.bg is not None else background)
-
-
-class UIStatusIndicator:
-    OK = 0
-    WARN = 1
-    ERR = 2
-
-    def __init__(self, x, y, r=6, state=0):
-        self.x, self.y, self.r = x, y, r
-        self.state = state
-
-    def draw(self):
-        c = {self.OK: GREEN, self.WARN: ORANGE, self.ERR: RED}.get(self.state, RED)
-        fill_circle(self.x, self.y, self.r, c)
-
-
-# ---------------------------------------------------------------------
-# NotificationBadge — the "red dot" / count marker.
-# Two ways to use it:
-#   1. Attach to a widget: btn.badge = NotificationBadge(count=3);
-#      the widget's own draw() will call badge.draw_at_corner(...).
-#   2. Draw manually anywhere: NotificationBadge(count=3).draw(x, y).
-# ---------------------------------------------------------------------
-
-class NotificationBadge:
-    def __init__(self, count=None, color=RED, text_color=WHITE, max_count=99, min_radius=5):
-        """count=None (or 0) draws a plain dot. count>0 draws a pill
-        with the number (capped at max_count, shown as '99+')."""
-        self.count = count
-        self.color = color
-        self.text_color = text_color
-        self.max_count = max_count
-        self.min_radius = min_radius
         self.visible = True
+        self.enabled = True
+        self.pressed = False
+        self.parent = None
 
-    def set(self, count):
-        self.count = count
+        if self not in _registered_widgets:
+            _registered_widgets.append(self)
 
-    def clear(self):
-        self.count = None
+    def _clamp_bounds(self):
+        self.w = _clamp(int(self.w), 1, WIDTH)
+        self.h = _clamp(int(self.h), 1, HEIGHT)
+        self.x = _clamp(int(self.x), 0, max(0, WIDTH - self.w))
+        self.y = _clamp(int(self.y), 0, max(0, HEIGHT - self.h))
 
-    def draw(self, x, y):
-        """Draw the badge centered at (x, y)."""
+    def _relayout(self, old_w, old_h, new_w, new_h):
+        """Proportional reflow when rotation changes between Portrait and Landscape."""
+        if old_w <= 0 or old_h <= 0:
+            return
+        self.x = int(round(self.x * new_w / old_w))
+        self.y = int(round(self.y * new_h / old_h))
+        self.w = max(8, int(round(self.w * new_w / old_w)))
+        self.h = max(8, int(round(self.h * new_h / old_h)))
+        self._clamp_bounds()
+
+    def contains(self, px, py, margin=2):
+        return _point_in_rect(px, py, self.x, self.y, self.w, self.h, margin)
+
+    def clear_area(self, bg_color=None):
+        fill_rect(self.x, self.y, self.w, self.h, background if bg_color is None else bg_color)
+
+    def show(self, redraw=True):
+        self.visible = True
+        if redraw:
+            self.draw()
+
+    def hide(self, redraw=True):
+        self.visible = False
+        if redraw:
+            self.clear_area()
+
+    def draw(self):
+        pass
+
+    def update(self, pt):
+        return self.handle_touch(pt)
+
+    def handle_touch(self, pt):
+        return False
+
+
+class UILabel(UIWidget):
+    def __init__(self, x, y, text="", color=WHITE, bg=TRANSPARENT,
+                 font=None, scale=1, align="left", w=0, h=0, fg=None):
+        if fg is not None:
+            color = fg
+        tw, th = text_size(text, font, scale)
+        super().__init__(x, y, w if w > 0 else max(1, tw), h if h > 0 else max(1, th))
+        self.text = str(text)
+        self.color = color
+        self.bg = bg
+        self.font = font
+        self.scale = max(1, int(scale))
+        self.align = align
+        self._auto_size = (w <= 0 or h <= 0)
+
+    def set_text(self, text, redraw=True):
+        text = str(text)
+        if text == self.text:
+            return
+        if redraw and self.visible:
+            self.clear_area(background if self.bg == TRANSPARENT or self.bg is None else self.bg)
+        self.text = text
+        if self._auto_size:
+            tw, th = text_size(self.text, self.font, self.scale)
+            self.w = _clamp(tw, 1, WIDTH - self.x)
+            self.h = _clamp(th, 1, HEIGHT - self.y)
+        if redraw and self.visible:
+            self.draw()
+
+    def draw(self):
         if not self.visible:
             return
-
-        if not self.count:
-            fill_circle(x, y, self.min_radius, self.color)
-            draw_circle(x, y, self.min_radius, BLACK)
-            return
-
-        label = str(self.count) if self.count <= self.max_count else "{}+".format(self.max_count)
-        w = max(self.min_radius * 2, len(label) * 6 + 8)
-        h = self.min_radius * 2 + 2
-        bx = x - w // 2
-        by = y - h // 2
-
-        draw_rounded_rect(bx, by, w, h, h // 2, self.color)
-        draw_rounded_rect(bx, by, w, h, h // 2, BLACK, filled=False)
-        draw_text_centered(x, by + (h - 8) // 2, label, self.text_color, self.color)
-
-    def draw_at_corner(self, wx, wy, ww, wh, corner="top-right", inset=2):
-        """Convenience for pinning to a widget's bounding box."""
-        if corner == "top-right":
-            x, y = wx + ww - inset, wy + inset
-        elif corner == "top-left":
-            x, y = wx + inset, wy + inset
-        elif corner == "bottom-right":
-            x, y = wx + ww - inset, wy + wh - inset
-        else:  # bottom-left
-            x, y = wx + inset, wy + wh - inset
-        self.draw(x, y)
-
-
-class UIAvatar:
-    """Circular avatar: either an initials badge or a BMP image,
-    with an optional NotificationBadge pinned to the corner."""
-
-    def __init__(self, x, y, r=20, image=None, initials=None,
-                 bg=SURFACE_ALT, fg=WHITE, badge=None):
-        self.x, self.y, self.r = x, y, r
-        self.image = image
-        self.initials = (initials or "")[:2].upper()
-        self.bg = bg
-        self.fg = fg
-        self.badge = badge
-
-    def draw(self):
-        if self.image:
-            try:
-                draw_bmp(self.image, self.x - self.r, self.y - self.r,
-                         self.r * 2, self.r * 2)
-            except Exception as e:
-                log_error("UIAvatar image failed: {}".format(e))
-                fill_circle(self.x, self.y, self.r, self.bg)
+        if self.bg != TRANSPARENT and self.bg is not None:
+            fill_rect(self.x, self.y, self.w, self.h, self.bg)
+        if not self._auto_size:
+            if self.align == "center":
+                draw_text_in_rect(self.x, self.y, self.w, self.h, self.text, self.color, self.bg, self.font, self.scale)
+            elif self.align == "right":
+                _, th = text_size(self.text, self.font, self.scale)
+                draw_text_right(self.x + self.w, self.y + max(0, (self.h - th) // 2),
+                                self.text, self.color, self.bg, self.scale, self.font)
+            else:
+                _, th = text_size(self.text, self.font, self.scale)
+                draw_text(self.x, self.y + max(0, (self.h - th) // 2),
+                          self.text, self.color, self.bg, self.font, self.scale)
         else:
-            fill_circle(self.x, self.y, self.r, self.bg)
-            if self.initials:
-                draw_text_centered(self.x, self.y - 4, self.initials, self.fg, self.bg)
+            if self.align == "center":
+                draw_text_centered(self.x, self.y, self.text, self.color, self.bg, self.scale, self.font)
+            elif self.align == "right":
+                draw_text_right(self.x, self.y, self.text, self.color, self.bg, self.scale, self.font)
+            else:
+                draw_text(self.x, self.y, self.text, self.color, self.bg, self.font, self.scale)
 
-        if self.badge:
-            self.badge.draw_at_corner(self.x - self.r, self.y - self.r,
-                                       self.r * 2, self.r * 2)
 
-
-class UIBadgeLabel:
-    """Small pill/tag label, e.g. status chips: "NEW", "BETA", "3 left"."""
-
-    def __init__(self, x, y, text, color=BLUE, text_color=WHITE, padding=6):
-        self.x, self.y = x, y
-        self.text = text
+class UIButton(UIWidget):
+    def __init__(self, x, y, w, h, text="", action=None,
+                 color=ACCENT_BLUE, text_color=WHITE, pressed_color=None,
+                 border_color=None, radius=8, font=None, scale=1,
+                 bg=None, fg=None, label=None):
+        super().__init__(x, y, w, h)
+        if label is not None:
+            text = label
+        if bg is not None:
+            color = bg
+        if fg is not None:
+            text_color = fg
+        self.text = str(text)
+        self.action = action
         self.color = color
         self.text_color = text_color
-        self.padding = padding
+        self.pressed_color = pressed_color if pressed_color is not None else darken(color, 70)
+        self.border_color = border_color
+        self.radius = radius
+        self.font = font
+        self.scale = max(1, int(scale))
 
-    def draw(self):
-        w = len(self.text) * 8 + self.padding * 2
-        h = 16
-        draw_rounded_rect(self.x, self.y, w, h, h // 2, self.color)
-        draw_text8x8(self.x + self.padding, self.y + 4, self.text, self.text_color, self.color)
-        return w, h
-
-
-# ---------------------------------------------------------------------
-# Toast — non-blocking, stackable notification banners.
-# Call Toast.push(...) to enqueue, Toast.update() once per loop tick
-# from your main event loop to render/expire it. No more sleep()
-# blocking the whole UI thread like the old version did.
-# ---------------------------------------------------------------------
-
-class Toast:
-    INFO = BLUE
-    SUCCESS = GREEN
-    WARNING = ORANGE
-    ERROR = RED
-
-    _queue = []
-    _current = None
-    _shown_at = 0
-    _duration_ms = 2000
-    _height = 30
-
-    @classmethod
-    def push(cls, text, kind=None, duration_ms=2000):
-        cls._queue.append((text, kind or cls.INFO, duration_ms))
-
-    @classmethod
-    def update(cls):
-        """Call once per frame. Draws the active toast, advances the
-        queue, and clears the area when a toast expires."""
-        now = time.ticks_ms()
-
-        if cls._current is None:
-            if not cls._queue:
-                return
-            cls._current = cls._queue.pop(0)
-            cls._shown_at = now
-            cls._draw(cls._current)
-            return
-
-        text, kind, duration = cls._current
-        if time.ticks_diff(now, cls._shown_at) >= duration:
-            cls._clear()
-            cls._current = None
-
-    @classmethod
-    def _draw(cls, toast):
-        text, kind, duration = toast
-        y = HEIGHT - cls._height - 6
-        x = 10
-        w = WIDTH - 20
-
-        draw_rounded_rect(x, y, w, cls._height, 8, SURFACE)
-        fill_rect(x + 2, y + cls._height // 2 - 8, 6, 16, kind)  # accent bar
-        draw_text8x8(x + 16, y + (cls._height - 8) // 2, text, WHITE, SURFACE)
-
-    @classmethod
-    def _clear(cls):
-        y = HEIGHT - cls._height - 6
-        fill_rect(10, y, WIDTH - 20, cls._height, background)
-
-
-class UIListView:
-    def __init__(self, x, y, w, h, items, item_h=24,
-                 bg=SURFACE, fg=WHITE,
-                 sel=BLUE, text_x=6,
-                 highlight=False, action=None):
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.items = items
-        self.item_h = item_h
-        self.bg = bg
-        self.fg = fg
-        self.sel = sel
-        self.text_x = text_x
-        self.highlight = highlight
-        self.action = action
-
-        self.scroll = 0
-        self.selected = -1
-        self.enabled = True
-
-        self._y0 = None
-        self._s0 = 0
-        self._moved = False
-
-    def _inside(self, x, y):
-        return self.x <= x < self.x + self.w and self.y <= y < self.y + self.h
-
-    def draw(self):
-        fill_rect(self.x, self.y, self.w, self.h, self.bg)
-
-        if not self.enabled:
-            return
-
-        content_h = len(self.items) * self.item_h
-        max_scroll = max(0, content_h - self.h)
-
-        if self.scroll < 0:
-            self.scroll = 0
-        elif self.scroll > max_scroll:
-            self.scroll = max_scroll
-
-        first = self.scroll // self.item_h
-        offset = self.scroll % self.item_h
-        visible = (self.h + self.item_h - 1) // self.item_h
-
-        for i in range(visible):
-            idx = first + i
-            if idx >= len(self.items):
-                break
-
-            iy = self.y + i * self.item_h - offset
-            if iy + self.item_h <= self.y or iy >= self.y + self.h:
-                continue
-
-            row_bg = self.sel if (self.highlight and idx == self.selected) else self.bg
-            fill_rect(self.x, iy, self.w, self.item_h, row_bg)
-
-            ty = iy + (self.item_h - 8) // 2
-            if self.y <= ty < self.y + self.h:
-                draw_text8x8(self.x + self.text_x, ty, str(self.items[idx]), self.fg, row_bg)
-
-    def handle_touch(self):
-        if not self.enabled:
-            return False
-
-        p = get_touch()
-
-        if p and self._y0 is None:
-            tx, ty = p
-            if not self._inside(tx, ty):
-                return False
-            self._y0 = ty
-            self._s0 = self.scroll
-            self._moved = False
-            return True
-
-        if p and self._y0 is not None:
-            _, ty = p
-            dy = self._y0 - ty
-            if abs(dy) > 6:
-                self._moved = True
-            self.scroll = self._s0 + dy
+    def set_text(self, text, redraw=True):
+        self.text = str(text)
+        if redraw and self.visible:
             self.draw()
-            return True
 
-        if not p and self._y0 is not None:
-            ty0 = self._y0
-            moved = self._moved
-            self._y0 = None
-
-            if not moved:
-                rel_y = ty0 - self.y
-                if 0 <= rel_y < self.h:
-                    idx = (self.scroll + rel_y) // self.item_h
-                    if 0 <= idx < len(self.items):
-                        self.selected = idx
-                        self.draw()
-                        if self.action:
-                            self.action(idx, self.items[idx])
-            return True
-
-        return False
-
-
-class UIInputTextBox:
-    def __init__(self, x, y, w, h, keyboard, fg, bg, padding=4, blink_ms=500):
-        self.kb = keyboard
-
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.fg = fg
-        self.bg = bg
-        self.padding = padding
-
-        self.char_w = 8
-        self.char_h = 8
-        self.cols = max(1, (w - padding * 2) // self.char_w)
-
-        self._last_buf = None
-        self._caret_on = True
-        self._last_blink = time.ticks_ms()
-        self._blink_ms = blink_ms
-
-        self.enabled = True
-
-        fill_rect(self.x, self.y, self.w, self.h, self.bg)
-
-    def _inside(self, x, y):
-        return self.x <= x < self.x + self.w and self.y <= y < self.y + self.h
-
-    def draw(self, force=False):
-        buf = self.kb.buffer
-
-        if not buf:
-            return
-
-        now = time.ticks_ms()
-        blink = False
-
-        if time.ticks_diff(now, self._last_blink) > self._blink_ms:
-            self._caret_on = not self._caret_on
-            self._last_blink = now
-            blink = True
-
-        if not force and buf == self._last_buf and not blink:
-            return
-
-        self._last_buf = buf
-
-        fill_rect(self.x, self.y, self.w, self.h, self.bg)
-
-        visible = buf[-self.cols:]
-        text = visible + ("|" if self._caret_on else "")
-
-        if not text.strip("|"):
-            return
-
-        draw_text8x8(self.x + self.padding, self.y + (self.h - self.char_h) // 2,
-                     text, self.fg, self.bg)
-
-    def handle_touch(self):
-        if not self.enabled:
-            return False
-
-        p = get_touch()
-        if not p:
-            return False
-
-        tx, ty = p
-        if not self._inside(tx, ty):
-            return False
-
-        self.kb.open()
-        return True
-
-
-class UIIconButton(_Touchable):
-    def __init__(self, x, y, w, h, label, bg=SURFACE_ALT, fg=WHITE, action=None):
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.label = label
-        self.bg = bg
-        self.fg = fg
-        self.action = action
-        self.badge = None
+    set_label = set_text
 
     def draw(self):
-        draw_rounded_rect(self.x, self.y, self.w, self.h, 6, self.bg)
-        draw_text_centered(self.x + self.w // 2, self.y + (self.h - 8) // 2,
-                            self.label, self.fg, self.bg)
-        if self.badge:
-            self.badge.draw_at_corner(self.x, self.y, self.w, self.h)
+        if not self.visible:
+            return
+        c = DARK_GRAY if not self.enabled else (self.pressed_color if self.pressed else self.color)
+        tc = TEXT_MUTED if not self.enabled else self.text_color
+        r = _clamp(self.radius, 0, min(self.w, self.h) // 2)
+        draw_rounded_rect(self.x, self.y, self.w, self.h, r, c, filled=True)
+        if self.border_color is not None:
+            draw_rounded_rect(self.x, self.y, self.w, self.h, r, self.border_color, filled=False)
+        if self.text:
+            draw_text_in_rect(self.x, self.y, self.w, self.h, self.text, tc, c, self.font, self.scale)
 
-    def handle_touch(self):
-        if not self._tap():
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled:
             return False
-        if self.action:
-            self.action()
-        return True
-
-
-class UICheckBox(_Touchable):
-    def __init__(self, x, y, label, checked=False, action=None):
-        self.x, self.y = x, y
-        self.label = label
-        self.checked = checked
-        self.action = action
-        self.size = 18
-        self.w = self.h = self.size
-
-    def draw(self):
-        fill_rect(self.x, self.y, self.size, self.size, background)
-        draw_rounded_rect(self.x, self.y, self.size, self.size, 4, LIGHT_GRAY, filled=False)
-        if self.checked:
-            draw_rounded_rect(self.x, self.y, self.size, self.size, 4, GREEN)
-            draw_line(self.x + 3, self.y + 9, self.x + 7, self.y + 14, WHITE)
-            draw_line(self.x + 7, self.y + 14, self.x + 15, self.y + 3, WHITE)
-        draw_text8x8(self.x + self.size + 6, self.y + 5, self.label, WHITE, background)
-
-    def handle_touch(self):
-        if not self._tap():
-            return False
-        self.checked = not self.checked
-        self.draw()
-        if self.action:
-            self.action(self.checked)
-        return True
-
-
-class UIRadioGroup:
-    def __init__(self, x, y, options, selected=0, action=None):
-        self.x, self.y = x, y
-        self.options = options
-        self.selected = selected
-        self.action = action
-        self.r = 6
-        self.spacing = 22
-
-    def draw(self):
-        for i, opt in enumerate(self.options):
-            cy = self.y + i * self.spacing
-            draw_circle(self.x, cy, self.r, LIGHT_GRAY)
-            if i == self.selected:
-                fill_circle(self.x, cy, self.r - 2, BLUE)
-            draw_text8x8(self.x + 14, cy - 4, opt, WHITE, background)
-
-    def handle_touch(self):
-        p = get_touch()
-        if not p:
-            return False
-        tx, ty = p
-        for i in range(len(self.options)):
-            cy = self.y + i * self.spacing
-            if abs(tx - self.x) <= self.r + 4 and abs(ty - cy) <= self.r + 4:
-                self.selected = i
+        if pt is not None:
+            inside = self.contains(pt[0], pt[1])
+            if inside and not self.pressed:
+                self.pressed = True
+                self.draw()
+                return True
+            elif not inside and self.pressed:
+                self.pressed = False
+                self.draw()
+        else:
+            if self.pressed:
+                self.pressed = False
                 self.draw()
                 if self.action:
-                    self.action(i, self.options[i])
-                time.sleep(0.15)
+                    try:
+                        self.action()
+                    except Exception as e:
+                        log_error("UIButton action failed: {}".format(e))
+                return True
+        return self.pressed
+
+
+class UIIconButton(UIButton):
+    """Button that renders a 1bpp bitmap icon or BMP file with optional caption."""
+
+    def __init__(self, x, y, w, h, icon_bits=None, icon_w=0, icon_h=0,
+                 bmp_path=None, text="", action=None, color=SURFACE_ALT,
+                 fg=WHITE, radius=8, font=None, scale=1):
+        super().__init__(x, y, w, h, text=text, action=action, color=color,
+                         text_color=fg, radius=radius, font=font, scale=scale)
+        self.icon_bits = icon_bits
+        self.icon_w = icon_w
+        self.icon_h = icon_h
+        self.bmp_path = bmp_path
+
+    def draw(self):
+        if not self.visible:
+            return
+        c = DARK_GRAY if not self.enabled else (self.pressed_color if self.pressed else self.color)
+        tc = TEXT_MUTED if not self.enabled else self.text_color
+        r = _clamp(self.radius, 0, min(self.w, self.h) // 2)
+        draw_rounded_rect(self.x, self.y, self.w, self.h, r, c, filled=True)
+        if self.bmp_path:
+            draw_logo(self.bmp_path, self.x + 4, self.y + 4, self.w - 8, self.h - 8,
+                      caption=self.text if self.text else None, caption_color=tc, bg=None, font=self.font)
+        elif self.icon_bits and self.icon_w > 0 and self.icon_h > 0:
+            ix = self.x + (self.w - self.icon_w) // 2
+            iy = self.y + (self.h - self.icon_h) // 2 - (6 if self.text else 0)
+            draw_bitmap(ix, iy, self.icon_w, self.icon_h, self.icon_bits, tc, c, 1)
+            if self.text:
+                draw_text_centered(self.x + self.w // 2, self.y + self.h - 14, self.text, tc, c, 1, self.font)
+        elif self.text:
+            draw_text_in_rect(self.x, self.y, self.w, self.h, self.text, tc, c, self.font, self.scale)
+
+
+class UIToggle(UIWidget):
+    """Toggle switch widget (also aliased as UISwitch)."""
+
+    def __init__(self, x, y, w=54, h=28, value=False, onchange=None, action=None,
+                 on_color=ACCENT_GREEN, off_color=SURFACE_ALT, knob_color=WHITE):
+        super().__init__(x, y, w, h)
+        self.value = bool(value)
+        self.onchange = onchange or action
+        self.on_color = on_color
+        self.off_color = off_color
+        self.knob_color = knob_color
+
+    def set_value(self, v, redraw=True):
+        v = bool(v)
+        if v != self.value:
+            self.value = v
+            if redraw and self.visible:
+                self.draw()
+
+    def draw(self):
+        if not self.visible:
+            return
+        r = min(self.w, self.h) // 2
+        col = self.on_color if self.value else self.off_color
+        draw_rounded_rect(self.x, self.y, self.w, self.h, r, col, filled=True)
+        draw_rounded_rect(self.x, self.y, self.w, self.h, r, BORDER, filled=False)
+        kr = max(2, r - 3)
+        kx = (self.x + self.w - r) if self.value else (self.x + r)
+        ky = self.y + self.h // 2
+        fill_circle(kx, ky, kr, self.knob_color)
+
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled:
+            return False
+        if pt is not None:
+            if self.contains(pt[0], pt[1], margin=4):
+                self.pressed = True
+                return True
+        else:
+            if self.pressed:
+                self.pressed = False
+                self.value = not self.value
+                self.draw()
+                if self.onchange:
+                    try:
+                        self.onchange(self.value)
+                    except TypeError:
+                        self.onchange()
+                    except Exception as e:
+                        log_error("UIToggle error: {}".format(e))
                 return True
         return False
 
 
-class UITabBar:
-    def __init__(self, x, y, w, h, tabs, active=0, action=None, badges=None):
-        """badges: optional dict {tab_index: NotificationBadge}."""
-        self.x, self.y, self.w, self.h = x, y, w, h
-        self.tabs = tabs
-        self.active = active
-        self.action = action
-        self.badges = badges or {}
+UISwitch = UIToggle
+
+
+class UICheckbox(UIWidget):
+    def __init__(self, x, y, label="", value=False, onchange=None, action=None,
+                 size=22, color=ACCENT_BLUE, text_color=WHITE, font=None, scale=1):
+        tw, th = text_size(label, font, scale)
+        super().__init__(x, y, size + (8 + tw if label else 0), max(size, th))
+        self.box_size = size
+        self.label = str(label)
+        self.value = bool(value)
+        self.onchange = onchange or action
+        self.color = color
+        self.text_color = text_color
+        self.font = font
+        self.scale = max(1, int(scale))
+
+    def set_value(self, val, redraw=True):
+        self.value = bool(val)
+        if redraw and self.visible:
+            self.draw()
 
     def draw(self):
-        tabw = self.w // len(self.tabs)
-        for i, t in enumerate(self.tabs):
-            bg = BLUE if i == self.active else SURFACE_ALT
-            tx = self.x + i * tabw
-            fill_rect(tx, self.y, tabw, self.h, bg)
-            draw_text_centered(tx + tabw // 2, self.y + (self.h - 8) // 2, t, WHITE, bg)
-            if i in self.badges:
-                self.badges[i].draw_at_corner(tx, self.y, tabw, self.h, corner="top-right")
+        if not self.visible:
+            return
+        self.clear_area()
+        bs = min(self.box_size, self.h)
+        by = self.y + (self.h - bs) // 2
+        r = max(3, bs // 5)
+        draw_rounded_rect(self.x, by, bs, bs, r, self.color if self.value else SURFACE, filled=True)
+        draw_rounded_rect(self.x, by, bs, bs, r, self.color if self.value else BORDER, filled=False)
+        if self.value:
+            draw_line(self.x + bs // 4, by + bs // 2, self.x + bs * 2 // 5, by + bs * 3 // 4, WHITE, 2)
+            draw_line(self.x + bs * 2 // 5, by + bs * 3 // 4, self.x + bs * 3 // 4, by + bs // 4, WHITE, 2)
+        if self.label:
+            _, th = text_size(self.label, self.font, self.scale)
+            draw_text(self.x + bs + 8, self.y + max(0, (self.h - th) // 2),
+                      self.label, self.text_color, background, self.font, self.scale)
 
-    def handle_touch(self):
-        p = get_touch()
-        if not p:
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled:
             return False
-        tx, ty = p
-        if self.x <= tx <= self.x + self.w and self.y <= ty <= self.y + self.h:
-            idx = (tx - self.x) // (self.w // len(self.tabs))
-            if idx != self.active and idx < len(self.tabs):
-                self.active = idx
+        if pt is not None:
+            if self.contains(pt[0], pt[1], margin=4):
+                self.pressed = True
+                return True
+        else:
+            if self.pressed:
+                self.pressed = False
+                self.value = not self.value
                 self.draw()
-                if self.action:
-                    self.action(idx, self.tabs[idx])
-                time.sleep(0.15)
-            return True
+                if self.onchange:
+                    try:
+                        self.onchange(self.value)
+                    except TypeError:
+                        self.onchange()
+                    except Exception as e:
+                        log_error("UICheckbox error: {}".format(e))
+                return True
         return False
 
 
-class UIStepper:
-    def __init__(self, x, y, value=0, step=1, action=None, min_v=None, max_v=None):
-        self.x, self.y = x, y
-        self.value = value
-        self.step = step
-        self.action = action
-        self.min_v = min_v
-        self.max_v = max_v
+class UIRadioGroup(UIWidget):
+    """Group of mutually exclusive radio options."""
 
-    def draw(self):
-        draw_rounded_rect(self.x, self.y, 80, 24, 6, SURFACE_ALT)
-        draw_text8x8(self.x + 8, self.y + 8, "-", WHITE, SURFACE_ALT)
-        draw_text_centered(self.x + 40, self.y + 8, str(self.value), WHITE, SURFACE_ALT)
-        draw_text8x8(self.x + 65, self.y + 8, "+", WHITE, SURFACE_ALT)
-
-    def handle_touch(self):
-        p = get_touch()
-        if not p:
-            return False
-        tx, ty = p
-        if self.x <= tx <= self.x + 24 and self.y <= ty <= self.y + 24:
-            new_v = self.value - self.step
-        elif self.x + 56 <= tx <= self.x + 80 and self.y <= ty <= self.y + 24:
-            new_v = self.value + self.step
-        else:
-            return False
-
-        if self.min_v is not None:
-            new_v = max(self.min_v, new_v)
-        if self.max_v is not None:
-            new_v = min(self.max_v, new_v)
-
-        self.value = new_v
-        self.draw()
-        if self.action:
-            self.action(self.value)
-        time.sleep(0.15)
-        return True
-
-
-class UIDivider:
-    def __init__(self, x, y, w, color=BORDER):
-        self.x, self.y, self.w = x, y, w
+    def __init__(self, x, y, options, selected=0, onchange=None,
+                 spacing=28, color=ACCENT_BLUE, text_color=WHITE, font=None, scale=1):
+        self.options = [str(o) for o in options]
+        self.spacing = max(20, int(spacing))
+        max_tw = 0
+        for o in self.options:
+            tw, _ = text_size(o, font, scale)
+            if tw > max_tw:
+                max_tw = tw
+        total_w = 26 + max_tw
+        total_h = max(22, len(self.options) * self.spacing)
+        super().__init__(x, y, total_w, total_h)
+        self.selected = _clamp(selected, 0, max(0, len(self.options) - 1))
+        self.onchange = onchange
         self.color = color
+        self.text_color = text_color
+        self.font = font
+        self.scale = max(1, int(scale))
 
     def draw(self):
-        draw_hline(self.x, self.y, self.w, self.color)
+        if not self.visible:
+            return
+        self.clear_area()
+        r = 9
+        for i, opt in enumerate(self.options):
+            cy = self.y + i * self.spacing + self.spacing // 2
+            cx = self.x + r + 2
+            fill_circle(cx, cy, r, SURFACE)
+            draw_circle(cx, cy, r, self.color if i == self.selected else BORDER)
+            if i == self.selected:
+                fill_circle(cx, cy, r - 4, self.color)
+            _, th = text_size(opt, self.font, self.scale)
+            draw_text(self.x + 2 * r + 8, cy - th // 2, opt, self.text_color, background, self.font, self.scale)
 
-
-class UIScreenAnimator:
-    """Vertical offset controller for screen transitions. No redraw logic
-    here — read .offset_y each frame and apply it yourself."""
-
-    def __init__(self):
-        self.mode = None
-        self.t0 = 0
-        self.duration = 0
-        self.running = False
-        self.start_offset = 0
-        self.end_offset = 0
-        self.offset_y = 0
-
-    def _now(self):
-        return time.ticks_ms()
-
-    def _progress(self):
-        return min(1.0, time.ticks_diff(self._now(), self.t0) / self.duration)
-
-    def _ease_out(self, t):
-        return 1 - (1 - t) ** 3
-
-    def _ease_in(self, t):
-        return t ** 3
-
-    def open(self, duration=220):
-        self.mode = "open"
-        self.duration = duration
-        self.start_offset = 30
-        self.end_offset = 0
-        self.t0 = self._now()
-        self.running = True
-
-    def close(self, duration=160):
-        self.mode = "close"
-        self.duration = duration
-        self.start_offset = 0
-        self.end_offset = 30
-        self.t0 = self._now()
-        self.running = True
-
-    def boot(self, duration=400):
-        self.mode = "boot"
-        self.duration = duration
-        self.start_offset = 50
-        self.end_offset = 0
-        self.t0 = self._now()
-        self.running = True
-
-    def update(self):
-        if not self.running:
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled or not self.options:
             return False
+        if pt is not None:
+            if self.contains(pt[0], pt[1]):
+                idx = (pt[1] - self.y) // self.spacing
+                idx = _clamp(idx, 0, len(self.options) - 1)
+                if idx != self.selected:
+                    self.selected = idx
+                    self.draw()
+                    if self.onchange:
+                        try:
+                            self.onchange(self.selected, self.options[self.selected])
+                        except TypeError:
+                            self.onchange(self.selected)
+                return True
+        return False
 
-        t = self._progress()
 
-        if self.mode == "open":
-            e = self._ease_out(t)
-        elif self.mode == "close":
-            e = self._ease_in(t)
+class UISlider(UIWidget):
+    def __init__(self, x, y, w, h=28, min_val=0, max_val=100, value=50,
+                 onchange=None, color=ACCENT_BLUE, track_color=SURFACE_ALT,
+                 knob_color=WHITE, step=1):
+        super().__init__(x, y, w, h)
+        self.min_val = min_val
+        self.max_val = max_val if max_val > min_val else min_val + 1
+        self.step = step
+        self.value = _clamp(value, self.min_val, self.max_val)
+        self.onchange = onchange
+        self.color = color
+        self.track_color = track_color
+        self.knob_color = knob_color
+
+    def set_value(self, val, redraw=True):
+        val = _clamp(val, self.min_val, self.max_val)
+        if val != self.value:
+            self.value = val
+            if redraw and self.visible:
+                self.draw()
+
+    def draw(self):
+        if not self.visible:
+            return
+        self.clear_area()
+        t = (self.value - self.min_val) / (self.max_val - self.min_val)
+        if self.w >= self.h:
+            kr = max(6, self.h // 2 - 2)
+            th = max(4, self.h // 3)
+            ty = self.y + (self.h - th) // 2
+            tx0 = self.x + kr
+            tw = max(1, self.w - 2 * kr)
+            draw_rounded_rect(tx0, ty, tw, th, th // 2, self.track_color, filled=True)
+            fw = int(tw * t)
+            if fw > 0:
+                draw_rounded_rect(tx0, ty, fw, th, th // 2, self.color, filled=True)
+            kx = tx0 + fw
+            ky = self.y + self.h // 2
+            fill_circle(kx, ky, kr, self.knob_color)
+            draw_circle(kx, ky, kr, BORDER)
         else:
-            e = self._ease_out(t)
+            kr = max(6, self.w // 2 - 2)
+            tw = max(4, self.w // 3)
+            tx = self.x + (self.w - tw) // 2
+            ty0 = self.y + kr
+            th = max(1, self.h - 2 * kr)
+            draw_rounded_rect(tx, ty0, tw, th, tw // 2, self.track_color, filled=True)
+            fh = int(th * t)
+            ky = ty0 + th - fh
+            if fh > 0:
+                draw_rounded_rect(tx, ky, tw, fh, tw // 2, self.color, filled=True)
+            kx = self.x + self.w // 2
+            fill_circle(kx, ky, kr, self.knob_color)
+            draw_circle(kx, ky, kr, BORDER)
 
-        self.offset_y = int(self.start_offset + (self.end_offset - self.start_offset) * e)
-
-        if t >= 1.0:
-            self.running = False
-            self.offset_y = 0
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled:
             return False
-
-        return True
-
-
-class VirtualKeyboard:
-    """NOTE: calibrated_keys below were tuned for a specific screen
-    resolution/orientation. After switching resolutions, re-run
-    VKTouchCalibrator to get fresh coordinates before relying on touch."""
-
-    TOUCH_RADIUS = 12
-    DEBOUNCE_MS = 200
-
-    calibrated_keys = [
-        {'key': 'Q', 'x': 0, 'y': 132},
-        {'key': 'W', 'x': 21, 'y': 136},
-        {'key': 'E', 'x': 54, 'y': 136},
-        {'key': 'R', 'x': 91, 'y': 136},
-        {'key': 'T', 'x': 126, 'y': 135},
-        {'key': 'Y', 'x': 161, 'y': 133},
-        {'key': 'U', 'x': 197, 'y': 134},
-        {'key': 'I', 'x': 236, 'y': 136},
-        {'key': 'O', 'x': 271, 'y': 135},
-        {'key': 'P', 'x': 303, 'y': 135},
-        {'key': 'A', 'x': 0, 'y': 169},
-        {'key': 'S', 'x': 25, 'y': 170},
-        {'key': 'D', 'x': 62, 'y': 171},
-        {'key': 'F', 'x': 102, 'y': 171},
-        {'key': 'G', 'x': 142, 'y': 171},
-        {'key': 'H', 'x': 180, 'y': 171},
-        {'key': 'J', 'x': 218, 'y': 173},
-        {'key': 'K', 'x': 257, 'y': 171},
-        {'key': 'L', 'x': 295, 'y': 171},
-        {'key': 'Aa', 'x': 0, 'y': 205},
-        {'key': 'Z', 'x': 28, 'y': 206},
-        {'key': 'X', 'x': 64, 'y': 207},
-        {'key': 'C', 'x': 102, 'y': 205},
-        {'key': 'V', 'x': 140, 'y': 208},
-        {'key': 'B', 'x': 178, 'y': 208},
-        {'key': 'N', 'x': 217, 'y': 207},
-        {'key': 'M', 'x': 257, 'y': 208},
-        {'key': 'DEL', 'x': 292, 'y': 208},
-        {'key': '123', 'x': 29, 'y': 238},
-        {'key': 'SPACE', 'x': 147, 'y': 238},
-        {'key': 'OK', 'x': 256, 'y': 238},
-        {'key': '1', 'x': 0, 'y': 132},
-        {'key': '2', 'x': 20, 'y': 132},
-        {'key': '3', 'x': 53, 'y': 134},
-        {'key': '4', 'x': 88, 'y': 134},
-        {'key': '5', 'x': 126, 'y': 134},
-        {'key': '6', 'x': 161, 'y': 132},
-        {'key': '7', 'x': 196, 'y': 133},
-        {'key': '8', 'x': 236, 'y': 131},
-        {'key': '9', 'x': 269, 'y': 134},
-        {'key': '0', 'x': 304, 'y': 132},
-        {'key': '-', 'x': 0, 'y': 166},
-        {'key': '/', 'x': 25, 'y': 168},
-        {'key': '\\', 'x': 59, 'y': 169},
-        {'key': ':', 'x': 91, 'y': 169},
-        {'key': ';', 'x': 123, 'y': 169},
-        {'key': '(', 'x': 164, 'y': 170},
-        {'key': ')', 'x': 198, 'y': 172},
-        {'key': '_', 'x': 233, 'y': 173},
-        {'key': '|', 'x': 270, 'y': 167},
-        {'key': '+', 'x': 303, 'y': 171},
-        {'key': '.', 'x': 3, 'y': 205},
-        {'key': '@', 'x': 48, 'y': 203},
-        {'key': '#', 'x': 80, 'y': 203},
-        {'key': '$', 'x': 134, 'y': 204},
-        {'key': '&', 'x': 194, 'y': 206},
-        {'key': '%', 'x': 243, 'y': 204},
-        {'key': 'ABC', 'x': 289, 'y': 207},
-    ]
-
-    def __init__(self, width=None, height=120,
-                 text_color=None, key_color=None, border_color=None,
-                 bg_color=None, ok_action=None):
-
-        self.width = width or WIDTH
-        self.height = height
-
-        self.text_color = text_color or WHITE
-        self.key_color = key_color or GRAY
-        self.border_color = border_color or DARK_GRAY
-        self.bg_color = bg_color or GRAY
-
-        self.buffer = ""
-        self.case_upper = False
-        self.symbol_mode = False
-        self.ok_action = ok_action
-
-        self.x = 0
-        self.y = HEIGHT - height
-
-        self.key_buttons = []
-        self.last_touch_ms = 0
-
-        self.active = True
-
-        self._draw_keys()
-
-    def close(self):
-        self.active = False
-        fill_rect(self.x, self.y, self.width, self.height, BLACK)
-
-    def open(self):
-        self.active = True
-        self._draw_keys()
-
-    def _canon(self, label):
-        if len(label) == 1 and label.isalpha():
-            return label.upper()
-        return label
-
-    def _get_layout(self):
-        if self.symbol_mode:
-            return [
-                ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'],
-                ['-', '/', '\\', ':', ';', '(', ')', '_', '|', '+'],
-                ['.', '@', '#', '$', '&', '%', 'ABC'],
-                ['SPACE', 'DEL', 'OK'],
-            ]
-
-        layout = [
-            ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
-            ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L'],
-            ['Aa', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', 'DEL'],
-            ['123', 'SPACE', 'OK'],
-        ]
-
-        if not self.case_upper:
-            lower = []
-            for row in layout:
-                new_row = []
-                for k in row:
-                    new_row.append(k.lower() if (len(k) == 1 and k.isalpha()) else k)
-                lower.append(new_row)
-            return lower
-
-        return layout
-
-    def _draw_keys(self):
-        fill_rect(self.x, self.y, self.width, self.height, self.bg_color)
-        self.key_buttons = []
-
-        layout = self._get_layout()
-        rows = len(layout)
-        rh = self.height // rows
-
-        for r, row in enumerate(layout):
-            cols = len(row)
-            kw = self.width // cols
-
-            for c, label in enumerate(row):
-                kx = self.x + c * kw
-                ky = self.y + r * rh
-                w, h = kw - 2, rh - 2
-                self.key_buttons.append({'x': kx, 'y': ky, 'w': w, 'h': h, 'label': label})
-                self._draw_key(kx, ky, w, h, label)
-
-    def _draw_key(self, x, y, w, h, label):
-        draw_rounded_rect(x, y, w, h, 4, self.key_color)
-        tx = x + (w // 2) - (len(label) * 4)
-        ty = y + (h // 2) - 4
-        draw_text8x8(tx, ty, label, self.text_color, self.key_color)
-
-    def _highlight_key(self, key_btn):
-        x, y, w, h = key_btn['x'], key_btn['y'], key_btn['w'], key_btn['h']
-        fill_rect(x, y, w, h, LIGHT_GRAY)
-        time.sleep(0.05)
-        self._draw_key(x, y, w, h, key_btn['label'])
-
-    def check_touch(self):
-        if not self.active:
-            return
-
-        touch = get_touch()
-        if not touch:
-            return
-
-        now = time.ticks_ms()
-        if self.last_touch_ms and time.ticks_diff(now, self.last_touch_ms) < self.DEBOUNCE_MS:
-            return
-
-        tx, ty = touch
-        layout = self._get_layout()
-
-        active_canon = []
-        for r in layout:
-            for lbl in r:
-                c = self._canon(lbl)
-                if c not in active_canon:
-                    active_canon.append(c)
-
-        best = None
-        best_d2 = 999999
-
-        for entry in self.calibrated_keys:
-            if self._canon(entry['key']) not in active_canon:
-                continue
-            dx = tx - entry['x']
-            dy = ty - entry['y']
-            d2 = dx * dx + dy * dy
-            if d2 < best_d2:
-                best_d2 = d2
-                best = entry
-
-        if not best or best_d2 > (self.TOUCH_RADIUS * self.TOUCH_RADIUS):
-            return
-
-        target = self._canon(best['key'])
-        key_btn = None
-        logical_label = best['key']
-
-        for btn in self.key_buttons:
-            if self._canon(btn['label']) == target:
-                key_btn = btn
-                logical_label = btn['label']
-                break
-
-        self._key_pressed(logical_label, key_btn)
-        self.last_touch_ms = now
-
-    def _key_pressed(self, k, key_btn=None):
-        if key_btn:
-            self._highlight_key(key_btn)
-
-        if k == "DEL":
-            if self.buffer:
-                self.buffer = self.buffer[:-1]
-        elif k == "SPACE":
-            self.buffer += " "
-        elif k == "OK":
-            if self.ok_action:
-                self.ok_action(self.buffer)
-        elif k == "Aa":
-            self.case_upper = not self.case_upper
-            self._draw_keys()
-        elif k == "123":
-            self.symbol_mode = True
-            self._draw_keys()
-        elif k == "ABC":
-            self.symbol_mode = False
-            self._draw_keys()
-        else:
-            if len(k) == 1:
-                if k.isalpha():
-                    self.buffer += k.upper() if self.case_upper else k.lower()
+        if pt is not None:
+            if self.pressed or self.contains(pt[0], pt[1], margin=6):
+                self.pressed = True
+                if self.w >= self.h:
+                    kr = max(6, self.h // 2 - 2)
+                    ratio = _clamp((pt[0] - (self.x + kr)) / max(1, self.w - 2 * kr), 0.0, 1.0)
                 else:
-                    self.buffer += k
+                    kr = max(6, self.w // 2 - 2)
+                    ratio = 1.0 - _clamp((pt[1] - (self.y + kr)) / max(1, self.h - 2 * kr), 0.0, 1.0)
+                raw = self.min_val + ratio * (self.max_val - self.min_val)
+                if self.step:
+                    raw = round((raw - self.min_val) / self.step) * self.step + self.min_val
+                if isinstance(self.min_val, int) and isinstance(self.max_val, int) and isinstance(self.step, int):
+                    raw = int(round(raw))
+                nv = _clamp(raw, self.min_val, self.max_val)
+                if nv != self.value:
+                    self.value = nv
+                    self.draw()
+                    if self.onchange:
+                        try:
+                            self.onchange(self.value)
+                        except Exception as e:
+                            log_error("UISlider error: {}".format(e))
+                return True
+        else:
+            self.pressed = False
+        return False
 
-    def get_buffer(self, clear=False):
-        out = self.buffer
-        if clear:
-            self.buffer = ""
-        return out
 
-    def clear_buffer(self):
-        self.buffer = ""
+class UIProgressBar(UIWidget):
+    def __init__(self, x, y, w, h=20, value=0, min_val=0, max_val=100,
+                 color=ACCENT_GREEN, bg=SURFACE_ALT, border_color=BORDER,
+                 radius=6, show_percent=False, font=None):
+        super().__init__(x, y, w, h)
+        self.min_val = min_val
+        self.max_val = max_val if max_val > min_val else min_val + 1
+        self.value = _clamp(value, self.min_val, self.max_val)
+        self.color = color
+        self.bg = bg
+        self.border_color = border_color
+        self.radius = radius
+        self.show_percent = show_percent
+        self.font = font
+
+    def set_value(self, val, redraw=True):
+        nv = _clamp(val, self.min_val, self.max_val)
+        if nv != self.value:
+            self.value = nv
+            if redraw and self.visible:
+                self.draw()
+
+    def draw(self):
+        if not self.visible:
+            return
+        r = _clamp(self.radius, 0, min(self.w, self.h) // 2)
+        draw_rounded_rect(self.x, self.y, self.w, self.h, r, self.bg, filled=True)
+        ratio = _clamp((self.value - self.min_val) / (self.max_val - self.min_val), 0.0, 1.0)
+        fw = int(self.w * ratio)
+        if fw > 0:
+            draw_rounded_rect(self.x, self.y, fw, self.h, min(r, fw // 2), self.color, filled=True)
+        if self.border_color is not None:
+            draw_rounded_rect(self.x, self.y, self.w, self.h, r, self.border_color, filled=False)
+        if self.show_percent:
+            pct = "{}%".format(int(round(ratio * 100)))
+            draw_text_in_rect(self.x, self.y, self.w, self.h, pct, WHITE, TRANSPARENT, self.font, 1)
 
 
-class VKTouchCalibrator:
-    """Touch calibrator for VirtualKeyboard. Run this after switching
-    resolution/orientation — the shipped calibrated_keys won't match."""
+class UIGauge(UIWidget):
+    def __init__(self, cx, cy, r=48, value=0, min_val=0, max_val=100,
+                 thickness=10, color=ACCENT_BLUE, bg=SURFACE_ALT,
+                 text_color=WHITE, label="", unit="", font=None):
+        super().__init__(cx - r, cy - r, r * 2, r * 2)
+        self.min_val = min_val
+        self.max_val = max_val if max_val > min_val else min_val + 1
+        self.value = _clamp(value, self.min_val, self.max_val)
+        self.thickness = max(2, int(thickness))
+        self.color = color
+        self.bg = bg
+        self.text_color = text_color
+        self.label = str(label)
+        self.unit = str(unit)
+        self.font = font
 
-    def __init__(self, vk, samples_per_key=5):
-        self.vk = vk
-        self.samples_per_key = samples_per_key
+    def set_value(self, val, redraw=True):
+        nv = _clamp(val, self.min_val, self.max_val)
+        if nv != self.value:
+            self.value = nv
+            if redraw and self.visible:
+                self.draw()
 
-        self.bg = background
-        self.highlight = LIGHT_GRAY
-        self.border = WHITE
-        self.text = WHITE
+    def draw(self):
+        if not self.visible:
+            return
+        r_out = min(self.w, self.h) // 2
+        cx = self.x + self.w // 2
+        cy = self.y + self.h // 2
+        thick = min(self.thickness, max(2, r_out // 2))
+        r_in = max(1, r_out - thick)
 
-    def _msg(self, text):
-        fill_rect(0, 0, WIDTH, 16, self.bg)
-        draw_text8x8(2, 4, text, self.text, self.bg)
+        draw_ring(cx, cy, r_in, r_out, self.bg, 135, 405)
+        ratio = _clamp((self.value - self.min_val) / (self.max_val - self.min_val), 0.0, 1.0)
+        sweep = int(270 * ratio)
+        if sweep > 0:
+            draw_ring(cx, cy, r_in, r_out, self.color, 135, 135 + sweep)
 
-    def _wait_for_touch(self):
-        while True:
-            p = get_touch()
-            if p:
-                return p
-            time.sleep_ms(10)
+        fill_circle(cx, cy, max(1, r_in - 2), background)
+        val_str = "{}{}".format(self.value, self.unit)
+        _, th = text_size(val_str, self.font, 1)
+        draw_text_centered(cx, cy - th // 2 - (6 if self.label else 0), val_str, self.text_color, background, 1, self.font)
+        if self.label:
+            draw_text_centered(cx, cy + th // 2, self.label, TEXT_MUTED, background, 1, FONT_8X8)
 
-    def _wait_for_release(self):
-        while True:
-            p = get_touch()
-            if not p:
-                return
-            time.sleep_ms(10)
 
-    def _highlight_button(self, btn):
-        x, y, w, h = btn["x"], btn["y"], btn["w"], btn["h"]
-        fill_rect(x, y, w, h, self.highlight)
-        moclcd.draw_rect(x, y, w, h, self.border)
+class UINumberBox(UIWidget):
+    """[- / value / +] numeric stepper widget."""
 
-    def _redraw_button(self, btn):
-        self.vk._draw_key(btn["x"], btn["y"], btn["w"], btn["h"], btn["label"])
+    def __init__(self, x, y, w=120, h=36, value=0, min_val=0, max_val=100, step=1,
+                 onchange=None, color=SURFACE_ALT, btn_color=ACCENT_BLUE, text_color=WHITE, font=None):
+        super().__init__(x, y, w, h)
+        self.min_val = min_val
+        self.max_val = max_val
+        self.step = step
+        self.value = _clamp(value, min_val, max_val)
+        self.onchange = onchange
+        self.color = color
+        self.btn_color = btn_color
+        self.text_color = text_color
+        self.font = font
+        self._active_side = 0
 
-    def _find_button_by_label(self, label):
-        for btn in self.vk.key_buttons:
-            if btn["label"] == label:
-                return btn
-        return None
+    def set_value(self, val, redraw=True):
+        nv = _clamp(val, self.min_val, self.max_val)
+        if nv != self.value:
+            self.value = nv
+            if redraw and self.visible:
+                self.draw()
 
-    def _collect_unique_labels(self):
-        labels = []
-        seen = set()
-        for btn in self.vk.key_buttons:
-            lab = btn["label"]
-            if not lab:
-                continue
-            if lab not in seen:
-                seen.add(lab)
-                labels.append(lab)
-        return labels
+    def draw(self):
+        if not self.visible:
+            return
+        bw = min(self.h, self.w // 3)
+        draw_rounded_rect(self.x, self.y, self.w, self.h, 6, self.color, filled=True)
+        draw_rounded_rect(self.x, self.y, bw, self.h, 6,
+                           darken(self.btn_color, 60) if self._active_side == -1 else self.btn_color, filled=True)
+        draw_rounded_rect(self.x + self.w - bw, self.y, bw, self.h, 6,
+                          darken(self.btn_color, 60) if self._active_side == 1 else self.btn_color, filled=True)
+        draw_text_in_rect(self.x, self.y, bw, self.h, "-", WHITE, TRANSPARENT, self.font, 1)
+        draw_text_in_rect(self.x + self.w - bw, self.y, bw, self.h, "+", WHITE, TRANSPARENT, self.font, 1)
+        draw_text_in_rect(self.x + bw, self.y, self.w - 2 * bw, self.h,
+                          str(self.value), self.text_color, self.color, self.font, 1)
 
-    def _calibrate_current_layout(self, layout_name):
-        results = []
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled:
+            return False
+        bw = min(self.h, self.w // 3)
+        if pt is not None:
+            if self.contains(pt[0], pt[1]):
+                self.pressed = True
+                if pt[0] < self.x + bw:
+                    self._active_side = -1
+                elif pt[0] > self.x + self.w - bw:
+                    self._active_side = 1
+                else:
+                    self._active_side = 0
+                self.draw()
+                return True
+        else:
+            if self.pressed:
+                self.pressed = False
+                side = self._active_side
+                self._active_side = 0
+                if side != 0:
+                    nv = _clamp(self.value + side * self.step, self.min_val, self.max_val)
+                    if nv != self.value:
+                        self.value = nv
+                        if self.onchange:
+                            try:
+                                self.onchange(self.value)
+                            except Exception as e:
+                                log_error("UINumberBox error: {}".format(e))
+                self.draw()
+                return True
+        return False
 
-        labels = self._collect_unique_labels()
-        self._msg("Calibrating {} layout...".format(layout_name))
-        time.sleep_ms(400)
 
-        for key in labels:
-            btn = self._find_button_by_label(key)
-            if not btn:
-                continue
+class UIList(UIWidget):
+    """Scrollable/selectable list of items."""
 
-            self._highlight_button(btn)
-            self._msg("Touch '{}' {}x".format(key, self.samples_per_key))
+    def __init__(self, x, y, w, h, items=None, onselect=None,
+                 item_h=30, bg=SURFACE, fg=WHITE, sel_bg=ACCENT_BLUE,
+                 border=BORDER, font=None):
+        super().__init__(x, y, w, h)
+        self.items = list(items) if items else []
+        self.onselect = onselect
+        self.item_h = max(18, int(item_h))
+        self.bg = bg
+        self.fg = fg
+        self.sel_bg = sel_bg
+        self.border = border
+        self.font = font
+        self.selected = -1
+        self.scroll = 0
+        self._touch_y0 = None
 
-            xs = []
-            ys = []
+    def set_items(self, items, redraw=True):
+        self.items = list(items)
+        self.selected = -1
+        self.scroll = 0
+        if redraw and self.visible:
+            self.draw()
 
-            for i in range(self.samples_per_key):
-                p = self._wait_for_touch()
-                xs.append(p[0])
-                ys.append(p[1])
+    def draw(self):
+        if not self.visible:
+            return
+        fill_rect(self.x, self.y, self.w, self.h, self.bg)
+        if self.border is not None:
+            draw_rect(self.x, self.y, self.w, self.h, self.border, fill=False)
+        vis_rows = max(1, self.h // self.item_h)
+        for i in range(vis_rows):
+            idx = self.scroll + i
+            if idx >= len(self.items):
+                break
+            ry = self.y + i * self.item_h
+            sel = (idx == self.selected)
+            rbg = self.sel_bg if sel else self.bg
+            if sel:
+                fill_rect(self.x + 1, ry + 1, self.w - 2, self.item_h - 1, rbg)
+            txt = str(self.items[idx])
+            _, th = text_size(txt, self.font, 1)
+            draw_text(self.x + 8, ry + max(0, (self.item_h - th) // 2), txt, self.fg, rbg, self.font, 1)
+            if i < vis_rows - 1:
+                draw_hline(self.x + 4, ry + self.item_h - 1, self.w - 8, BORDER)
 
-                self._wait_for_release()
-                time.sleep_ms(80)
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled:
+            return False
+        if pt is not None:
+            if self.contains(pt[0], pt[1]):
+                self.pressed = True
+                row = (pt[1] - self.y) // self.item_h
+                idx = self.scroll + row
+                if 0 <= idx < len(self.items) and idx != self.selected:
+                    self.selected = idx
+                    self.draw()
+                return True
+        else:
+            if self.pressed:
+                self.pressed = False
+                if 0 <= self.selected < len(self.items) and self.onselect:
+                    try:
+                        self.onselect(self.selected, self.items[self.selected])
+                    except TypeError:
+                        self.onselect(self.selected)
+                    except Exception as e:
+                        log_error("UIList error: {}".format(e))
+                return True
+        return False
 
-            self._redraw_button(btn)
 
-            avg_x = sum(xs) // len(xs)
-            avg_y = sum(ys) // len(ys)
+class UIDropdown(UIWidget):
+    """Collapsible dropdown selector."""
 
-            print("[VKTouchCalibrator] {} '{}' avg: ({}, {})".format(layout_name, key, avg_x, avg_y))
+    def __init__(self, x, y, w, h=34, options=None, selected=0, onchange=None,
+                 bg=SURFACE_ALT, fg=WHITE, accent=ACCENT_BLUE, font=None):
+        super().__init__(x, y, w, h)
+        self.options = [str(o) for o in (options or ["Option 1"])]
+        self.selected = _clamp(selected, 0, len(self.options) - 1)
+        self.onchange = onchange
+        self.bg = bg
+        self.fg = fg
+        self.accent = accent
+        self.font = font
+        self.expanded = False
+        self._base_h = self.h
 
-            results.append({"key": key, "x": avg_x, "y": avg_y})
-            time.sleep_ms(150)
+    def draw(self):
+        if not self.visible:
+            return
+        draw_rounded_rect(self.x, self.y, self.w, self._base_h, 6, self.bg, filled=True)
+        draw_rounded_rect(self.x, self.y, self.w, self._base_h, 6, BORDER, filled=False)
+        cur = self.options[self.selected] if self.options else ""
+        _, th = text_size(cur, self.font, 1)
+        draw_text(self.x + 10, self.y + max(0, (self._base_h - th) // 2), cur, self.fg, self.bg, self.font, 1)
+        ax = self.x + self.w - 18
+        ay = self.y + self._base_h // 2
+        draw_triangle(ax - 5, ay - 3, ax + 5, ay - 3, ax, ay + 4, self.fg, filled=True)
 
-        return results
+        if self.expanded:
+            vis = min(len(self.options), max(1, (HEIGHT - (self.y + self._base_h)) // self._base_h))
+            dh = vis * self._base_h
+            dy = self.y + self._base_h
+            fill_rect(self.x, dy, self.w, dh, SURFACE)
+            draw_rect(self.x, dy, self.w, dh, self.accent, fill=False)
+            for i in range(vis):
+                ry = dy + i * self._base_h
+                bgc = self.accent if i == self.selected else SURFACE
+                if i == self.selected:
+                    fill_rect(self.x + 1, ry + 1, self.w - 2, self._base_h - 1, bgc)
+                draw_text(self.x + 10, ry + max(0, (self._base_h - th) // 2),
+                          self.options[i], self.fg, bgc, self.font, 1)
 
-    def run(self):
-        fill_rect(0, 0, WIDTH, 16, self.bg)
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled:
+            return False
+        if pt is not None:
+            vis = min(len(self.options), max(1, (HEIGHT - (self.y + self._base_h)) // self._base_h))
+            full_h = self._base_h * (1 + (vis if self.expanded else 0))
+            if _point_in_rect(pt[0], pt[1], self.x, self.y, self.w, full_h):
+                self.pressed = True
+                self._last_pt = pt
+                return True
+            elif self.expanded:
+                self.expanded = False
+                if active_screen:
+                    active_screen.draw()
+                else:
+                    self.draw()
+        else:
+            if self.pressed:
+                self.pressed = False
+                pt0 = getattr(self, "_last_pt", None)
+                if pt0 is not None:
+                    if pt0[1] < self.y + self._base_h:
+                        self.expanded = not self.expanded
+                        if not self.expanded and active_screen:
+                            active_screen.draw()
+                        else:
+                            self.draw()
+                    elif self.expanded:
+                        idx = (pt0[1] - (self.y + self._base_h)) // self._base_h
+                        if 0 <= idx < len(self.options):
+                            self.selected = idx
+                            if self.onchange:
+                                try:
+                                    self.onchange(self.selected, self.options[self.selected])
+                                except TypeError:
+                                    self.onchange(self.selected)
+                        self.expanded = False
+                        if active_screen:
+                            active_screen.draw()
+                        else:
+                            self.draw()
+                return True
+        return False
 
-        print("[VKTouchCalibrator] Starting calibration...")
-        self._msg("Starting VK calibration...")
-        time.sleep_ms(500)
 
-        self.vk.symbol_mode = False
-        self.vk.case_upper = True
-        self.vk._draw_keys()
-        res_abc = self._calibrate_current_layout("ABC")
+class UITabs(UIWidget):
+    """Segmented tab bar at top or bottom of screen."""
 
-        self.vk.symbol_mode = True
-        self.vk.case_upper = True
-        self.vk._draw_keys()
-        res_sym = self._calibrate_current_layout("123/sym")
+    def __init__(self, x, y, w, h=36, tabs=None, selected=0, onchange=None,
+                 bg=SURFACE, active_bg=ACCENT_BLUE, fg=WHITE, font=None):
+        super().__init__(x, y, w, h)
+        self.tabs = [str(t) for t in (tabs or ["Tab 1", "Tab 2"])]
+        self.selected = _clamp(selected, 0, max(0, len(self.tabs) - 1))
+        self.onchange = onchange
+        self.bg = bg
+        self.active_bg = active_bg
+        self.fg = fg
+        self.font = font
 
-        all_res = res_abc + res_sym
+    def draw(self):
+        if not self.visible or not self.tabs:
+            return
+        draw_rounded_rect(self.x, self.y, self.w, self.h, 6, self.bg, filled=True)
+        n = len(self.tabs)
+        tw = self.w // n
+        for i, title in enumerate(self.tabs):
+            tx = self.x + i * tw
+            cw = (self.w - i * tw) if i == n - 1 else tw
+            if i == self.selected:
+                draw_rounded_rect(tx + 2, self.y + 2, cw - 4, self.h - 4, 5, self.active_bg, filled=True)
+            draw_text_in_rect(tx, self.y, cw, self.h, title,
+                              self.fg if i == self.selected else TEXT_MUTED,
+                              self.active_bg if i == self.selected else self.bg, self.font, 1)
 
-        final = []
-        seen = set()
-        for item in all_res:
-            k = item["key"]
-            if k in seen:
-                continue
-            seen.add(k)
-            final.append(item)
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled or not self.tabs:
+            return False
+        if pt is not None and self.contains(pt[0], pt[1]):
+            self.pressed = True
+            idx = _clamp((pt[0] - self.x) * len(self.tabs) // max(1, self.w), 0, len(self.tabs) - 1)
+            if idx != self.selected:
+                self.selected = idx
+                self.draw()
+                if self.onchange:
+                    try:
+                        self.onchange(self.selected, self.tabs[self.selected])
+                    except TypeError:
+                        self.onchange(self.selected)
+            return True
+        else:
+            self.pressed = False
+        return False
 
-        print("\n[VKTouchCalibrator] Done. Full calibrated_keys block:\n")
-        print("calibrated_keys = [")
-        for item in final:
-            print("    {{'key': {!r}, 'x': {}, 'y': {}}},".format(item["key"], item["x"], item["y"]))
-        print("]\n")
-        print("[VKTouchCalibrator] Paste into VirtualKeyboard.calibrated_keys if you want to use it")
 
-        self._msg("Calibration complete.")
-        return final
+class UIChart(UIWidget):
+    """Real-time line or bar chart widget."""
+
+    def __init__(self, x, y, w, h, data=None, min_val=0, max_val=100,
+                 mode="line", color=ACCENT_GREEN, bg=SURFACE, grid_color=BORDER):
+        super().__init__(x, y, w, h)
+        self.data = list(data) if data else []
+        self.min_val = min_val
+        self.max_val = max_val if max_val > min_val else min_val + 1
+        self.mode = mode
+        self.color = color
+        self.bg = bg
+        self.grid_color = grid_color
+
+    def push(self, val, max_points=32, redraw=True):
+        self.data.append(val)
+        if len(self.data) > max_points:
+            self.data.pop(0)
+        if redraw and self.visible:
+            self.draw()
+
+    def draw(self):
+        if not self.visible:
+            return
+        fill_rect(self.x, self.y, self.w, self.h, self.bg)
+        draw_rect(self.x, self.y, self.w, self.h, self.grid_color, fill=False)
+        for g in range(1, 4):
+            gy = self.y + (self.h * g) // 4
+            draw_hline(self.x + 1, gy, self.w - 2, DARK_GRAY)
+        if not self.data:
+            return
+        n = len(self.data)
+        span = self.max_val - self.min_val
+        if self.mode == "bar":
+            bw = max(2, (self.w - 8) // max(1, n))
+            for i, v in enumerate(self.data):
+                ratio = _clamp((v - self.min_val) / span, 0.0, 1.0)
+                bh = int((self.h - 6) * ratio)
+                bx = self.x + 4 + i * bw
+                by = self.y + self.h - 3 - bh
+                if bh > 0:
+                    fill_rect(bx, by, max(1, bw - 2), bh, self.color)
+        else:
+            if n == 1:
+                ratio = _clamp((self.data[0] - self.min_val) / span, 0.0, 1.0)
+                py = self.y + self.h - 3 - int((self.h - 6) * ratio)
+                fill_circle(self.x + self.w // 2, py, 3, self.color)
+            else:
+                prev_x = prev_y = None
+                for i, v in enumerate(self.data):
+                    ratio = _clamp((v - self.min_val) / span, 0.0, 1.0)
+                    px = self.x + 4 + i * (self.w - 8) // (n - 1)
+                    py = self.y + self.h - 3 - int((self.h - 6) * ratio)
+                    if prev_x is not None:
+                        draw_line(prev_x, prev_y, px, py, self.color, 2)
+                    prev_x, prev_y = px, py
+
+
+class UICard(UIWidget):
+    """Panel / container widget that groups child widgets."""
+
+    def __init__(self, x, y, w, h, title=None, bg=SURFACE, border=BORDER,
+                 title_color=WHITE, radius=10, font=None):
+        super().__init__(x, y, w, h)
+        self.title = title
+        self.bg = bg
+        self.border = border
+        self.title_color = title_color
+        self.radius = radius
+        self.font = font
+        self.children = []
+
+    def add(self, widget):
+        widget.parent = self
+        if widget not in self.children:
+            self.children.append(widget)
+        return widget
+
+    def draw(self):
+        if not self.visible:
+            return
+        r = _clamp(self.radius, 0, min(self.w, self.h) // 2)
+        draw_rounded_rect(self.x, self.y, self.w, self.h, r, self.bg, filled=True)
+        if self.border is not None:
+            draw_rounded_rect(self.x, self.y, self.w, self.h, r, self.border, filled=False)
+        if self.title:
+            draw_text(self.x + 10, self.y + 8, self.title, self.title_color, self.bg, self.font, 1)
+            _, th = text_size(self.title, self.font, 1)
+            draw_hline(self.x + 6, self.y + th + 12, max(1, self.w - 12), BORDER)
+        for c in self.children:
+            if c.visible:
+                c.draw()
+
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled:
+            return False
+        for c in reversed(self.children):
+            if c.handle_touch(pt):
+                return True
+        return False
+
+
+UIPanel = UICard
+
+
+class UIHeader(UIWidget):
+    """Full-width top navigation/status header that automatically spans WIDTH."""
+
+    def __init__(self, title="", height=32, bg=SURFACE, fg=WHITE, right_text="", font=None):
+        super().__init__(0, 0, WIDTH, height)
+        self.title = str(title)
+        self.right_text = str(right_text)
+        self.bg = bg
+        self.fg = fg
+        self.font = font
+
+    def _relayout(self, old_w, old_h, new_w, new_h):
+        self.x = 0
+        self.y = 0
+        self.w = new_w
+
+    def draw(self):
+        if not self.visible:
+            return
+        fill_rect(0, 0, WIDTH, self.h, self.bg)
+        draw_hline(0, self.h - 1, WIDTH, BORDER)
+        _, th = text_size(self.title, self.font, 1)
+        ty = max(0, (self.h - th) // 2)
+        draw_text(10, ty, self.title, self.fg, self.bg, self.font, 1)
+        if self.right_text:
+            draw_text_right(WIDTH - 10, ty, self.right_text, TEXT_MUTED, self.bg, 1, self.font)
+
+
+class UIModal(UICard):
+    """Centered dialog modal with OK/Cancel actions."""
+
+    def __init__(self, title="Confirm", message="", w=240, h=140,
+                 on_ok=None, on_cancel=None, font=None):
+        w = min(w, WIDTH - 24)
+        h = min(h, HEIGHT - 24)
+        super().__init__((WIDTH - w) // 2, (HEIGHT - h) // 2, w, h,
+                         title=title, bg=SURFACE_ALT, border=WHITE, radius=10, font=font)
+        self.message = str(message)
+        self.on_ok = on_ok
+        self.on_cancel = on_cancel
+        bw = (w - 30) // 2
+        by = self.y + self.h - 42
+        self.btn_ok = UIButton(self.x + 10, by, bw, 32, "OK",
+                               action=self._do_ok, color=ACCENT_BLUE, font=font)
+        self.btn_cancel = UIButton(self.x + 20 + bw, by, bw, 32, "Cancel",
+                                   action=self._do_cancel, color=DARK_GRAY, font=font)
+        self.add(self.btn_ok)
+        self.add(self.btn_cancel)
+
+    def _do_ok(self):
+        self.hide()
+        if self.on_ok:
+            self.on_ok()
+
+    def _do_cancel(self):
+        self.hide()
+        if self.on_cancel:
+            self.on_cancel()
+
+    def draw(self):
+        if not self.visible:
+            return
+        super().draw()
+        if self.message:
+            draw_text_in_rect(self.x + 10, self.y + 30, self.w - 20, self.h - 76,
+                              self.message, WHITE, self.bg, self.font, 1)
+
+
+class UIScreen:
+    """Screen manager grouping widgets and handling automatic orientation updates."""
+
+    def __init__(self, bg=BLACK, widgets=None):
+        self.bg = bg
+        self.widgets = list(widgets) if widgets else []
+
+    def add(self, widget):
+        if widget not in self.widgets:
+            self.widgets.append(widget)
+        return widget
+
+    def show(self):
+        global active_screen
+        active_screen = self
+        set_background(self.bg)
+        self.draw()
+
+    def draw(self):
+        clear(self.bg)
+        for w in self.widgets:
+            if w.visible:
+                w.draw()
+
+    def poll(self):
+        return poll(self.widgets)
+
+
+Screen = UIScreen
+
+
+def set_screen(screen):
+    screen.show()
+
+
+def poll(widgets=None):
+    """Sample touch once and dispatch to widgets (top-most first)."""
+    if widgets is None:
+        widgets = active_screen.widgets if active_screen is not None else _registered_widgets
+    pt = get_touch()
+    handled = False
+    for w in reversed(widgets):
+        if w.handle_touch(pt):
+            handled = True
+            if pt is not None:
+                break
+    return handled
