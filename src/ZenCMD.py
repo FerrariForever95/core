@@ -7,13 +7,18 @@ import time
 
 try:
     import urandom
-except ImportError:
+except ImportError:                       # pragma: no cover - desktop fallback
     import random as urandom
 
 try:
     import network as _recovery_network
 except ImportError:
     _recovery_network = None
+
+try:
+    import netservice as _netservice
+except ImportError:
+    _netservice = None
 
 try:
     import urequests as _recovery_urequests
@@ -58,16 +63,19 @@ wifi_password="{wifi_password}"
 """
 
     def __init__(self):
-        self._creds = {}
+        self._creds = {}          # kept only in RAM until recovery completes
         self._pkgtable = None
         self._results = {"installed": [], "updated_flagged": [], "failed": []}
-        self.zeno_regenerated = False
+        self.zeno_regenerated = False   # True only if run() wrote a brand-new zeno.py
 
     def help(self):
-        print("  recover                Rebuild core OS components from pkgtable.json")
-        print("                         Works even if Services/PackageManager/Git/")
-        print("                         Network/zeno.py are missing or corrupted.")
+        print("  recover               Rebuild core OS components from pkgtable.json")
+        print("                        Works even if Services/PackageManager/Git/")
+        print("                        Network/zeno.py are missing or corrupted.")
 
+    # =============================================
+    # entry point
+    # =============================================
     def run(self):
         print("\n=== Zeno OS Recovery ===")
         print("Rebuilding core OS components from pkgtable.json.\n")
@@ -120,11 +128,15 @@ wifi_password="{wifi_password}"
                 self._write_zeno_py(self._creds)
                 self.zeno_regenerated = True
                 print("[recover] Generated new zeno.py.")
+            # credentials only ever lived in self._creds / locals -- drop them now
             self._creds = {}
 
         print("=== Recovery complete ===\n")
         return not self._results["failed"]
 
+    # =============================================
+    # prompts (only used when zeno.py is missing)
+    # =============================================
     def _prompt_all(self):
         creds = {}
         creds["user"] = input("Username: ").strip()
@@ -139,6 +151,9 @@ wifi_password="{wifi_password}"
         password = input("Wi-Fi Password: ").strip()
         return ssid, password
 
+    # =============================================
+    # zeno.py handling -- read-only, never imports it (it may be broken)
+    # =============================================
     def _file_exists(self, path):
         try:
             os.stat(path)
@@ -179,12 +194,17 @@ wifi_password="{wifi_password}"
         with open(self.ZENO_PATH, "w") as f:
             f.write(content)
 
+    # =============================================
+    # Wi-Fi -- connects directly via the 'network' module, never via
+    # the Network service
+    # =============================================
     def _connect_wifi(self, ssid, password):
         if not ssid:
             print("[recover] No SSID available to connect with.")
             return False
         if _recovery_network is None:
-            print("[recover] 'network' module unavailable on this platform -- continuing.")
+            print("[recover] 'network' module unavailable on this platform -- "
+                  "assuming an existing/wired connection and continuing.")
             return True
         try:
             wlan = _recovery_network.WLAN(_recovery_network.STA_IF)
@@ -203,6 +223,9 @@ wifi_password="{wifi_password}"
             print("[recover] Wi-Fi error: {}".format(e))
             return False
 
+    # =============================================
+    # HTTP / pkgtable
+    # =============================================
     def _download_pkgtable(self):
         raw = self._http_get_text(self.PKGTABLE_URL)
         if raw is None:
@@ -234,6 +257,9 @@ wifi_password="{wifi_password}"
         return "https://raw.githubusercontent.com/{}/{}/{}/{}".format(
             author, repo, branch or "main", file_path)
 
+    # =============================================
+    # filesystem helpers -- raw os/open only, mkdir -p style
+    # =============================================
     def _mkdirs(self, path):
         parts = [p for p in path.split("/") if p]
         cur = ""
@@ -242,7 +268,7 @@ wifi_password="{wifi_password}"
             try:
                 os.mkdir(cur)
             except OSError:
-                pass
+                pass  # already exists
 
     def _full_path(self, install_path, filename):
         return "{}/{}".format((install_path or "/").rstrip("/"), filename)
@@ -274,6 +300,9 @@ wifi_password="{wifi_password}"
         except OSError:
             return False
 
+    # =============================================
+    # pkglist.json (read/write directly -- no PackageManager/FileManager)
+    # =============================================
     def _load_pkglist(self):
         try:
             with open(self.PKGLIST_PATH) as f:
@@ -289,6 +318,9 @@ wifi_password="{wifi_password}"
         except OSError as e:
             print("[recover] Could not write pkglist.json: {}".format(e))
 
+    # =============================================
+    # per-package restore, with dependency resolution
+    # =============================================
     def _restore_package(self, name, installed, seen, chain=None):
         if name in seen:
             return name not in self._results["failed"]
@@ -326,12 +358,15 @@ wifi_password="{wifi_password}"
                 same_version = record.get("version") == entry.get("version")
 
                 if healthy and same_version:
-                    return True
+                    return True  # already good, nothing to do
 
                 if healthy and not same_version:
+                    # present and readable, just out of date -- don't
+                    # clobber it, just flag it for a normal update later
                     record["update needed"] = True
                     self._results["updated_flagged"].append(name)
                     return True
+                # else: missing or corrupted -- fall through and repair it
 
             data = self._http_get_text(self._raw_url(
                 entry.get("author"), entry.get("repository"), entry.get("branch"), entry.get("file")))
@@ -365,8 +400,16 @@ wifi_password="{wifi_password}"
 
 
 # =================================================
-# SERVICE LOADING
+# SERVICE LOADING  (must never prevent ZenCMD from booting)
 # =================================================
+# ZenCMD has to be able to boot -- and always offer 'recover' -- even if
+# /Services is missing entirely, or any single class inside it is missing
+# or broken. This is wrapped in a function (rather than run once at
+# import time) so the exact same loading logic can be re-run right after
+# a successful 'recover': once Recovery has repaired the files on disk,
+# ZenCMD re-imports them and drops back into a normal, non-degraded boot
+# state without needing an actual device reboot.
+
 class _NullLogger:
     def debug(self, msg, source=None):
         pass
@@ -384,6 +427,9 @@ class _FallbackZeno:
 
 
 def _fresh_import(name):
+    """Import (or re-import) a top-level module, dropping any cached
+    copy first so files that 'recover' just rewrote are actually picked
+    up instead of stale bytecode already sitting in sys.modules."""
     for mod_name in [k for k in list(sys.modules.keys()) if k == name or k.startswith(name + ".")]:
         try:
             del sys.modules[mod_name]
@@ -393,7 +439,9 @@ def _fresh_import(name):
 
 
 def _load_services():
-    global Services, Network, Disk, downloadhelper, system, Logger, Git, WifiManager
+    """(Re)load /Services and zeno.py and rebuild every piece of shell
+    state that depends on them. Returns True if Services loaded cleanly."""
+    global Services, Network, Disk, downloadhelper, system, Logger, Git,WifiManager
     global BluetoothManager, BootConfig, usermanager, FileManager, PackageManager
     global zeno, logger, _um, _fm, _pm, MODULES
 
@@ -428,11 +476,25 @@ def _load_services():
 
     logger = Logger() if Logger else _NullLogger()
     _um = usermanager() if usermanager else None
-    _fm = FileManager() if FileManager else None
-    _pm = PackageManager() if PackageManager else None
+    _fm = FileManager() if FileManager else None   # <-- ALL filesystem access goes through here when available
+    _pm = PackageManager() if PackageManager else None   # cheap now -- packages load lazily on first run(), not here
 
+    # WifiManager (the merged Services.py's replacement for the old
+    # "Network" class) requires a Logger instance -- MODULES[name]()
+    # below always calls its entry with zero args, so we can't register
+    # the class itself. Wrap it in a zero-arg factory that closes over
+    # the logger we just built, matching how every other MODULES entry
+    # gets instantiated.
     Network = (lambda cls=_WifiManagerCls: cls(logger)) if _WifiManagerCls is not None else None
 
+    # NOTE: "encrypter": ZenZip was removed -- ZenZip is never imported
+    # anywhere in Services, so leaving it wired in here would crash ZenCMD
+    # at import time with NameError the moment MODULES is built. Re-add it
+    # once a real ZenZip implementation exists and is imported above.
+    #
+    # Only services that actually loaded are registered -- if Services is
+    # missing or partially broken, "enter <module>" / "pkg install ..."
+    # just reports "No such module" instead of crashing ZenCMD.
     all_modules = {
         "net":          Network,
         "disk":         Disk,
@@ -447,42 +509,75 @@ def _load_services():
         "iot":          IoTManager
     }
     MODULES = {k: v for k, v in all_modules.items() if v is not None}
+
     return Services is not None
 
 
+# initial boot load
 _load_services()
 
 # =================================================
-# VERSION & PRIVILEGE CONFIG
+# VERSION
 # =================================================
-ZENCMD_VERSION = "3.90"
+ZENCMD_VERSION = "3.81"
 ZENOS_NAME     = "Zeno OS"
 
+# Commands that require Super Mode.
+# Checked as prefix-match so "bootmgr <anything>" is caught.
+# NOTE: this list is matched against the *bare command word* (either a
+# top-level builtin, or the method name called on a module), so it also
+# gates package-manager methods -- "install", "uninstall", "reinstall"
+# and "update" all require Super Mode whether typed as "pkg install foo",
+# as a one-shot module call, or from inside "enter pkg".
+#
+# 'recover' is deliberately NOT in this list: it must remain usable even
+# when usermanager/Super Mode itself is unavailable (e.g. Services is gone).
 PRIVILEGED_PREFIXES = (
-    "bootmgr", "mount", "umount", "unmount", "format", "mkfs",
-    "shutdown", "reboot", "factory", "removeuser", "elevate",
-    "delevate", "service", "reload", "reloadmodule", "kernel",
-    "driver", "pkg", "install", "remove", "uninstall", "reinstall",
-    "update", "mountzfs", "bootlog",
+    "bootmgr",
+    "mount",
+    "umount",
+    "unmount",
+    "format",
+    "mkfs",
+    "shutdown",
+    "reboot",
+    "factory",
+    "removeuser",
+    "elevate",
+    "delevate",
+    "service",
+    "reload",
+    "reloadmodule",
+    "kernel",
+    "driver",
+    "pkg",
+    "install",
+    "remove",
+    "uninstall",
+    "reinstall",
+    "update",
+    "mountzfs",
+    "bootlog",
 )
 
 # =================================================
 # STATE
 # =================================================
-current_path    = "/Home"
-active_module   = None
-module_instance = None
+current_path   = "/Home"
+active_module  = None        # str key
+module_instance = None       # live object
 
-history_log = []
-aliases     = {}
-env_vars    = {}
-jobs        = []
+history_log    = []          # command history
+aliases        = {}          # user-defined aliases
+env_vars       = {}          # shell environment
+jobs           = []          # background job stubs
 
-_PIPE_IN    = None
+_PIPE_IN       = None        # list[str] of lines fed in from a "|" pipeline, else None
 
 # =================================================
 # PRIVILEGE HELPERS
 # =================================================
+
 def _is_super():
     if _um is None:
         return False
@@ -497,32 +592,38 @@ def _require_super(cmd_word):
         if cmd_word == prefix or cmd_word.startswith(prefix + " "):
             if not _is_super():
                 print("Access denied. Command requires Super Mode. Use 'super' first.")
-                return True
+                return True   # caller should skip
     return False
 
 
 # =================================================
 # PROMPT
 # =================================================
+
 def _prompt():
     d = current_path.rstrip("/") or ""
     if d.startswith("/"):
-        d = d[1:]
+        d = d[1:]                   # strip leading slash for display
 
     if _is_super():
         path_part = f"root/{d}" if d else "root/"
-        return f"{path_part}#:$ "
+        return f"{path_part}#:$"
     else:
-        path_part = f"{zeno.user}/{d}:$" if d else f"{zeno.user}/:$ "
+        path_part = f"{zeno.user}/{d}:$" if d else f"{zeno.user}/:$"
         if active_module:
             return f"{path_part}[{active_module}]> "
-        return f"{path_part}> "
+        return f"{path_part}>"
 
 
 # =================================================
-# PATH HELPERS
+# PATH HELPERS  (pure string helpers -- no I/O here; all real I/O goes
+# through FileManager, which does its own normalisation internally)
 # =================================================
+
 def _normalize_path(path):
+    """Collapse '.', '..' and repeated slashes into a clean absolute path.
+    This is what makes 'cd ..', 'cd ../foo', 'cat ../x.txt' etc. actually work --
+    previously paths were just string-concatenated and '..' was never resolved."""
     parts = []
     for p in path.split("/"):
         if p in ("", "."):
@@ -536,6 +637,7 @@ def _normalize_path(path):
 
 
 def _abs(path):
+    """Resolve a path to a normalized absolute path using current_path."""
     if path.startswith("/"):
         combined = path
     else:
@@ -565,10 +667,13 @@ def _is_dir(path):
 
 
 # =================================================
-# PROGRAM SEARCH / EXECUTION
+# PROGRAM SEARCH / EXECUTION  (routed through FileManager so read/exec
+# permission is actually enforced, not just faked with a path guard)
 # =================================================
+
 def _fs_file(path):
-    if not _fm or not _fm.exists(path):
+    """True if path exists and is a plain file (not a directory)."""
+    if not _fm.exists(path):
         return False
     try:
         return _fm.metadata(path).get("type") != "directory"
@@ -590,8 +695,9 @@ def resolve_program(name, cwd):
         if _fs_file(p):
             return p
 
+    print("[SYSRUN] Searching filesystem...")
     stack = ["/"]
-    seen = set()
+    seen  = set()
     while stack:
         base = stack.pop()
         if base in seen:
@@ -615,6 +721,7 @@ def resolve_program(name, cwd):
 
 
 def run_python_file(path):
+    """Read (with permission enforcement) and exec a .py file."""
     fd = _fm.open(path, "r")
     try:
         code = _fm.read(fd)
@@ -624,124 +731,8 @@ def run_python_file(path):
 
 
 # =================================================
-# ADVANCED PARSER & SHELL PIPELINE
+# DIRECTORY DISPLAY
 # =================================================
-class _OutputCapture:
-    """Enhanced output sink with clean line-splitting and raw-flush fallback."""
-    def __init__(self):
-        self.lines = []
-        self._buf = ""
-
-    def write(self, s):
-        self._buf += str(s)
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
-            self.lines.append(line)
-
-    def flush(self):
-        if self._buf:
-            self.lines.append(self._buf)
-            self._buf = ""
-
-
-def _split(cmd):
-    """Accurately tokenizes arguments while strictly preserving quote strings."""
-    parts = []
-    buf = []
-    in_q = False
-    q_char = None
-    for ch in cmd:
-        if in_q:
-            if ch == q_char:
-                in_q = False
-            else:
-                buf.append(ch)
-        elif ch in ('"', "'"):
-            in_q = True
-            q_char = ch
-        elif ch == " ":
-            if buf:
-                parts.append("".join(buf))
-                buf = []
-        else:
-            buf.append(ch)
-    if buf:
-        parts.append("".join(buf))
-    return parts
-
-
-def _split_top(raw, delims):
-    """Splits text on boundaries (; or |) while honoring quoted tokens."""
-    segments = []
-    buf = []
-    in_q = False
-    q_char = None
-    for ch in raw:
-        if in_q:
-            buf.append(ch)
-            if ch == q_char:
-                in_q = False
-        elif ch in ('"', "'"):
-            in_q = True
-            q_char = ch
-            buf.append(ch)
-        elif ch in delims:
-            segments.append("".join(buf))
-            buf = []
-        else:
-            buf.append(ch)
-    segments.append("".join(buf))
-    return segments
-
-
-def _read_lines(args, idx=0):
-    """Priority stream consumer: File args first, then piped lines."""
-    if len(args) > idx:
-        p = _abs(args[idx])
-        try:
-            fd = _fm.open(p, "r")
-            try:
-                data = _fm.read(fd)
-            finally:
-                _fm.close(fd)
-            return data.splitlines()
-        except Exception as e:
-            print("[read error]", e)
-            return None
-    if _PIPE_IN is not None:
-        return _PIPE_IN
-    return None
-
-
-def _parse_redirections(cmd_str):
-    """Detects and strips '>' or '>>' file redirection targets from commands."""
-    mode = None
-    target_file = None
-    cmd_clean = cmd_str
-
-    if ">>" in cmd_str:
-        parts = cmd_str.split(">>", 1)
-        cmd_clean = parts[0].strip()
-        target_file = parts[1].strip().split()[0]
-        mode = "a"
-    elif ">" in cmd_str:
-        parts = cmd_str.split(">", 1)
-        cmd_clean = parts[0].strip()
-        target_file = parts[1].strip().split()[0]
-        mode = "w"
-
-    return cmd_clean, target_file, mode
-
-
-# =================================================
-# BUILT-IN COMMANDS
-# =================================================
-def _cmd_ls(args):
-    long = "-l" in args
-    paths = [a for a in args if not a.startswith("-")]
-    path = _abs(paths[0]) if paths else current_path
-    list_dir(path, long=long)
-
 
 def list_dir(path, long=False):
     try:
@@ -754,6 +745,7 @@ def list_dir(path, long=False):
     print("-" * 40)
     for f in entries:
         full = _pjoin(path, f)
+        # hide protected root-level .py unless super (system files)
         if path == "/" and (f.endswith(".py") or f.endswith(".mpy")) and not _is_super():
             continue
         if f in ["pkglist.json", "pkgtable.json"]:
@@ -764,9 +756,9 @@ def list_dir(path, long=False):
             meta = {"type": "unknown", "size": 0, "owner": "?"}
         is_d = meta.get("type") == "directory"
         if long:
-            sz = human_size(meta.get("size", 0))
-            kind = "<DIR> " if is_d else "      "
-            owner = meta.get("owner", "?")
+            sz     = human_size(meta.get("size", 0))
+            kind   = "<DIR> " if is_d else "      "
+            owner  = meta.get("owner", "?")
             print(f"  {kind}{f:28} {sz:>10}  owner={owner}")
         else:
             tag = "/" if is_d else ""
@@ -789,6 +781,331 @@ def tree_dir(path, prefix=""):
             tree_dir(full, prefix + "|   ")
         else:
             print(prefix + "|-- " + e)
+
+
+# =================================================
+# ARGUMENT HELPERS
+# =================================================
+
+def convert_arg(arg):
+    try:
+        return float(arg) if "." in arg else int(arg)
+    except:
+        return arg
+
+
+def _is_intlike(s):
+    try:
+        int(s)
+        return True
+    except Exception:
+        return False
+
+
+def _split(cmd):
+    """Split a single command into tokens, respecting quoted strings.
+    Quote characters themselves are stripped (used for the final,
+    per-command argument split)."""
+    parts  = []
+    buf    = []
+    in_q   = False
+    q_char = None
+    for ch in cmd:
+        if in_q:
+            if ch == q_char:
+                in_q = False
+            else:
+                buf.append(ch)
+        elif ch in ('"', "'"):
+            in_q   = True
+            q_char = ch
+        elif ch == " ":
+            if buf:
+                parts.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
+
+
+def _split_top(raw, delims):
+    """Split raw text on any character in `delims` (e.g. ';' or '|'),
+    but never inside quotes. Quote characters are PRESERVED here (unlike
+    _split) since each resulting segment is itself re-tokenized later."""
+    segments = []
+    buf    = []
+    in_q   = False
+    q_char = None
+    for ch in raw:
+        if in_q:
+            buf.append(ch)
+            if ch == q_char:
+                in_q = False
+        elif ch in ('"', "'"):
+            in_q   = True
+            q_char = ch
+            buf.append(ch)
+        elif ch in delims:
+            segments.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    segments.append("".join(buf))
+    return segments
+
+
+# =================================================
+# STDOUT CAPTURE  (backs the "|" pipeline -- lets one command's printed
+# output become the next command's piped-in lines)
+# =================================================
+
+class _OutputCapture:
+    def __init__(self):
+        self.lines = []
+        self._buf = ""
+
+    def write(self, s):
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            self.lines.append(line)
+
+    def flush(self):
+        pass
+
+
+def _read_lines(args, idx=0):
+    """Get a list of text lines for commands like cat/head/tail/search.
+    Priority: an explicit file argument at args[idx], otherwise whatever
+    came in through a '|' pipe. Returns None if neither is available."""
+    if len(args) > idx:
+        p = _abs(args[idx])
+        try:
+            fd = _fm.open(p, "r")
+            try:
+                data = _fm.read(fd)
+            finally:
+                _fm.close(fd)
+            return data.splitlines()
+        except Exception as e:
+            print("[read]", e)
+            return None
+    if _PIPE_IN is not None:
+        return _PIPE_IN
+    return None
+
+
+# =================================================
+# BUILT-IN COMMAND HELP STRINGS
+# =================================================
+BUILTIN_HELP = {
+    "pwd":         "pwd                   Print working directory",
+    "cd":          "cd <path>             Change directory (supports .. and .)",
+    "ls":          "ls [-l]               List directory contents",
+    "dir":         "dir                   Alias for ls",
+    "tree":        "tree [path]           Show directory tree",
+    "mkdir":       "mkdir <dir>           Create directory",
+    "rmdir":       "rmdir <dir>           Remove empty directory",
+    "rm":          "rm <path>             Remove file",
+    "cp":          "cp <src> <dst>        Copy file",
+    "mv":          "mv <src> <dst>        Move/rename file",
+    "touch":       "touch <file>          Create empty file",
+    "cat":         "cat <file>            Print file contents (or piped input)",
+    "head":        "head <file> [n]       Print first n lines (default 10; or piped input)",
+    "tail":        "tail <file> [n]       Print last n lines (default 10; or piped input)",
+    "search":      "search <pat> [file]   Grep-like search (alias: grep; supports piped input)",
+    "echo":        "echo <text>           Print text",
+    "clear":       "clear                 Clear terminal  (cls alias)",
+    "cls":         "cls                   Alias for clear",
+    "history":     "history               Show command history",
+    "which":       "which <cmd>           Find command location",
+    "whereis":     "whereis <name>        Locate binary on filesystem",
+    "find":        "find <path> <name>    Search for files",
+    "stat":        "stat <path>           File status information",
+    "file":        "file <path>           Describe file type",
+    "whoami":      "whoami                Show current user",
+    "id":          "id                    Show user identity",
+    "hostname":    "hostname              Show device hostname",
+    "date":        "date                  Show current date",
+    "time":        "time                  Show current time",
+    "uptime":      "uptime                Show system uptime",
+    "version":     "version               Show ZenCMD and OS version",
+    "df":          "df                    Disk free (filesystem usage)",
+    "du":          "du <path>             Disk usage of path",
+    "free":        "free                  Show free memory",
+    "memdebug":    "memdebug              Detailed memory debug",
+    "ps":          "ps                    Show running processes",
+    "kill":        "kill <pid>            Kill process by ID",
+    "jobs":        "jobs                  List background jobs",
+    "env":         "env                   Show environment variables",
+    "export":      "export KEY=VALUE      Set environment variable",
+    "alias":       "alias [name=cmd]      Define or list aliases",
+    "unalias":     "unalias <name>        Remove alias",
+    "mount":       "mount [src dst]       Mount filesystem  (SUPER)",
+    "mountzfs":    "mountzfs              Mount ZFS volume  (SUPER)",
+    "sync":        "sync                  Sync filesystem buffers",
+    "bootlog":     "bootlog               Show boot log  (SUPER)",
+    "log":         "log                   Show ZenCMD log",
+    "service":     "service <name> <op>   Manage services  (SUPER)",
+    "services":    "services              List all services",
+    "reload":      "reload                Reload ZenCMD config  (SUPER)",
+    "reloadmodule":"reloadmodule <mod>    Reload a module  (SUPER)",
+    "shutdown":    "shutdown              Power off device  (SUPER)",
+    "reboot":      "reboot                Reboot device  (SUPER)",
+    "factory":     "factory               Factory reset  (SUPER)",
+    "super":       "super                 Elevate to Super Mode",
+    "unsuper":     "unsuper               Exit Super Mode",
+    "passwd":      "passwd                Change your account password",
+    "chusername":  "chusername            Change your account username",
+    "userdebug":   "userdebug             Show current user debug",
+    "whoisroot":   "whoisroot             Check if current user is rooted",
+    "modules":     "modules               List available modules",
+    "enter":       "enter <module>        Enter module context",
+    "leave":       "leave                 Leave current module",
+    "sysrun":      "sysrun <file>         Run a .py file or open a file",
+    "pkgrun":      "pkgrun <pkg> [args]   Run an installed package",
+    "recover":     "recover               Rebuild core OS from pkgtable.json (always works)",
+    "help":        "help [cmd|module]     Show help",
+    "exit":        "exit / quit           Exit module or ZenCMD",
+    "quit":        "quit                  Alias for exit",
+}
+
+
+def _shell_help():
+    print(f"\nZenCMD {ZENCMD_VERSION} — {ZENOS_NAME}")
+    print("=" * 48)
+    print("Navigation")
+    for k in ("pwd", "cd", "ls", "tree", "mkdir", "rmdir", "rm", "cp", "mv", "touch"):
+        print(" ", BUILTIN_HELP[k])
+    print("\nFile Operations")
+    for k in ("cat", "head", "tail", "search", "echo", "stat", "file", "find", "which", "whereis"):
+        print(" ", BUILTIN_HELP[k])
+    print("\nSystem")
+    for k in ("whoami", "id", "hostname", "date", "time", "uptime", "version",
+              "df", "du", "free", "memdebug", "ps", "kill", "jobs", "sync"):
+        print(" ", BUILTIN_HELP[k])
+    print("\nEnvironment")
+    for k in ("env", "export", "alias", "unalias", "history", "clear"):
+        print(" ", BUILTIN_HELP[k])
+    print("\nZeno-specific")
+    for k in ("super", "unsuper", "passwd", "chusername", "userdebug", "whoisroot", "modules",
+              "enter", "leave", "sysrun", "pkgrun", "service", "services",
+              "reload", "reloadmodule", "mountzfs", "bootlog", "log",
+              "shutdown", "reboot", "factory"):
+        print(" ", BUILTIN_HELP[k])
+    print("\nRecovery (always available, even with a broken /Services)")
+    print(" ", BUILTIN_HELP["recover"])
+    print("\nPackages: 'enter pkg' or 'pkg <install|uninstall|reinstall|update|")
+    print("info|list|verify|run> ...'. install/uninstall/reinstall/update")
+    print("require Super Mode. Use 'pkgrun <pkg> [args]' to run one directly.")
+    print("\nChaining: use ';' to run commands one after another")
+    print("  e.g.  clear ; ls")
+    print("and '|' to pipe one command's output into the next")
+    print("  e.g.  cat /LOGS/systemlog.txt | search ERROR")
+    print("  e.g.  ls -l | search .py")
+    print("\nType 'help <command>' for details, or '<module> help' for module help.")
+    print()
+
+
+# =================================================
+# SUPER MODE
+# =================================================
+
+def _cmd_super():
+    if _is_super():
+        print("Already in Super Mode.")
+        return
+    if _um is None:
+        print("Super Mode is unavailable (usermanager service is missing). "
+              "Recovery-critical commands like 'recover' don't need it.")
+        return
+    try:
+        pwd = input(f"Enter password for {zeno.user}: ")
+    except KeyboardInterrupt:
+        print()
+        return
+    _um.elevate(zeno.user, pwd)
+    if _is_super():
+        logger.debug(f"Super Mode entered by {zeno.user}", source="ZenCMD")
+        print("Entering Super Mode...")
+    else:
+        logger.warning(f"Failed Super Mode attempt by {zeno.user}", source="ZenCMD")
+        print("Authentication failed.")
+
+
+def _cmd_unsuper():
+    if not _is_super():
+        print("Not in Super Mode.")
+        return
+    try:
+        pwd = input(f"Confirm password for {zeno.user}: ")
+    except KeyboardInterrupt:
+        print()
+        return
+    _um.delevate(zeno.user, pwd)
+    if not _is_super():
+        logger.debug(f"Super Mode exited by {zeno.user}", source="ZenCMD")
+        print("Exited Super Mode.")
+    else:
+        print("Authentication failed. Remaining in Super Mode.")
+
+def _cmd_passwd():
+    if _um is None:
+        print("Password change is unavailable (usermanager service is missing).")
+        return
+    try:
+        old_pwd = input(f"Current password for {zeno.user}: ")
+        new_pwd = input("New password: ")
+        confirm_pwd = input("Confirm new password: ")
+    except KeyboardInterrupt:
+        print()
+        return
+    if new_pwd != confirm_pwd:
+        print("New passwords do not match. Aborted.")
+        return
+    if not new_pwd:
+        print("Password cannot be empty. Aborted.")
+        return
+    ok = _um.change_password(zeno.user, old_pwd, new_pwd)
+    if ok:
+        logger.debug(f"Password changed for {zeno.user}", source="ZenCMD")
+    else:
+        logger.warning(f"Failed password-change attempt by {zeno.user}", source="ZenCMD")
+
+
+def _cmd_chusername():
+    if _um is None:
+        print("Username change is unavailable (usermanager service is missing).")
+        return
+    try:
+        pwd = input(f"Current password for {zeno.user}: ")
+        new_user = input("New username: ").strip()
+    except KeyboardInterrupt:
+        print()
+        return
+    if not new_user:
+        print("Username cannot be empty. Aborted.")
+        return
+    ok = _um.change_username(zeno.user, pwd, new_user)
+    if ok:
+        print("Note: zeno.py still declares the old username -- update the "
+              "'user' field in zeno.py too, or this change will be reverted "
+              "automatically the next time the account record is read.")
+        logger.debug(f"Username change requested: {zeno.user} -> {new_user}", source="ZenCMD")
+    else:
+        logger.warning(f"Failed username-change attempt by {zeno.user}", source="ZenCMD")
+
+# =================================================
+# BUILT-IN IMPLEMENTATIONS  (filesystem ones all go through _fm)
+# =================================================
+
+def _cmd_ls(args):
+    long  = "-l" in args
+    paths = [a for a in args if not a.startswith("-")]
+    path  = _abs(paths[0]) if paths else current_path
+    list_dir(path, long=long)
 
 
 def _cmd_cd(args):
@@ -891,10 +1208,9 @@ def _cmd_touch(args):
 def _cmd_cat(args):
     lines = _read_lines(args, 0)
     if lines is None:
-        print("Usage: cat <file> (or pipe input)")
+        print("Usage: cat <file>  (or pipe input, e.g. ls | cat)")
         return
-    for line in lines:
-        print(line)
+    print("\n".join(lines))
 
 
 def _cmd_head(args):
@@ -907,10 +1223,12 @@ def _cmd_head(args):
     elif len(args) > 1:
         n = int(args[1])
         file_args = args[:1]
+    else:
+        file_args = args[:1]
 
     lines = _read_lines(file_args, 0)
     if lines is None:
-        print("Usage: head <file> [n] (or pipe input)")
+        print("Usage: head <file> [n]  (or pipe input)")
         return
     for line in lines[:n]:
         print(line)
@@ -926,76 +1244,35 @@ def _cmd_tail(args):
     elif len(args) > 1:
         n = int(args[1])
         file_args = args[:1]
+    else:
+        file_args = args[:1]
 
     lines = _read_lines(file_args, 0)
     if lines is None:
-        print("Usage: tail <file> [n] (or pipe input)")
+        print("Usage: tail <file> [n]  (or pipe input)")
         return
     for line in lines[-n:]:
         print(line)
 
 
 def _cmd_search(args):
+    """grep-like: search <pattern> [file] -- reads from file if given,
+    otherwise from piped input (e.g. cat log.txt | search ERROR)."""
     if not args:
-        print("Usage: search <pattern> [file] (or pipe input)")
+        print("Usage: search <pattern> [file]  (or pipe input, e.g. cat file | search foo)")
         return
     pattern = args[0]
     lines = _read_lines(args, 1)
     if lines is None:
+        print("Usage: search <pattern> [file]  (or pipe input)")
         return
     matched = 0
     for line in lines:
         if pattern in line:
             print(line)
             matched += 1
-    if matched == 0 and _PIPE_IN is None:
+    if matched == 0:
         print("[search] no matches")
-
-
-def _cmd_wc(args):
-    lines = _read_lines(args, 0)
-    if lines is None:
-        print("Usage: wc [file] (or pipe input)")
-        return
-    line_count = len(lines)
-    word_count = sum(len(line.split()) for line in lines)
-    char_count = sum(len(line) + 1 for line in lines)
-    print(f" {line_count:6} {word_count:6} {char_count:6}")
-
-
-def _cmd_sort(args):
-    lines = _read_lines(args, 0)
-    if lines is None:
-        print("Usage: sort [file] (or pipe input)")
-        return
-    for line in sorted(lines):
-        print(line)
-
-
-def _cmd_uniq(args):
-    lines = _read_lines(args, 0)
-    if lines is None:
-        print("Usage: uniq [file] (or pipe input)")
-        return
-    last = None
-    for line in lines:
-        if line != last:
-            print(line)
-            last = line
-
-
-def _cmd_echo(args):
-    if not args and _PIPE_IN is not None:
-        for line in _PIPE_IN:
-            print(line)
-        return
-    out = []
-    for a in args:
-        if a.startswith("$"):
-            out.append(str(env_vars.get(a[1:], "")))
-        else:
-            out.append(a)
-    print(" ".join(out))
 
 
 def _cmd_stat(args):
@@ -1005,14 +1282,14 @@ def _cmd_stat(args):
     p = _abs(args[0])
     try:
         meta = _fm.metadata(p)
-    except Exception:
+    except Exception as e:
         print("[stat] Not found:", p)
         return
-    print(f"  Path        : {p}")
-    print(f"  Type        : {meta.get('type')}")
-    print(f"  Size        : {human_size(meta.get('size', 0))}")
-    print(f"  Owner       : {meta.get('owner')}")
-    print(f"  Permission  : {meta.get('permission')}")
+    print(f"  Path       : {p}")
+    print(f"  Type       : {meta.get('type')}")
+    print(f"  Size       : {human_size(meta.get('size', 0))}")
+    print(f"  Owner      : {meta.get('owner')}")
+    print(f"  Permission : {meta.get('permission')}")
 
 
 def _cmd_file(args):
@@ -1069,6 +1346,20 @@ def _cmd_which(args):
         print(p)
     else:
         print(f"{name}: not found")
+
+
+def _cmd_whereis(args):
+    _cmd_which(args)
+
+
+def _cmd_echo(args):
+    out = []
+    for a in args:
+        if a.startswith("$"):
+            out.append(str(env_vars.get(a[1:], "")))
+        else:
+            out.append(a)
+    print(" ".join(out))
 
 
 def _cmd_env(args):
@@ -1135,7 +1426,8 @@ def _cmd_whoisroot(args):
     if _um is None:
         print("usermanager service unavailable.")
         return
-    if _um.isrooted(zeno.user):
+    rooted = _um.isrooted(zeno.user)
+    if rooted:
         print(f"{zeno.user} is in Super Mode (rooted).")
     else:
         print(f"{zeno.user} is not rooted.")
@@ -1147,7 +1439,11 @@ def _cmd_whoami(args):
 
 def _cmd_id(args):
     uid = 0 if _is_super() else 1000
-    print(f"uid={uid}({'root' if _is_super() else zeno.user}) gid={uid}")
+    print(f"uid={uid}({_cmd_whoami_str()}) gid={uid}")
+
+
+def _cmd_whoami_str():
+    return "root" if _is_super() else zeno.user
 
 
 def _cmd_hostname(args):
@@ -1202,10 +1498,10 @@ def _cmd_df(args):
     try:
         import uos
         st = uos.statvfs("/")
-        block_size = st[0]
-        total = st[2] * block_size
-        free = st[3] * block_size
-        used = total - free
+        block_size  = st[0]
+        total       = st[2] * block_size
+        free        = st[3] * block_size
+        used        = total - free
         print(f"  Total : {human_size(total)}")
         print(f"  Used  : {human_size(used)}")
         print(f"  Free  : {human_size(free)}")
@@ -1305,25 +1601,31 @@ def _cmd_mountzfs(args):
 
 
 def _cmd_bootlog(args):
-    lines = _read_lines(["/bootlog.txt"], 0)
-    if lines:
-        for line in lines:
-            print(line)
-    else:
+    p = "/bootlog.txt"
+    try:
+        fd = _fm.open(p, "r")
+        try:
+            print(_fm.read(fd))
+        finally:
+            _fm.close(fd)
+    except Exception:
         print("[bootlog] No boot log found.")
 
 
 def _cmd_log(args):
-    lines = _read_lines(["/log.txt"], 0)
-    if lines:
-        for line in lines:
-            print(line)
-    else:
+    p = "/log.txt"
+    try:
+        fd = _fm.open(p, "r")
+        try:
+            print(_fm.read(fd))
+        finally:
+            _fm.close(fd)
+    except Exception:
         print("[log] No log file found.")
 
 
 def _cmd_services(args):
-    print("Services: (stub - integrate service manager)")
+    print("Services: (stub — integrate service manager)")
 
 
 def _cmd_service(args):
@@ -1418,19 +1720,27 @@ def _cmd_sysrun(args):
 
 
 def _cmd_pkgrun(args):
+    """pkgrun <package> [args...] -- run an installed package.
+    Does NOT require Super Mode; only install/uninstall/reinstall/update do.
+    """
     if not args:
         print("Usage: pkgrun <package> [args...]")
         return
     if PackageManager is None:
         print("[pkgrun] PackageManager service is unavailable. Try 'recover' first.")
         return
-    name = args[0]
+    name     = args[0]
     pkg_args = [convert_arg(a) for a in args[1:]]
     pm = PackageManager()
     pm.run(name, *pkg_args)
 
 
 def _cmd_recover(args):
+    """recover -- rebuild core OS components from pkgtable.json using the
+    standalone Recovery class above (no /Services dependency at all).
+    On success, re-imports Services/zeno.py and rebuilds every dependent
+    piece of ZenCMD state, so the shell drops back into a normal boot
+    without requiring an actual device reboot."""
     try:
         rec = Recovery()
         ok = rec.run()
@@ -1457,8 +1767,13 @@ def _cmd_recover(args):
             except Exception as e:
                 print("[recover] Warning: could not rebuild userinfo.json:", e)
     else:
-        print("[recover] Recovery finished, but Services still failed to import. A manual reboot may be required.")
+        print("[recover] Recovery finished, but Services still failed to import. "
+              "A manual reboot may be required.")
 
+
+# =================================================
+# MODULE DISPATCH
+# =================================================
 
 def _enter_module(name):
     global active_module, module_instance
@@ -1467,7 +1782,7 @@ def _enter_module(name):
         print(f"No such module: {name}")
         return
     module_instance = cls()
-    active_module = name.lower()
+    active_module   = name.lower()
     logger.debug(f"Module entered: {active_module}", source="ZenCMD")
     print(f">> {active_module}")
 
@@ -1477,7 +1792,7 @@ def _leave_module():
     if active_module:
         logger.debug(f"Module exited: {active_module}", source="ZenCMD")
         print(f"Left module: {active_module}")
-        active_module = None
+        active_module   = None
         module_instance = None
     else:
         print("Not inside a module.")
@@ -1492,279 +1807,480 @@ def _dispatch_module(instance, fn, args):
         print(f"No method: {fn}")
 
 
-def convert_arg(arg):
+# =================================================
+# USER MANAGEMENT COMMANDS
+# =================================================
+
+def _cmd_userlist(args):
+    """userlist -- List all users in the system."""
     try:
-        return float(arg) if "." in arg else int(arg)
-    except:
-        return arg
+        from Services import usermanager
+        um = usermanager()
+        users = um.list_users()
+        if users:
+            print("Users:")
+            for user in users:
+                # Get user info to show if they're root
+                try:
+                    import json
+                    from Services import dewrapper
+                    d = dewrapper()
+                    user_info = json.loads(d.read(f"OS/users/{user}/userinfo.json"))
+                    root_marker = " (root)" if user_info.get("root", False) else ""
+                    print(f"  {user}{root_marker}")
+                except:
+                    print(f"  {user}")
+        else:
+            print("No users found")
+    except Exception as e:
+        print(f"Error listing users: {e}")
 
+def _cmd_useradd(args):
+    """useradd <username> <password> [--root] -- Create a new user.
 
-def _is_intlike(s):
+    Example: useradd john password123 --root"""
+    if len(args) < 2:
+        print("Usage: useradd <username> <password> [--root]")
+        return
+
+    username = args[0]
+    password = args[1]
+    is_root = len(args) > 2 and args[2] == "--root"
+
     try:
-        int(s)
-        return True
-    except Exception:
-        return False
+        from Services import usermanager
+        um = usermanager()
+        success, message = um.create_user(username, password, is_root)
+        if success:
+            print(message)
+        else:
+            print(f"Error: {message}")
+    except Exception as e:
+        print(f"Error creating user: {e}")
 
+def _cmd_userdel(args):
+    """userdel <username> -- Delete a user and their data.
 
-def _cmd_super():
-    if _is_super():
-        print("Already in Super Mode.")
+    Note: Cannot delete the current user or root user."""
+    if len(args) < 1:
+        print("Usage: userdel <username>")
         return
-    if _um is None:
-        print("Super Mode is unavailable (usermanager service missing).")
-        return
+
+    username = args[0]
+
     try:
-        pwd = input(f"Enter password for {zeno.user}: ")
-    except KeyboardInterrupt:
-        print()
-        return
-    _um.elevate(zeno.user, pwd)
-    if _is_super():
-        logger.debug(f"Super Mode entered by {zeno.user}", source="ZenCMD")
-        print("Entering Super Mode...")
-    else:
-        logger.warning(f"Failed Super Mode attempt by {zeno.user}", source="ZenCMD")
-        print("Authentication failed.")
+        from Services import usermanager
+        um = usermanager()
+        success, message = um.delete_user(username)
+        if success:
+            print(message)
+        else:
+            print(f"Error: {message}")
+    except Exception as e:
+        print(f"Error deleting user: {e}")
 
+def _cmd_userauth(args):
+    """userauth <username> <password> -- Authenticate a user.
 
-def _cmd_unsuper():
-    if not _is_super():
-        print("Not in Super Mode.")
+    Example: userauth john password123"""
+    if len(args) < 2:
+        print("Usage: userauth <username> <password>")
         return
+
+    username = args[0]
+    password = args[1]
+
     try:
-        pwd = input(f"Confirm password for {zeno.user}: ")
-    except KeyboardInterrupt:
-        print()
-        return
-    _um.delevate(zeno.user, pwd)
-    if not _is_super():
-        logger.debug(f"Super Mode exited by {zeno.user}", source="ZenCMD")
-        print("Exited Super Mode.")
-    else:
-        print("Authentication failed. Remaining in Super Mode.")
+        from Services import usermanager
+        um = usermanager()
+        success, message = um.authenticate_user(username, password)
+        if success:
+            print(message)
+        else:
+            print(f"Auth failed: {message}")
+    except Exception as e:
+        print(f"Error authenticating user: {e}")
 
+def _cmd_userhome(args):
+    """userhome <username> -- Get home directory path for a user.
 
-def _cmd_passwd():
-    if _um is None:
-        print("Password change is unavailable (usermanager service is missing).")
+    Example: userhome john"""
+    if len(args) < 1:
+        print("Usage: userhome <username>")
         return
+
+    username = args[0]
+
     try:
-        old_pwd = input(f"Current password for {zeno.user}: ")
-        new_pwd = input("New password: ")
-        confirm_pwd = input("Confirm new password: ")
-    except KeyboardInterrupt:
-        print()
-        return
-    if new_pwd != confirm_pwd:
-        print("New passwords do not match. Aborted.")
-        return
-    if not new_pwd:
-        print("Password cannot be empty. Aborted.")
-        return
-    ok = _um.change_password(zeno.user, old_pwd, new_pwd)
-    if ok:
-        logger.debug(f"Password changed for {zeno.user}", source="ZenCMD")
-    else:
-        logger.warning(f"Failed password-change attempt by {zeno.user}", source="ZenCMD")
+        from Services import usermanager
+        um = usermanager()
+        home_path = um.get_user_home_path(username)
+        if home_path:
+            print(home_path)
+        else:
+            print(f"User '{username}' not found or home path unavailable")
+    except Exception as e:
+        print(f"Error getting user home: {e}")
 
+def _cmd_userswitch(args):
+    """userswitch <username> -- Switch to user context (requires auth).
 
-def _cmd_chusername():
-    if _um is None:
-        print("Username change is unavailable (usermanager service is missing).")
+    Example: userswitch john"""
+    if len(args) < 1:
+        print("Usage: userswitch <username>")
         return
+
+    username = args[0]
+    # For password, we'll prompt or use a default approach
+    # In a real implementation, this would prompt for password
+    password = input(f"Password for {username}: ").strip()
+
     try:
-        pwd = input(f"Current password for {zeno.user}: ")
-        new_user = input("New username: ").strip()
-    except KeyboardInterrupt:
-        print()
-        return
-    if not new_user:
-        print("Username cannot be empty. Aborted.")
-        return
-    ok = _um.change_username(zeno.user, pwd, new_user)
-    if ok:
-        print("Note: Update the 'user' field in zeno.py to maintain persistence.")
-        logger.debug(f"Username change requested: {zeno.user} -> {new_user}", source="ZenCMD")
-    else:
-        logger.warning(f"Failed username-change attempt by {zeno.user}", source="ZenCMD")
+        from Services import usermanager
+        um = usermanager()
+        success, message = um.switch_user_context(username)
+        # Note: The current switch_user_context implementation is simplified
+        # A full implementation would update zeno.user, etc.
+        if success:
+            print(message)
+            # Update zeno to reflect the new user (simplified)
+            import zeno
+            zeno.user = username
+        else:
+            print(f"Switch failed: {message}")
+    except Exception as e:
+        print(f"Error switching user: {e}")
 
 
 # =================================================
-# DISPATCH TABLE
+# SYSTEM CONFIGURATION COMMANDS
 # =================================================
-BUILTIN_HELP = {
-    "pwd":          "pwd                    Print working directory",
-    "cd":           "cd <path>              Change directory (supports .. and .)",
-    "ls":           "ls [-l]                List directory contents",
-    "dir":          "dir                    Alias for ls",
-    "tree":         "tree [path]            Show directory tree",
-    "mkdir":        "mkdir <dir>            Create directory",
-    "rmdir":        "rmdir <dir>            Remove empty directory",
-    "rm":           "rm <path>              Remove file",
-    "cp":           "cp <src> <dst>         Copy file",
-    "mv":           "mv <src> <dst>         Move/rename file",
-    "touch":        "touch <file>           Create empty file",
-    "cat":          "cat [file]             Print file contents (supports pipeline)",
-    "head":         "head [file] [n]        Print first n lines (supports pipeline)",
-    "tail":         "tail [file] [n]        Print last n lines (supports pipeline)",
-    "search":       "search <pat> [file]    Filter lines by pattern (supports pipeline)",
-    "wc":           "wc [file]              Count lines, words, chars (supports pipeline)",
-    "sort":         "sort [file]            Alphabetically sort lines (supports pipeline)",
-    "uniq":         "uniq [file]            Deduplicate adjacent lines (supports pipeline)",
-    "echo":         "echo <text>            Print text (supports pipeline)",
-    "clear":        "clear                  Clear terminal (cls alias)",
-    "cls":          "cls                    Alias for clear",
-    "history":      "history                Show command history",
-    "which":        "which <cmd>            Find command location",
-    "whereis":      "whereis <name>         Locate binary on filesystem",
-    "find":         "find <path> <name>     Search for files",
-    "stat":         "stat <path>            File status information",
-    "file":         "file <path>            Describe file type",
-    "whoami":       "whoami                 Show current user",
-    "id":           "id                     Show user identity",
-    "hostname":     "hostname               Show device hostname",
-    "date":         "date                   Show current date",
-    "time":         "time                   Show current time",
-    "uptime":       "uptime                 Show system uptime",
-    "version":      "version                Show ZenCMD and OS version",
-    "df":           "df                     Disk free (filesystem usage)",
-    "du":           "du <path>              Disk usage of path",
-    "free":         "free                   Show free memory",
-    "memdebug":     "memdebug               Detailed memory debug",
-    "ps":           "ps                     Show running processes",
-    "kill":         "kill <pid>             Kill process by ID",
-    "jobs":         "jobs                   List background jobs",
-    "env":          "env                    Show environment variables",
-    "export":       "export KEY=VALUE       Set environment variable",
-    "alias":        "alias [name=cmd]       Define or list aliases",
-    "unalias":      "unalias <name>         Remove alias",
-    "mount":        "mount [src dst]        Mount filesystem (SUPER)",
-    "mountzfs":     "mountzfs               Mount ZFS volume (SUPER)",
-    "sync":         "sync                   Sync filesystem buffers",
-    "bootlog":      "bootlog                Show boot log (SUPER)",
-    "log":          "log                    Show ZenCMD log",
-    "service":      "service <name> <op>    Manage services (SUPER)",
-    "services":     "services               List all services",
-    "reload":       "reload                 Reload ZenCMD config (SUPER)",
-    "reloadmodule": "reloadmodule <mod>     Reload a module (SUPER)",
-    "shutdown":     "shutdown               Power off device (SUPER)",
-    "reboot":       "reboot                 Reboot device (SUPER)",
-    "factory":      "factory                Factory reset (SUPER)",
-    "super":        "super                  Elevate to Super Mode",
-    "unsuper":      "unsuper                Exit Super Mode",
-    "passwd":       "passwd                 Change account password",
-    "chusername":   "chusername             Change account username",
-    "userdebug":    "userdebug              Show current user debug",
-    "whoisroot":    "whoisroot              Check if user is rooted",
-    "modules":      "modules                List available modules",
-    "enter":        "enter <module>         Enter module context",
-    "leave":        "leave                  Leave current module",
-    "sysrun":       "sysrun <file>          Run a .py file or open a file",
-    "pkgrun":       "pkgrun <pkg> [args]    Run an installed package",
-    "recover":      "recover                Rebuild core OS from pkgtable.json",
-    "help":         "help [cmd|module]      Show help",
-    "exit":         "exit / quit            Exit module or ZenCMD",
-    "quit":         "quit                   Alias for exit",
-}
 
+def _cmd_debug(args):
+    """debug [on|off] -- Get or set debug mode.
+
+    Examples:
+      debug        -- Show current debug mode
+      debug on     -- Enable debug mode
+      debug off    -- Disable debug mode"""
+    try:
+        import zeno
+        if len(args) == 0:
+            # Get current value
+            status = "on" if zeno.debug_enabled else "off"
+            print(f"Debug mode: {status}")
+        elif len(args) == 1:
+            # Set value
+            if args[0].lower() in ["on", "true", "1", "yes"]:
+                zeno.debug_enabled = True
+                zeno.save_config()
+                print("Debug mode enabled")
+            elif args[0].lower() in ["off", "false", "0", "no"]:
+                zeno.debug_enabled = False
+                zeno.save_config()
+                print("Debug mode disabled")
+            else:
+                print("Usage: debug [on|off]")
+        else:
+            print("Usage: debug [on|off]")
+    except Exception as e:
+        print(f"Error with debug command: {e}")
+
+def _cmd_perfmode(args):
+    """perfmode [performance|powersaving|balanced] -- Get or set performance mode.
+
+    Examples:
+      perfmode          -- Show current performance mode
+      perfmode performance -- Set to performance mode
+      perfmode powersaving -- Set to power saving mode
+      perfmode balanced   -- Set to balanced mode"""
+    try:
+        import zeno
+        if len(args) == 0:
+            # Get current value
+            print(f"Performance mode: {zeno.performance_mode}")
+        elif len(args) == 1:
+            # Set value
+            mode = args[0].lower()
+            if mode in ["performance", "powersaving", "balanced"]:
+                zeno.performance_mode = mode
+                zeno.save_config()
+                print(f"Performance mode set to: {mode}")
+            else:
+                print("Usage: perfmode [performance|powersaving|balanced]")
+        else:
+            print("Usage: perfmode [performance|powersaving|balanced]")
+    except Exception as e:
+        print(f"Error with perfmode command: {e}")
+
+def _cmd_graphics(args):
+    """graphics [on|off] -- Get or set graphics subsystem enabled state.
+
+    Examples:
+      graphics       -- Show current graphics state
+      graphics on    -- Enable graphics subsystem
+      graphics off   -- Disable graphics subsystem"""
+    try:
+        import zeno
+        if len(args) == 0:
+            # Get current value
+            status = "on" if zeno.graphics_enabled else "off"
+            print(f"Graphics: {status}")
+        elif len(args) == 1:
+            # Set value
+            if args[0].lower() in ["on", "true", "1", "yes"]:
+                zeno.graphics_enabled = True
+                zeno.save_config()
+                print("Graphics subsystem enabled")
+            elif args[0].lower() in ["off", "false", "0", "no"]:
+                zeno.graphics_enabled = False
+                zeno.save_config()
+                print("Graphics subsystem disabled")
+            else:
+                print("Usage: graphics [on|off]")
+        else:
+            print("Usage: graphics [on|off]")
+    except Exception as e:
+        print(f"Error with graphics command: {e}")
+
+def _cmd_wifi_cfg(args):
+    """wifi [on|off] -- Get or set WiFi enabled state.
+
+    Examples:
+      wifi       -- Show current WiFi state
+      wifi on    -- Enable WiFi
+      wifi off   -- Disable WiFi"""
+    try:
+        import zeno
+        if len(args) == 0:
+            # Get current value
+            status = "on" if zeno.wifi_enabled else "off"
+            print(f"WiFi: {status}")
+        elif len(args) == 1:
+            # Set value
+            if args[0].lower() in ["on", "true", "1", "yes"]:
+                zeno.wifi_enabled = True
+                zeno.save_config()
+                print("WiFi enabled")
+            elif args[0].lower() in ["off", "false", "0", "no"]:
+                zeno.wifi_enabled = False
+                zeno.save_config()
+                print("WiFi disabled")
+            else:
+                print("Usage: wifi [on|off]")
+        else:
+            print("Usage: wifi [on|off]")
+    except Exception as e:
+        print(f"Error with wifi command: {e}")
+
+def _cmd_ble_cfg(args):
+    """ble [on|off] -- Get or set Bluetooth LE enabled state.
+
+    Examples:
+      ble       -- Show current Bluetooth LE state
+      ble on    -- Enable Bluetooth LE
+      ble off   -- Disable Bluetooth LE"""
+    try:
+        import zeno
+        if len(args) == 0:
+            # Get current value
+            status = "on" if zeno.ble_enabled else "off"
+            print(f"Bluetooth LE: {status}")
+        elif len(args) == 1:
+            # Set value
+            if args[0].lower() in ["on", "true", "1", "yes"]:
+                zeno.ble_enabled = True
+                zeno.save_config()
+                print("Bluetooth LE enabled")
+            elif args[0].lower() in ["off", "false", "0", "no"]:
+                zeno.ble_enabled = False
+                zeno.save_config()
+                print("Bluetooth LE disabled")
+            else:
+                print("Usage: ble [on|off]")
+        else:
+            print("Usage: ble [on|off]")
+    except Exception as e:
+        print(f"Error with ble command: {e}")
+
+def _cmd_bootverbose(args):
+    """bootverbose [on|off] -- Get or set verbose boot messages.
+
+    Examples:
+      bootverbose       -- Show current boot verbosity
+      bootverbose on    -- Enable verbose boot messages
+      bootverbose off   -- Disable verbose boot messages"""
+    try:
+        import zeno
+        if len(args) == 0:
+            # Get current value
+            status = "on" if zeno.boot_verbose else "off"
+            print(f"Boot verbose: {status}")
+        elif len(args) == 1:
+            # Set value
+            if args[0].lower() in ["on", "true", "1", "yes"]:
+                zeno.boot_verbose = True
+                zeno.save_config()
+                print("Verbose boot messages enabled")
+            elif args[0].lower() in ["off", "false", "0", "no"]:
+                zeno.boot_verbose = False
+                zeno.save_config()
+                print("Verbose boot messages disabled")
+            else:
+                print("Usage: bootverbose [on|off]")
+        else:
+            print("Usage: bootverbose [on|off]")
+    except Exception as e:
+        print(f"Error with bootverbose command: {e}")
+
+def _cmd_powersave(args):
+    """powersave [on|off] -- Get or set aggressive power saving.
+
+    Examples:
+      powersave       -- Show current power saving setting
+      powersave on    -- Enable aggressive power saving
+      powersave off   -- Disable aggressive power saving"""
+    try:
+        import zeno
+        if len(args) == 0:
+            # Get current value
+            status = "on" if zeno.power_saving_aggressive else "off"
+            print(f"Aggressive power saving: {status}")
+        elif len(args) == 1:
+            # Set value
+            if args[0].lower() in ["on", "true", "1", "yes"]:
+                zeno.power_saving_aggressive = True
+                zeno.save_config()
+                print("Aggressive power saving enabled")
+            elif args[0].lower() in ["off", "false", "0", "no"]:
+                zeno.power_saving_aggressive = False
+                zeno.save_config()
+                print("Aggressive power saving disabled")
+            else:
+                print("Usage: powersave [on|off]")
+        else:
+            print("Usage: powersave [on|off]")
+    except Exception as e:
+        print(f"Error with powersave command: {e}")
+
+
+# =================================================
+# COMMAND DISPATCH TABLE
+# =================================================
 BUILTINS = {
+    # Navigation
     "pwd":          (lambda a: print(current_path),  False),
-    "cd":           (_cmd_cd,         False),
-    "ls":           (_cmd_ls,         False),
-    "dir":          (_cmd_ls,         False),
+    "cd":           (_cmd_cd,        False),
+    "ls":           (_cmd_ls,        False),
+    "dir":          (_cmd_ls,        False),
     "tree":         (lambda a: (tree_dir(_abs(a[0]) if a else current_path) or print()), False),
-    "mkdir":        (_cmd_mkdir,      False),
-    "rmdir":        (_cmd_rmdir,      False),
-    "rm":           (_cmd_rm,         False),
-    "cp":           (_cmd_cp,         False),
-    "mv":           (_cmd_mv,         False),
-    "touch":        (_cmd_touch,      False),
-    "cat":          (_cmd_cat,        False),
-    "head":         (_cmd_head,       False),
-    "tail":         (_cmd_tail,       False),
-    "search":       (_cmd_search,     False),
-    "wc":           (_cmd_wc,         False),
-    "sort":         (_cmd_sort,       False),
-    "uniq":         (_cmd_uniq,       False),
-    "echo":         (_cmd_echo,       False),
-    "stat":         (_cmd_stat,       False),
-    "file":         (_cmd_file,       False),
-    "find":         (_cmd_find,       False),
-    "which":        (_cmd_which,      False),
-    "whereis":      (_cmd_which,      False),
-    "whoami":       (_cmd_whoami,     False),
-    "id":           (_cmd_id,         False),
-    "hostname":     (_cmd_hostname,   False),
-    "date":         (_cmd_date,       False),
-    "time":         (_cmd_time_cmd,   False),
-    "uptime":       (_cmd_uptime,     False),
-    "version":      (_cmd_version,    False),
-    "df":           (_cmd_df,         False),
-    "du":           (_cmd_du,         False),
-    "free":         (_cmd_free,       False),
-    "memdebug":     (_cmd_memdebug,   False),
-    "ps":           (_cmd_ps,         False),
-    "kill":         (_cmd_kill,       False),
-    "jobs":         (_cmd_jobs,       False),
-    "env":          (_cmd_env,        False),
-    "export":       (_cmd_export,     False),
-    "alias":        (_cmd_alias,      False),
-    "unalias":      (_cmd_unalias,    False),
-    "history":      (_cmd_history,    False),
+    "mkdir":        (_cmd_mkdir,     False),
+    "rmdir":        (_cmd_rmdir,     False),
+    "rm":           (_cmd_rm,        False),
+    "cp":           (_cmd_cp,        False),
+    "mv":           (_cmd_mv,        False),
+    "touch":        (_cmd_touch,     False),
+    # File content
+    "cat":          (_cmd_cat,       False),
+    "head":         (_cmd_head,      False),
+    "tail":         (_cmd_tail,      False),
+    "search":       (_cmd_search,    False),
+    "echo":         (_cmd_echo,      False),
+    "stat":         (_cmd_stat,      False),
+    "file":         (_cmd_file,      False),
+    "find":         (_cmd_find,      False),
+    "which":        (_cmd_which,     False),
+    "whereis":      (_cmd_whereis,   False),
+    # System debug
+    "whoami":       (lambda a: print(_cmd_whoami_str()), False),
+    "id":           (_cmd_id,        False),
+    "hostname":     (_cmd_hostname,  False),
+    "date":         (_cmd_date,      False),
+    "time":         (_cmd_time_cmd,  False),
+    "uptime":       (_cmd_uptime,    False),
+    "version":      (_cmd_version,   False),
+    "df":           (_cmd_df,        False),
+    "du":           (_cmd_du,        False),
+    "free":         (_cmd_free,      False),
+    "memdebug":     (_cmd_memdebug,  False),
+    "ps":           (_cmd_ps,        False),
+    "kill":         (_cmd_kill,      False),
+    "jobs":         (_cmd_jobs,      False),
+    # Environment
+    "env":          (_cmd_env,       False),
+    "export":       (_cmd_export,    False),
+    "alias":        (_cmd_alias,     False),
+    "unalias":      (_cmd_unalias,   False),
+    "history":      (_cmd_history,   False),
     "clear":        (lambda a: print("\n" * 40), False),
     "cls":          (lambda a: print("\n" * 40), False),
-    "userdebug":    (_cmd_userdebug,  False),
-    "whoisroot":    (_cmd_whoisroot,  False),
-    "modules":      (_cmd_modules,    False),
-    "sysrun":       (_cmd_sysrun,     False),
-    "pkgrun":       (_cmd_pkgrun,     False),
-    "recover":      (_cmd_recover,    False),
-    "mount":        (_cmd_mount,      True),
-    "mountzfs":     (_cmd_mountzfs,   True),
-    "sync":         (_cmd_sync,       False),
-    "bootlog":      (_cmd_bootlog,    True),
-    "log":          (_cmd_log,        False),
-    "service":      (_cmd_service,    True),
-    "services":     (_cmd_services,   False),
-    "reload":       (_cmd_reload,     True),
+    # User
+    "userdebug":    (_cmd_userdebug, False),
+    "whoisroot":    (_cmd_whoisroot, False),
+    # Modules
+    "modules":      (_cmd_modules,   False),
+    "sysrun":       (_cmd_sysrun,    False),
+    "pkgrun":       (_cmd_pkgrun,    False),
+    # Recovery -- always available, no Super Mode required
+    "recover":      (_cmd_recover,   False),
+    # Privileged
+    "mount":        (_cmd_mount,     True),
+    "mountzfs":     (_cmd_mountzfs,  True),
+    "sync":         (_cmd_sync,      False),
+    "bootlog":      (_cmd_bootlog,   True),
+    "log":          (_cmd_log,       False),
+    "service":      (_cmd_service,   True),
+    "services":     (_cmd_services,  False),
+    "reload":       (_cmd_reload,    True),
     "reloadmodule": (_cmd_reloadmodule, True),
-    "shutdown":     (_cmd_shutdown,   True),
-    "reboot":       (_cmd_reboot,     True),
-    "factory":      (_cmd_factory,    True),
+    "shutdown":     (_cmd_shutdown,  True),
+    "reboot":       (_cmd_reboot,    True),
+    "factory":      (_cmd_factory,   True),
+    # User management
+    "userlist":     (_cmd_userlist,  False),
+    "useradd":      (_cmd_useradd,   True),
+    "userdel":      (_cmd_userdel,   True),
+    "userauth":     (_cmd_userauth,  False),
+    "userhome":     (_cmd_userhome,  False),
+    "userswitch":   (_cmd_userswitch, True),
+    # System configuration
+    "debug":        (_cmd_debug,     False),
+    "perfmode":     (_cmd_perfmode,  False),
+    "graphics":     (_cmd_graphics,  False),
+    "wifi":         (_cmd_wifi_cfg,  False),
+    "ble":          (_cmd_ble_cfg,   False),
+    "bootverbose":  (_cmd_bootverbose, False),
+    "powersave":    (_cmd_powersave, False),
 }
 
+# Default aliases (user can override)
 aliases["ll"]   = "ls -l"
 aliases["cls"]  = "clear"
 aliases["q"]    = "exit"
 aliases["grep"] = "search"
 
 
-def _shell_help():
-    print(f"\nZenCMD {ZENCMD_VERSION} - {ZENOS_NAME}")
-    print("=" * 48)
-    print("Navigation: pwd, cd, ls, tree, mkdir, rmdir, rm, cp, mv, touch")
-    print("Stream:     cat, head, tail, search (grep), wc, sort, uniq, echo")
-    print("System:     whoami, id, hostname, date, time, uptime, version, df, du, free, ps, kill")
-    print("Redirection: supports pipes (|) and file redirection (>, >>)")
-    print("Recovery:   'recover' rebuilds OS from pkgtable.json unconditionally.\n")
-
+# =================================================
+# COMMAND PREPROCESSOR
+# =================================================
 
 def _preprocess(raw):
+    """Expand aliases, handle env-var substitutions."""
     parts = _split(raw)
     if not parts:
         return raw
     first = parts[0]
     if first in aliases:
         expansion = aliases[first]
-        rest = raw[len(first):].lstrip()
+        rest      = raw[len(first):].lstrip()
         return (expansion + " " + rest).strip() if rest else expansion
     return raw
 
 
 # =================================================
-# EXECUTION ENGINE WITH REDIRECTIONS
+# SINGLE-COMMAND EXECUTION  (one command word + its args -- no ';' or '|')
 # =================================================
+
 def _execute(raw):
     global current_path, active_module, module_instance
 
@@ -1776,6 +2292,7 @@ def _execute(raw):
     verb  = parts[0].lower()
     args  = parts[1:]
 
+    # ---- exit / quit ----
     if verb in ("exit", "quit"):
         if active_module:
             _leave_module()
@@ -1784,10 +2301,12 @@ def _execute(raw):
             raise SystemExit(0)
         return
 
+    # ---- leave ----
     if verb == "leave":
         _leave_module()
         return
 
+    # ---- help (contextual) ----
     if verb == "help":
         if not args:
             if active_module and module_instance and hasattr(module_instance, "help"):
@@ -1808,6 +2327,7 @@ def _execute(raw):
                 print(f"No help for '{topic}'.")
         return
 
+    # ---- super / unsuper ----
     if verb == "super":
         _cmd_super()
         return
@@ -1816,12 +2336,16 @@ def _execute(raw):
         _cmd_unsuper()
         return
 
+    # ---- <module> help  (e.g. "pkg help") ----
     if verb in MODULES and args and args[0].lower() == "help":
         m = MODULES[verb]()
         if hasattr(m, "help"):
             m.help()
+        else:
+            print(f"Module '{verb}' has no help().")
         return
 
+    # ---- enter <module> or bare module name ----
     if verb == "enter":
         if args:
             _enter_module(args[0])
@@ -1833,6 +2357,7 @@ def _execute(raw):
         _enter_module(verb)
         return
 
+    # ---- inside-module command dispatch ----
     if active_module and module_instance:
         if verb not in BUILTINS and verb not in MODULES:
             if _require_super(verb):
@@ -1840,14 +2365,20 @@ def _execute(raw):
             _dispatch_module(module_instance, verb, [convert_arg(a) for a in args])
             return
 
+    # ---- one-shot module call: "pkg install foo", "git status" ----
     if verb in MODULES and args:
-        fn = args[0]
+        fn    = args[0]
         margs = [convert_arg(a) for a in args[1:]]
         if fn.lower() == "help":
             m = MODULES[verb]()
             if hasattr(m, "help"):
                 m.help()
+            else:
+                print(f"Module '{verb}' has no help().")
             return
+        # Enforce Super Mode at the shell level too -- not just inside
+        # PackageManager -- so one-shot calls get the same gate as
+        # "enter pkg" -> "install foo".
         if _require_super(fn):
             return
         m = MODULES[verb]()
@@ -1855,6 +2386,7 @@ def _execute(raw):
         _dispatch_module(m, fn, margs)
         return
 
+    # ---- built-in commands ----
     if verb in BUILTINS:
         handler, needs_super = BUILTINS[verb]
         if needs_super and not _is_super():
@@ -1862,25 +2394,27 @@ def _execute(raw):
             return
         handler(args)
         return
-
     if _pm is not None and _pm.check(verb):
-        _pm.run(verb, *args)
+        _pm.run(verb,*args)
         logger.debug(f"Module call: {verb}", source="ZenCMD")
         return
+    print(f"Unknown command: {verb}  (type 'help')")
 
-    print(f"Unknown command: {verb} (type 'help')")
 
+# =================================================
+# PIPELINE ("|") + STATEMENT SEQUENCING (";")
+# =================================================
 
 def _run_single(cmd_line, pipe_in=None, capture=False):
+    """Run one pipeline segment. If capture=True, stdout is redirected
+    and the printed lines are returned (for the next segment); otherwise
+    output goes straight to the real terminal and None is returned."""
     global _PIPE_IN
     _PIPE_IN = pipe_in
 
-    clean_cmd, target_file, red_mode = _parse_redirections(cmd_line)
-    redirect_target = target_file is not None
-
-    if not capture and not redirect_target:
+    if not capture:
         try:
-            _execute(clean_cmd)
+            _execute(cmd_line)
         finally:
             _PIPE_IN = None
         return None
@@ -1889,30 +2423,17 @@ def _run_single(cmd_line, pipe_in=None, capture=False):
     cap = _OutputCapture()
     sys.stdout = cap
     try:
-        _execute(clean_cmd)
+        _execute(cmd_line)
     finally:
         sys.stdout = old_stdout
         _PIPE_IN = None
-        cap.flush()
-
-    if redirect_target:
-        try:
-            target_path = _abs(target_file)
-            data_to_write = "\n".join(cap.lines)
-            if red_mode == "a" and _fm.exists(target_path):
-                fd = _fm.open(target_path, "a")
-                _fm.write(fd, "\n" + data_to_write if data_to_write else "")
-                _fm.close(fd)
-            else:
-                _fm.create(target_path, data_to_write + "\n")
-        except Exception as e:
-            print("[redirect error]", e)
-        return None
-
+    if cap._buf:
+        cap.lines.append(cap._buf)
     return cap.lines
 
 
 def _run_statement(stmt):
+    """Run one ';'-separated statement, handling any '|' pipeline within it."""
     segments = [s.strip() for s in _split_top(stmt, "|")]
     segments = [s for s in segments if s]
     if not segments:
@@ -1927,10 +2448,15 @@ def _run_statement(stmt):
         data = _run_single(seg, pipe_in=data, capture=not is_last)
 
 
+# =================================================
+# TOP-LEVEL COMMAND HANDLER
+# =================================================
+
 def handle(raw):
     raw = raw.strip()
     if not raw:
         return
+
     statements = [s.strip() for s in _split_top(raw, ";")]
     for stmt in statements:
         if not stmt:
@@ -1940,24 +2466,32 @@ def handle(raw):
 
 
 # =================================================
-# STARTUP BANNER & LOOP
+# STARTUP BANNER
 # =================================================
 print(f"\n{ZENOS_NAME} — ZenCMD {ZENCMD_VERSION}")
 print(f"Logged in as: {zeno.user}")
 if Services is None:
-    print("[ZenCMD] Services unavailable -- running in recovery fallback.")
+    print("[ZenCMD] Services unavailable -- most commands are disabled.")
+    print("[ZenCMD] Run 'recover' to rebuild the OS from pkgtable.json.")
 print("Type 'help' for commands.\n")
 logger.debug(f"ZenCMD started, user={zeno.user}", source="ZenCMD")
 
+# =================================================
+# MAIN LOOP
+# =================================================
 while True:
     try:
         line = input(_prompt()).strip()
         handle(line)
+
     except SystemExit:
         logger.debug("ZenCMD exited normally", source="ZenCMD")
         break
+
     except KeyboardInterrupt:
         print("\n[ZenCMD] ^C")
+
     except Exception as e:
         print("[ZenCMD] Error:", e)
         logger.error(str(e), source="ZenCMD")
+
