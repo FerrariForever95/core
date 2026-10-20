@@ -184,32 +184,31 @@ def show_error_dialog(title, err_message):
 
 
 def launch_app(name):
-    base_name = name[:-3] if name.endswith(".py") else name
-    path = APP_PATH + "/" + base_name + ".py"
-    
-    gc.collect()
-    log.debug("launching app '{}'".format(base_name), source="KERNEL")
-    
+    path = APP_PATH + "/" + name + ".py"
     globals()["APP_EXIT"] = AppExit
-
+    
+    print("[KERNEL] Launching app:", name)
+    log.debug("launching app '{}'".format(name), source="KERNEL")
+    
     try:
-        with open(path, "r") as f:
-            src = f.read()
-        
-        exec(compile(src, path, "exec"), globals())
-        redraw_home()
-        
+        with open(path) as f:
+            exec(f.read(), globals())
     except AppExit:
-        redraw_home()
-        
+        print("[KERNEL] App exited normally:", name)
     except Exception as e:
         buf = uio.StringIO()
         sys.print_exception(e, buf)
-        err_str = "{} - {}".format(type(e).__name__, e)
-        print("[APP ERROR]", base_name)
-        print(buf.getvalue())
-        log.error("app '{}' crashed: {}".format(base_name, e), source="KERNEL")
-        show_error_dialog("Error: " + base_name, err_str)
+        err_output = buf.getvalue()
+        
+        # Print full traceback to console/REPL so you can track outputs/prints
+        print("[APP ERROR CRASH]", name)
+        print(err_output)
+        
+        log.error("app '{}' crashed: {}".format(name, e), source="KERNEL")
+        show_error_dialog("Error: " + name, str(e))
+    finally:
+        redraw_home()
+
 # ---------------------------------------------------------------------------
 # POWER DIALOG
 # ---------------------------------------------------------------------------
