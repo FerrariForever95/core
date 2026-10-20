@@ -187,28 +187,32 @@ def launch_app(name):
     path = APP_PATH + "/" + name + ".py"
     globals()["APP_EXIT"] = AppExit
     
-    print("[KERNEL] Launching app:", name)
-    log.debug("launching app '{}'".format(name), source="KERNEL")
+    print("\n--- [LAUNCH DEBUG] ---")
+    print("1. App Name requested:", name)
+    print("2. Resolved file path:", path)
     
     try:
+        print("3. Attempting to open file...")
         with open(path) as f:
-            exec(f.read(), globals())
+            code = f.read()
+        print("4. File opened successfully. Code length:", len(code), "bytes")
+        
+        print("5. Executing code via exec(code, globals())...")
+        exec(code, globals())
+        print("6. Execution completed normally.")
+        
     except AppExit:
-        print("[KERNEL] App exited normally:", name)
+        print("-> Caught AppExit exception (normal app close).")
     except Exception as e:
         buf = uio.StringIO()
         sys.print_exception(e, buf)
-        err_output = buf.getvalue()
-        
-        # Print full traceback to console/REPL so you can track outputs/prints
-        print("[APP ERROR CRASH]", name)
-        print(err_output)
-        
-        log.error("app '{}' crashed: {}".format(name, e), source="KERNEL")
+        print("-> CRASH DETECTED IN APP:", name)
+        print(buf.getvalue())
         show_error_dialog("Error: " + name, str(e))
     finally:
+        print("7. Redrawing home screen...")
         redraw_home()
-
+        print("--- [LAUNCH END] ---\n")
 # ---------------------------------------------------------------------------
 # POWER DIALOG
 # ---------------------------------------------------------------------------
