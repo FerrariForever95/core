@@ -13,7 +13,7 @@ if "/bin/Graphics" not in sys.path:
     sys.path.append("/bin/Graphics")
 
 from Graphics import Graphics as gfx
-
+  # Switch to Portrait
 # Map required Graphics API attributes
 color565        = gfx.color565
 UIWindow        = gfx.UIWindow
