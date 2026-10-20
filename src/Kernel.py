@@ -184,43 +184,32 @@ def show_error_dialog(title, err_message):
 
 
 def launch_app(name):
-    path = APP_PATH + "/" + name + ".py"
-    app_dir = APP_PATH if 'APP_PATH' in globals() else "/SYSTEM32/APPS"
-    gc.collect()
-    log.debug("launching app '{}' (non-isolated)".format(name), source="KERNEL")
+    base_name = name[:-3] if name.endswith(".py") else name
+    path = APP_PATH + "/" + base_name + ".py"
     
-    # Expose app control flags in the shared global scope
+    gc.collect()
+    log.debug("launching app '{}'".format(base_name), source="KERNEL")
+    
     globals()["APP_EXIT"] = AppExit
-    globals()["__file__"] = path
-    globals()["__name__"] = "__main__"
-
-    old_path = list(sys.path)
-    old_cwd = os.getcwd()
-    for p in [app_dir, "/bin", "/"]:
-        if p not in sys.path:
-            sys.path.insert(0, p)
 
     try:
-        os.chdir(app_dir)
-        with open(path) as f:
-            exec(compile(f.read(), path, "exec"), globals())
+        with open(path, "r") as f:
+            src = f.read()
+        
+        exec(compile(src, path, "exec"), globals())
         redraw_home()
+        
     except AppExit:
         redraw_home()
+        
     except Exception as e:
         buf = uio.StringIO()
         sys.print_exception(e, buf)
         err_str = "{} - {}".format(type(e).__name__, e)
-        print("[APP ERROR]", name)
+        print("[APP ERROR]", base_name)
         print(buf.getvalue())
-        log.error("app '{}' crashed: {}".format(name, e), source="KERNEL")
-        show_error_dialog("Error: " + name, err_str)
-    finally:
-        try:
-            os.chdir(old_cwd)
-        except Exception:
-            os.chdir("/")
-        sys.path = old_path
+        log.error("app '{}' crashed: {}".format(base_name, e), source="KERNEL")
+        show_error_dialog("Error: " + base_name, err_str)
 # ---------------------------------------------------------------------------
 # POWER DIALOG
 # ---------------------------------------------------------------------------
