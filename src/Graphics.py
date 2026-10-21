@@ -2954,20 +2954,12 @@ class UIIconButton(UIWidget):
                         log_error("UIIconButton action failed: {}".format(e))
                 return True
         return self.pressed
-
-
-# ---------------------------------------------------------------------
-# UIWindow -- Upgraded with Minimize, Maximize, and Red Exit Button
-# ---------------------------------------------------------------------
 class UIWindow(UIScreen):
-    """Window manager supporting title bar, wallpaper/backgrounds, and 
-    window controls: Close (X), Minimize (_), and Maximize ([]).
-    Minimized windows dock to a bottom taskbar with their app logo."""
+    """Window manager supporting title bar, wallpaper/backgrounds, and a red close button (X)."""
 
     def __init__(self, lcd, title=None, background=None, on_exit=None,
                  taskbar_color=color565(50, 50, 50), title_color=WHITE,
-                 taskbar_height=35, exit_button=True, minimize_button=True, 
-                 maximize_button=True, logo_path=None, widgets=None):
+                 taskbar_height=35, exit_button=True, widgets=None):
         super().__init__(lcd, background if isinstance(background, int) else BLACK, widgets)
         self.wallpaper = background if isinstance(background, str) else None
         self.title = title
@@ -2975,84 +2967,29 @@ class UIWindow(UIScreen):
         self.taskbar_color = taskbar_color
         self.title_color = title_color
         self.taskbar_height = taskbar_height
-        self.logo_path = logo_path
         
         self._grad = None
         self._grad_block = 8
         self._prev_bg = None
-        self.minimized = False
-        self.maximized = False
 
         sz = max(16, taskbar_height - 5)
-        
         self.exit_btn = None
-        self.min_btn = None
-        self.max_btn = None
-        
-        btn_x = WIDTH - sz - 2
         
         if exit_button:
-            self.exit_btn = UIButton(lcd, btn_x, (taskbar_height - sz) // 2, sz, sz, "X",
+            # Red close button positioned on the top right
+            self.exit_btn = UIButton(lcd, WIDTH - sz - 2, (taskbar_height - sz) // 2, sz, sz, "X",
                                      action=self._exit, color=color565(200, 0, 0), radius=4)
-            btn_x -= (sz + 4)
-            
-        if maximize_button:
-            self.max_btn = UIButton(lcd, btn_x, (taskbar_height - sz) // 2, sz, sz, "[]",
-                                    action=self.toggle_maximize, color=color565(80, 80, 90), radius=4)
-            btn_x -= (sz + 4)
-            
-        if minimize_button:
-            self.min_btn = UIButton(lcd, btn_x, (taskbar_height - sz) // 2, sz, sz, "_",
-                                    action=self.minimize, color=color565(80, 80, 90), radius=4)
 
     def _relayout(self, old_w, old_h, new_w, new_h):
+        """Automatically repositions the close button on screen rotation."""
         sz = max(16, self.taskbar_height - 5)
-        btn_x = new_w - sz - 2
-        
         if self.exit_btn is not None:
-            self.exit_btn.x = btn_x
+            self.exit_btn.x = new_w - sz - 2
             self.exit_btn.y = (self.taskbar_height - sz) // 2
-            btn_x -= (sz + 4)
-            
-        if self.max_btn is not None:
-            self.max_btn.x = btn_x
-            self.max_btn.y = (self.taskbar_height - sz) // 2
-            btn_x -= (sz + 4)
-            
-        if self.min_btn is not None:
-            self.min_btn.x = btn_x
-            self.min_btn.y = (self.taskbar_height - sz) // 2
 
     def _exit(self):
         if self.on_exit:
             self.on_exit()
-
-    def minimize(self):
-        if self.minimized:
-            return
-        self.minimized = True
-        
-        if self not in _minimized_windows:
-            _minimized_windows.append(self)
-            
-        clear(background)
-        global active_screen
-        if active_screen == self:
-            active_screen = None
-        print("[UIWindow] Minimized:", self.title)
-
-    def restore(self):
-        if not self.minimized:
-            return
-        self.minimized = False
-        if self in _minimized_windows:
-            _minimized_windows.remove(self)
-        self.show()
-        print("[UIWindow] Restored:", self.title)
-
-    def toggle_maximize(self):
-        self.maximized = not self.maximized
-        self.draw()
 
     def _draw_taskbar(self):
         h = self.taskbar_height
@@ -3062,39 +2999,38 @@ class UIWindow(UIScreen):
                                self.title_color, self.taskbar_color)
         if self.exit_btn is not None:
             self.exit_btn.draw()
-        if self.min_btn is not None:
-            self.min_btn.draw()
-        if self.max_btn is not None:
-            self.max_btn.draw()
 
-    def draw_minimized_dock(self):
-        if not _minimized_windows:
+    def taskbar(self, color, title, text_color=WHITE, height=35):
+        self.taskbar_color = color
+        self.title = title
+        self.title_color = text_color
+        self.taskbar_height = height
+        self._draw_taskbar()
+
+    def layer(self, x, y, width, height, color):
+        fill_rect(x, y, width, height, color)
+
+    def draw_gradient(self, c1, c2, angle=0, block_size=8):
+        angle = angle % 360
+        self._grad = (c1, c2, angle)
+        self._grad_block = max(2, int(block_size))
+        self._paint_gradient()
+
+    def _paint_gradient(self):
+        c1, c2, a = self._grad
+        if a in (45, 135):
+            bs = self._grad_block
+            total = WIDTH + HEIGHT
+            for y in range(0, HEIGHT, bs):
+                for x in range(0, WIDTH, bs):
+                    t = (x + (HEIGHT - y)) / total if a == 45 else (x + y) / total
+                    fill_rect(x, y, bs, bs, blend(c1, c2, int(_clamp(t, 0.0, 1.0) * 255)))
             return
-        dock_h = 32
-        dock_y = HEIGHT - dock_h
-        fill_rect(0, dock_y, WIDTH, dock_h, color565(20, 20, 25))
-        draw_hline(0, dock_y, WIDTH, BORDER)
-        
-        icon_size = 24
-        x = 10
-        y = dock_y + (dock_h - icon_size) // 2
-        
-        for win in _minimized_windows:
-            draw_rounded_rect(x, y, icon_size + 30, icon_size, 4, SURFACE_ALT, filled=True)
-            draw_rounded_rect(x, y, icon_size + 30, icon_size, 4, BORDER, filled=False)
-            
-            if win.logo_path:
-                try:
-                    draw_transparent_image(win.logo_path, x + 4, y + 2, max_w=20, max_h=20)
-                except Exception:
-                    pass
-            txt = win.title[:4] if win.title else "App"
-            draw_text(x + 26, y + 8, txt, WHITE, SURFACE_ALT, FONT_8X8, 1)
-            x += icon_size + 38
+        if a in (180, 270):
+            c1, c2 = c2, c1
+        draw_gradient_rect(0, 0, WIDTH, HEIGHT, c1, c2, a not in (90, 270))
 
     def draw(self):
-        if self.minimized:
-            return
         if self._grad is not None:
             self._paint_gradient()
         elif self.wallpaper:
@@ -3109,19 +3045,15 @@ class UIWindow(UIScreen):
         for w in self.widgets:
             if w.visible:
                 w.draw()
-        self.draw_minimized_dock()
 
     def start(self, animate=True):
         self._prev_bg = background
-        self.minimized = False
         if animate:
             window_open_animation(0.4, 60, self.bg)
         self.show()
 
     def close(self, animate=True):
         global active_screen
-        if self in _minimized_windows:
-            _minimized_windows.remove(self)
         if animate:
             window_close_animation(0.4, 60)
         if active_screen is self:
@@ -3133,37 +3065,14 @@ class UIWindow(UIScreen):
         pt = get_touch()
         if pt is None:
             return False
-            
         if self.exit_btn is not None and self.exit_btn.handle_touch(pt):
             return True
-        if self.min_btn is not None and self.min_btn.handle_touch(pt):
-            return True
-        if self.max_btn is not None and self.max_btn.handle_touch(pt):
-            return True
-            
-        if _minimized_windows and pt[1] >= HEIGHT - 32:
-            icon_size = 24
-            x = 10
-            for win in _minimized_windows:
-                item_w = icon_size + 30
-                if x <= pt[0] <= x + item_w:
-                    win.restore()
-                    return True
-                x += item_w + 8
-                
         return False
 
     def poll(self):
-        if self.minimized:
-            return self.check()
-            
         ws = self.widgets[:]
         if self.exit_btn is not None:
             ws.append(self.exit_btn)
-        if self.min_btn is not None:
-            ws.append(self.min_btn)
-        if self.max_btn is not None:
-            ws.append(self.max_btn)
         
         handled = poll(ws)
         if not handled:
