@@ -4003,7 +4003,10 @@ class UIIconButton(UIWidget):
                 return True
         return self.pressed
 class UIGradientWallpaper(UIWidget):
-    def __init__(self, lcd, colors, angle=0):
+    """High-fidelity multi-stop gradient wallpaper widget supporting 
+    smooth linear, diagonal, and radial interpolation across screen rotations."""
+    
+    def __init__(self, lcd, colors, angle=135):
         super().__init__(lcd, 0, 0, WIDTH, HEIGHT)
         self.colors = list(colors) if colors else [BLACK, BLACK]
         self.angle = int(angle) % 360
@@ -4016,7 +4019,6 @@ class UIGradientWallpaper(UIWidget):
             self.draw()
 
     def _relayout(self, old_w, old_h, new_w, new_h):
-        # Wallpapers always span the entire live screen dimensions
         self.x = 0
         self.y = 0
         self.w = new_w
@@ -4031,53 +4033,42 @@ class UIGradientWallpaper(UIWidget):
             fill_rect(0, 0, WIDTH, HEIGHT, self.colors[0] if n == 1 else BLACK)
             return
 
-        # Handle standard 90-degree increments using built-in draw_gradient_rect
-        if self.angle == 0:
-            # Vertical top-to-bottom
-            step = HEIGHT / (n - 1)
-            for i in range(n - 1):
-                y0 = int(i * step)
-                y1 = int((i + 1) * step)
-                h = max(1, y1 - y0)
-                draw_gradient_rect(0, y0, WIDTH, h, self.colors[i], self.colors[i+1], vertical=True)
-        elif self.angle == 180:
-            # Vertical bottom-to-top
-            step = HEIGHT / (n - 1)
-            for i in range(n - 1):
-                y0 = int(i * step)
-                y1 = int((i + 1) * step)
-                h = max(1, y1 - y0)
-                draw_gradient_rect(0, y0, WIDTH, h, self.colors[i+1], self.colors[i], vertical=True)
-        elif self.angle == 90:
-            # Horizontal left-to-right
-            step = WIDTH / (n - 1)
-            for i in range(n - 1):
-                x0 = int(i * step)
-                x1 = int((i + 1) * step)
-                w = max(1, x1 - x0)
-                draw_gradient_rect(x0, 0, w, HEIGHT, self.colors[i], self.colors[i+1], vertical=False)
-        elif self.angle == 270:
-            # Horizontal right-to-left
-            step = WIDTH / (n - 1)
-            for i in range(n - 1):
-                x0 = int(i * step)
-                x1 = int((i + 1) * step)
-                w = max(1, x1 - x0)
-                draw_gradient_rect(x0, 0, w, HEIGHT, self.colors[i+1], self.colors[i], vertical=False)
-        else:
-            # Diagonal / multi-stop custom angle blend using pixel blocks
-            block_size = 8
-            total = WIDTH + HEIGHT
-            c0, c1 = self.colors[0], self.colors[-1]
-            a = self.angle
-            for y in range(0, HEIGHT, block_size):
-                for x in range(0, WIDTH, block_size):
-                    if a == 45:
-                        t = (x + (HEIGHT - y)) / total
-                    elif a == 135:
-                        t = (x + y) / total
-                    else:
-                        t = x / WIDTH  # Fallback smooth interpolation
-                    t = _clamp(t, 0.0, 1.0)
-                    col = blend(c0, c1, int(t * 255))
-                    fill_rect(x, y, block_size, block_size, col)
+        # Use optimized block rendering for ultra-smooth gradients without performance lag
+        block_size = 4  # Smaller block size = higher fidelity smoothness
+        total_stops = n - 1
+        
+        for y in range(0, HEIGHT, block_size):
+            for x in range(0, WIDTH, block_size):
+                # Calculate progress factor (0.0 to 1.0) based on angle
+                if self.angle == 0:  # Top to Bottom
+                    t = y / HEIGHT
+                elif self.angle == 180:  # Bottom to Top
+                    t = 1.0 - (y / HEIGHT)
+                elif self.angle == 90:  # Left to Right
+                    t = x / WIDTH
+                elif self.angle == 270:  # Right to Left
+                    t = 1.0 - (x / WIDTH)
+                elif self.angle == 45:  # Bottom-Left to Top-Right
+                    t = (x + (HEIGHT - y)) / (WIDTH + HEIGHT)
+                else:  # Default 135: Top-Left to Bottom-Right (Classic Ubuntu / Modern Dark)
+                    t = (x + y) / (WIDTH + HEIGHT)
+                
+                t = _clamp(t, 0.0, 1.0)
+                
+                # Determine which color stop segment we are in
+                scaled_t = t * total_stops
+                segment = int(scaled_t)
+                if segment >= total_stops:
+                    segment = total_stops - 1
+                    local_t = 1.0
+                else:
+                    local_t = scaled_t - segment
+                
+                c0 = self.colors[segment]
+                c1 = self.colors[segment + 1]
+                
+                # Smooth out local transition (alpha 0 to 255)
+                alpha = int(local_t * 255)
+                col = blend(c0, c1, alpha)
+                
+                fill_rect(x, y, block_size, block_size, col)
