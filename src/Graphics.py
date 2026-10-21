@@ -29,6 +29,9 @@ import json
 import micropython
 import lcd
 import touch
+import bmp
+import png
+import jpeg
 from machine import Pin
 
 pin = Pin(38, Pin.OUT)                # backlight enable
@@ -39,7 +42,7 @@ pin = Pin(38, Pin.OUT)                # backlight enable
 
 WIDTH = 480
 HEIGHT = 320
-ROTATION = 1                          # 0=Portrait, 1=Landscape, 2=Portrait Inv, 3=Landscape Inv
+ROTATION = 1                        # 0=Portrait, 1=Landscape, 2=Portrait Inv, 3=Landscape Inv
 
 # Design reference dimensions (if your UI layouts were written for 480x320 or 320x480)
 REF_WIDTH = 480
@@ -90,7 +93,60 @@ def blend(c0, c1, alpha):
     """alpha 0..255: 0 -> c0, 255 -> c1."""
     return lcd.blend(c0, c1, alpha)
 
-
+def draw_transparent_image(path, x, y, w=None, h=None, max_w=None, max_h=None, transparent_color=0x0000):
+    """Draws any image (BMP, PNG, JPEG) with a transparent color key (default black 0x0000).
+    Skips matching pixels so backgrounds and UI gradients show through seamlessly."""
+    x, y = int(x), int(y)
+    decoder = _get_image_decoder(path)
+    
+    fit_w = max_w if max_w is not None else w
+    fit_h = max_h if max_h is not None else h
+    
+    try:
+        img = decoder.open(path, fit=(fit_w, fit_h) if (fit_w or fit_h) else None)
+        dw, dh = img.width, img.height
+        
+        if _capturing:
+            _capture_ops.append(('image_transparent', path, x, y, dw, dh))
+            
+        buf = memoryview(img.buf)
+        for row in range(dh):
+            py = y + row
+            if py < 0 or py >= HEIGHT:
+                continue
+            row_offset = row * dw * 2
+            start_col = None
+            run_pixels = bytearray()
+            
+            for col in range(dw):
+                px = x + col
+                if px < 0 or px >= WIDTH:
+                    continue
+                idx = row_offset + (col * 2)
+                lo = buf[idx]
+                hi = buf[idx + 1]
+                color = (hi << 8) | lo
+                
+                if color == transparent_color:
+                    # Flush run on transparent pixel
+                    if start_col is not None and len(run_pixels) > 0:
+                        lcd.blit(start_col, py, len(run_pixels) // 2, 1, run_pixels)
+                        start_col = None
+                        run_pixels = bytearray()
+                else:
+                    # Accumulate opaque pixel
+                    if start_col is None:
+                        start_col = px
+                    run_pixels.append(lo)
+                    run_pixels.append(hi)
+                    
+            # Flush final run of the row
+            if start_col is not None and len(run_pixels) > 0:
+                lcd.blit(start_col, py, len(run_pixels) // 2, 1, run_pixels)
+        return dw, dh
+    except Exception as e:
+        log_error("Failed to draw transparent image {}: {}".format(path, e))
+        return 0, 0
 # Base Grayscale
 WHITE         = color565(255, 255, 255)
 SNOW          = color565(255, 250, 250)
@@ -843,182 +899,46 @@ def load_font(path):
 
 
 # ---------------------------------------------------------------------
-# BMP Loading
+# Native Image Loading (BMP / PNG / JPEG)
 # ---------------------------------------------------------------------
 
-@micropython.viper
-def _row24(src: ptr8, out: ptr8, o: int, n: int, xfp: int, step: int):
-    for k in range(n):
-        i = (xfp >> 16) * 3
-        v = ((int(src[i + 2]) & 0xF8) << 8) | ((int(src[i + 1]) & 0xFC) << 3) | (int(src[i]) >> 3)
-        out[o] = v >> 8
-        out[o + 1] = v & 0xFF
-        o += 2
-        xfp += step
-
-
-@micropython.viper
-def _row32(src: ptr8, out: ptr8, o: int, n: int, xfp: int, step: int):
-    for k in range(n):
-        i = (xfp >> 16) * 4
-        v = ((int(src[i + 2]) & 0xF8) << 8) | ((int(src[i + 1]) & 0xFC) << 3) | (int(src[i]) >> 3)
-        out[o] = v >> 8
-        out[o + 1] = v & 0xFF
-        o += 2
-        xfp += step
-
-
-def _row16(src, out, o, n, xfp, step, is565):
-    for _ in range(n):
-        i = (xfp >> 16) * 2
-        lo = src[i]
-        hi = src[i + 1]
-        if is565:
-            out[o] = hi
-            out[o + 1] = lo
-        else:
-            v = (hi << 8) | lo
-            v = ((v & 0x7FE0) << 1) | (v & 0x1F)
-            out[o] = v >> 8
-            out[o + 1] = v & 0xFF
-        o += 2
-        xfp += step
-
-
-def _row8(src, out, o, n, xfp, step, pal):
-    for _ in range(n):
-        j = src[xfp >> 16] * 2
-        out[o] = pal[j]
-        out[o + 1] = pal[j + 1]
-        o += 2
-        xfp += step
-
-
-def _le(b):
-    return int.from_bytes(b, "little")
-
-
-def _s32(b):
-    v = int.from_bytes(b, "little")
-    return v - 0x100000000 if v & 0x80000000 else v
-
-
-def _bmp_native_size(path):
-    with open(path, "rb") as f:
-        h = f.read(26)
-        if len(h) < 26 or h[0:2] != b"BM":
-            raise ValueError("not a BMP file")
-        return _s32(h[18:22]), abs(_s32(h[22:26]))
-
-
-def _bmp_parse(f):
-    h = f.read(54)
-    if len(h) < 54 or h[0:2] != b"BM":
-        raise ValueError("not a BMP file")
-    hdr = _le(h[14:18])
-    if hdr < 40:
-        raise ValueError("unsupported BMP header")
-    data_off = _le(h[10:14])
-    bw = _s32(h[18:22])
-    bh = _s32(h[22:26])
-    bpp = _le(h[28:30])
-    comp = _le(h[30:34])
-    ncol = _le(h[46:50])
-    topdown = bh < 0
-    bh = abs(bh)
-    if bw <= 0 or bh == 0:
-        raise ValueError("bad BMP size")
-    if comp not in (0, 3):
-        raise ValueError("compressed BMP not supported")
-    is565 = False
-    pal = None
-    if bpp == 16:
-        if comp == 3:
-            f.seek(54)
-            is565 = _le(f.read(4)) == 0xF800
-    elif bpp == 8:
-        f.seek(14 + hdr)
-        raw = f.read((ncol or 256) * 4)
-        pal = bytearray(512)
-        for i in range(min(256, len(raw) // 4)):
-            b = raw[i * 4]
-            g = raw[i * 4 + 1]
-            r = raw[i * 4 + 2]
-            v = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-            pal[i * 2] = v >> 8
-            pal[i * 2 + 1] = v & 0xFF
-    elif bpp not in (24, 32):
-        raise ValueError("unsupported BMP bit depth {}".format(bpp))
-    return bw, bh, topdown, bpp, data_off, pal, is565
+def _get_image_decoder(path):
+    ext = path.split(".")[-1].lower()
+    if ext == "bmp":
+        return bmp
+    elif ext == "png":
+        return png
+    elif ext in ("jpg", "jpeg"):
+        return jpeg
+    else:
+        # Fallback inspection by content sniffing if needed
+        return bmp
 
 
 def draw_bmp(path, x, y, w=None, h=None, max_w=None, max_h=None):
+    """Universal native image renderer supporting BMP, PNG, and JPEG formats."""
     x, y = int(x), int(y)
-    with open(path, "rb") as f:
-        bw, bh, topdown, bpp, data_off, pal, is565 = _bmp_parse(f)
-
-        if w and h:
-            dw, dh = int(w), int(h)
-        elif w:
-            dw = int(w)
-            dh = bh * dw // bw
-        elif h:
-            dh = int(h)
-            dw = bw * dh // bh
-        else:
-            dw, dh = bw, bh
-        if max_w and dw > max_w:
-            dh = dh * int(max_w) // dw
-            dw = int(max_w)
-        if max_h and dh > max_h:
-            dw = dw * int(max_h) // dh
-            dh = int(max_h)
-        dw = max(1, dw)
-        dh = max(1, dh)
-
+    
+    # Choose appropriate native decoder module based on extension
+    decoder = _get_image_decoder(path)
+    
+    # Fit constraints calculation
+    fit_w = max_w if max_w is not None else w
+    fit_h = max_h if max_h is not None else h
+    
+    try:
+        # Open and fit using native modules
+        img = decoder.open(path, fit=(fit_w, fit_h) if (fit_w or fit_h) else None)
+        dw, dh = img.width, img.height
+        
         if _capturing:
-            _capture_ops.append(('bmp', path, x, y, dw, dh))
-
-        vx0 = max(0, -x)
-        vx1 = min(dw, WIDTH - x)
-        vy0 = max(0, -y)
-        vy1 = min(dh, HEIGHT - y)
-        if vx1 <= vx0 or vy1 <= vy0:
-            return dw, dh
-        vw = vx1 - vx0
-
-        stride = ((bw * bpp + 31) // 32) * 4
-        xstep = (bw << 16) // dw
-        xfp0 = vx0 * xstep
-        rps = max(1, 8192 // (vw * 2))
-        strip = bytearray(vw * 2 * rps)
-        src = bytearray(stride)
-        last_sy = -1
-        r = 0
-        top = y + vy0
-
-        for dy in range(vy0, vy1):
-            sy = dy * bh // dh
-            if sy != last_sy:
-                f.seek(data_off + (sy if topdown else bh - 1 - sy) * stride)
-                f.readinto(src)
-                last_sy = sy
-            o = r * vw * 2
-            if bpp == 24:
-                _row24(src, strip, o, vw, xfp0, xstep)
-            elif bpp == 32:
-                _row32(src, strip, o, vw, xfp0, xstep)
-            elif bpp == 16:
-                _row16(src, strip, o, vw, xfp0, xstep, is565)
-            else:
-                _row8(src, strip, o, vw, xfp0, xstep, pal)
-            r += 1
-            if r == rps or dy == vy1 - 1:
-                lcd.blit(x + vx0, top, vw, r,
-                         strip if r == rps else memoryview(strip)[:r * vw * 2])
-                top += r
-                r = 0
+            _capture_ops.append(('image', path, x, y, dw, dh))
+            
+        lcd.blit(x, y, dw, dh, img.buf)
         return dw, dh
+    except Exception as e:
+        log_error("Failed to draw image {}: {}".format(path, e))
+        return 0, 0
 
 
 def draw_logo(path, box_x=0, box_y=0, box_w=None, box_h=None,
@@ -1034,12 +954,17 @@ def draw_logo(path, box_x=0, box_y=0, box_w=None, box_h=None,
 
     caption_h = (text_size(caption, font)[1] + 4) if caption else 0
     avail_h = max(1, box_h - caption_h)
-    native_w, native_h = _bmp_native_size(path)
+    
+    decoder = _get_image_decoder(path)
+    img = decoder.open(path)
+    native_w, native_h = img.src_size if hasattr(img, "src_size") else (img.width, img.height)
+    
     scale = min(box_w / native_w, avail_h / native_h, 1.0)
     out_w = max(1, int(native_w * scale))
     out_h = max(1, int(native_h * scale))
     lx = int(box_x) + (box_w - out_w) // 2
     ly = int(box_y) + (avail_h - out_h) // 2
+    
     draw_bmp(path, lx, ly, out_w, out_h)
     if caption:
         draw_text_centered(int(box_x) + box_w // 2, int(box_y) + avail_h + 2,
@@ -1169,7 +1094,7 @@ def replay_ops(ops, scale, ox, oy, text_reveal=0.92):
             draw_gradient_rect(_m(op[1], ox, scale), _m(op[2], oy, scale),
                                max(1, int(op[3] * scale)), max(1, int(op[4] * scale)),
                                op[5], op[6], op[7])
-        elif k == 'bmp':
+        elif k == 'image':
             draw_bmp(op[1], _m(op[2], ox, scale), _m(op[3], oy, scale),
                      max(1, int(op[4] * scale)), max(1, int(op[5] * scale)))
         elif k == 'text':
@@ -1356,7 +1281,7 @@ class UIButton(UIWidget):
 
     def contains(self, px, py, margin=None):
         return _point_in_rect(px, py, self.x, self.y, self.w, self.h,
-                              self.margin if margin is None else margin)
+                            self.margin if margin is None else margin)
 
     def set_text(self, text, redraw=True):
         self.text = str(text)
@@ -1403,12 +1328,7 @@ class UIButton(UIWidget):
 
 
 class UIIconButton(UIButton):
-    """Button that renders a 1bpp bitmap icon, a BMP file, or plain text.
-
-    New style : UIIconButton(lcd, x, y, w, h, icon_bits=bits, icon_w=24, icon_h=24, text="Home")
-                UIIconButton(lcd, x, y, w, h, bmp_path="/home.bmp", text="Home")
-    Old style : UIIconButton(lcd, x, y, w, h, "OK", bg, fg, action)
-                UIIconButton(lcd, x, y, w, h, label="OK", bg=..., fg=..., action=...)"""
+    """Button that renders a 1bpp bitmap icon, a BMP file, or plain text."""
 
     def __init__(self, lcd, x, y, w, h, icon_bits=None, icon_w=0, icon_h=0,
                  bmp_path=None, text="", action=None, color=None,
@@ -1473,7 +1393,7 @@ class UIBMPButton(UIWidget):
 
     def contains(self, px, py, margin=None):
         return _point_in_rect(px, py, self.x, self.y, self.w, self.h,
-                              self.margin if margin is None else margin)
+                            self.margin if margin is None else margin)
 
     def draw(self):
         if not self.visible:
@@ -1796,9 +1716,7 @@ class UISlider(UIWidget):
 
 
 class UISliderClassic(UISlider):
-    """Old UISlider(x, y, w, min_v, max_v, value, track, fill, knob, action).
-    The new UISlider takes h as its 4th positional arg, so the old signature
-    lives under this name."""
+    """Old UISlider(x, y, w, min_v, max_v, value, track, fill, knob, action)."""
 
     def __init__(self, lcd, x, y, w, min_v=0, max_v=100, value=0,
                  track=color565(80, 80, 80), fill=color565(0, 150, 255),
@@ -1930,7 +1848,7 @@ class UINumberBox(UIWidget):
         bw = min(self.h, self.w // 3)
         draw_rounded_rect(self.x, self.y, self.w, self.h, 6, self.color, filled=True)
         draw_rounded_rect(self.x, self.y, bw, self.h, 6,
-                           darken(self.btn_color, 60) if self._active_side == -1 else self.btn_color, filled=True)
+                          darken(self.btn_color, 60) if self._active_side == -1 else self.btn_color, filled=True)
         draw_rounded_rect(self.x + self.w - bw, self.y, bw, self.h, 6,
                           darken(self.btn_color, 60) if self._active_side == 1 else self.btn_color, filled=True)
         draw_text_in_rect(self.x, self.y, bw, self.h, "-", WHITE, TRANSPARENT, self.font, 1)
@@ -3315,6 +3233,8 @@ class VitualKeyboard:
 
     def clear_buffer(self):
         self.buffer = ""
+
+
 class UIInputTextBox(UIWidget):
     """Single-line text box fed by a keyboard's .buffer. Tapping it opens the
     keyboard (VirtualKeyboard.open(), or Keyboard.render()). Put it in the list
