@@ -1,4 +1,4 @@
-# kernel.py -- Zeno OS kernel (Standalone Graphics-API Edition with Ubuntu Gradient Theme).
+# kernel.py -- Zeno OS kernel (Standalone Graphics-API Edition with Clean Modern Gradient Theme).
 import os, sys, gc, uio, time
 import zeno
 import Services as S
@@ -42,7 +42,7 @@ LOGO_PATH     = "/SYSTEM32/APPS/LOGO"
 POWER_BMP     = "/SYSTEM32/RESOURCES/power.png"   # Supports .png (transparent) or .bmp/.jpg
 
 TASKBAR_H     = 35
-TASKBAR_RGB   = (44, 0, 30)      # Deep Ubuntu dark aubergine taskbar
+TASKBAR_RGB   = (22, 24, 35)      # Clean dark slate taskbar matching the gradient base
 POWER_SIZE    = 31               # icon tile in the taskbar
 LOGO_SIZE     = 50               # app logo; tile adds 4px inset each side
 TILE          = LOGO_SIZE + 8
@@ -50,16 +50,17 @@ PADDING       = 10
 TOUCH_MARGIN  = PADDING // 2        # extra touch area, kept < half the gap so tiles never overlap
 
 # ---------------------------------------------------------------------------
-# UBUNTU GRADIENT THEME WALLPAPER
+# PREMIUM CLEAN MODERN GRADIENT THEME WALLPAPER
 # ---------------------------------------------------------------------------
+# A smooth, professional multi-stop dark mode palette (Deep Space -> Slate -> Soft Indigo)
 ubuntu_gradient_wallpaper = gfx.UIGradientWallpaper(
     lcd, 
     [
-        G.color565(44, 0, 30),    # Deep Aubergine Purple
-        G.color565(89, 43, 76),   # Mid Violet-Aubergine
-        G.color565(227, 85, 27)   # Classic Ubuntu Warm Orange
+        G.color565(12, 14, 20),    # Deep Obsidian Base
+        G.color565(24, 28, 42),    # Midnight Slate
+        G.color565(42, 38, 70)     # Refined Soft Indigo Accent
     ], 
-    angle=135                     # Diagonal gradient flow
+    angle=135                     # Clean diagonal light sweep
 )
 
 # ---------------------------------------------------------------------------
@@ -94,12 +95,12 @@ def _safe_draw(w):
 
 
 def draw_wallpaper():
-    """Renders the multi-stop Ubuntu gradient wallpaper."""
+    """Renders the clean, high-fidelity gradient wallpaper."""
     try:
         ubuntu_gradient_wallpaper.draw()
     except Exception as e:
         log.error("gradient wallpaper draw failed: {}".format(e), source="KERNEL")
-        G.clear(G.color565(44, 0, 30))
+        G.clear(G.color565(12, 14, 20))
 
 
 def scan_apps():
@@ -145,12 +146,13 @@ def build_icons(names):
         if y + TILE > sh:
             break
         
+        # Sleek semi-transparent style tile container that blends nicely over the gradient
         _icons.append(AppIcon(
             lcd,
             x, y, TILE, TILE,
             image_path=get_logo_path(name),
             action=lambda n=name: launch_app(n),
-            color=G.color565(60, 20, 50), radius=6))
+            color=G.color565(32, 36, 54), radius=8))
         x += TILE + PADDING
     _app_names = names
 
@@ -253,7 +255,7 @@ def start_ui():
     global header, btn_power, dlg
     
     G.pin.on()
-    G.set_background(G.color565(44, 0, 30))
+    G.set_background(G.color565(12, 14, 20))
 
     bar = G.color565(*TASKBAR_RGB)
     header = G.UIHeader(lcd, "Zeno OS", TASKBAR_H, bg=bar, fg=G.WHITE)
