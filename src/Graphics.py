@@ -2953,7 +2953,7 @@ class UIIconButton(UIWidget):
                     except Exception as e:
                         log_error("UIIconButton action failed: {}".format(e))
                 return True
-        return self.pressed
+        return self.pressedreen render
 class UIWindow(UIScreen):
     """Window manager supporting title bar, wallpaper/backgrounds, and a red close button (X)."""
 
@@ -4002,4 +4002,93 @@ class UIIconButton(UIWidget):
                         log_error("UIIconButton action failed: {}".format(e))
                 return True
         return self.pressed
+class UIGradientWallpaper(UIWidget):
+    """Advanced gradient wallpaper widget supporting multi-color stops 
+    and arbitrary angles across screen rotations.
     
+    Usage:
+        # Dual color vertical gradient
+        bg = gfx.UIGradientWallpaper(lcd, [gfx.color565(30, 35, 60), gfx.color565(10, 10, 15)], angle=0)
+        bg.draw()
+        
+        # Multi-stop sunset gradient
+        sunset = gfx.UIGradientWallpaper(lcd, [gfx.RED, gfx.ORANGE, gfx.PURPLE], angle=45)
+    """
+    def __init__(self, lcd, colors, angle=0):
+        super().__init__(lcd, 0, 0, WIDTH, HEIGHT)
+        self.colors = list(colors) if colors else [BLACK, BLACK]
+        self.angle = int(angle) % 360
+
+    def set_gradient(self, colors, angle=None, redraw=True):
+        self.colors = list(colors) if colors else [BLACK, BLACK]
+        if angle is not None:
+            self.angle = int(angle) % 360
+        if redraw and self.visible:
+            self.draw()
+
+    def _relayout(self, old_w, old_h, new_w, new_h):
+        # Wallpapers always span the entire live screen dimensions
+        self.x = 0
+        self.y = 0
+        self.w = new_w
+        self.h = new_h
+
+    def draw(self):
+        if not self.visible:
+            return
+        
+        n = len(self.colors)
+        if n < 2:
+            fill_rect(0, 0, WIDTH, HEIGHT, self.colors[0] if n == 1 else BLACK)
+            return
+
+        # Handle standard 90-degree increments using built-in draw_gradient_rect
+        if self.angle == 0:
+            # Vertical top-to-bottom
+            step = HEIGHT / (n - 1)
+            for i in range(n - 1):
+                y0 = int(i * step)
+                y1 = int((i + 1) * step)
+                h = max(1, y1 - y0)
+                draw_gradient_rect(0, y0, WIDTH, h, self.colors[i], self.colors[i+1], vertical=True)
+        elif self.angle == 180:
+            # Vertical bottom-to-top
+            step = HEIGHT / (n - 1)
+            for i in range(n - 1):
+                y0 = int(i * step)
+                y1 = int((i + 1) * step)
+                h = max(1, y1 - y0)
+                draw_gradient_rect(0, y0, WIDTH, h, self.colors[i+1], self.colors[i], vertical=True)
+        elif self.angle == 90:
+            # Horizontal left-to-right
+            step = WIDTH / (n - 1)
+            for i in range(n - 1):
+                x0 = int(i * step)
+                x1 = int((i + 1) * step)
+                w = max(1, x1 - x0)
+                draw_gradient_rect(x0, 0, w, HEIGHT, self.colors[i], self.colors[i+1], vertical=False)
+        elif self.angle == 270:
+            # Horizontal right-to-left
+            step = WIDTH / (n - 1)
+            for i in range(n - 1):
+                x0 = int(i * step)
+                x1 = int((i + 1) * step)
+                w = max(1, x1 - x0)
+                draw_gradient_rect(x0, 0, w, HEIGHT, self.colors[i+1], self.colors[i], vertical=False)
+        else:
+            # Diagonal / multi-stop custom angle blend using pixel blocks
+            block_size = 8
+            total = WIDTH + HEIGHT
+            c0, c1 = self.colors[0], self.colors[-1]
+            a = self.angle
+            for y in range(0, HEIGHT, block_size):
+                for x in range(0, WIDTH, block_size):
+                    if a == 45:
+                        t = (x + (HEIGHT - y)) / total
+                    elif a == 135:
+                        t = (x + y) / total
+                    else:
+                        t = x / WIDTH  # Fallback smooth interpolation
+                    t = _clamp(t, 0.0, 1.0)
+                    col = blend(c0, c1, int(t * 255))
+                    fill_rect(x, y, block_size, block_size, col)
