@@ -1,4 +1,4 @@
-# kernel.py -- Zeno OS kernel (Standalone Graphics-API Edition with Error Modal Dialogs).
+# kernel.py -- Zeno OS kernel (Standalone Graphics-API Edition with Ubuntu Gradient Theme).
 import os, sys, gc, uio, time
 import zeno
 import Services as S
@@ -36,18 +36,31 @@ log.debug("kernel loading (standalone)", source="KERNEL")
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-ROTATION      = getattr(zeno, "rotation", 1)     # 0/2 portrait, 1/3 landscape
+ROTATION      = getattr(zeno, "rotation", 1)      # 0/2 portrait, 1/3 landscape
 APP_PATH      = "/SYSTEM32/APPS"
 LOGO_PATH     = "/SYSTEM32/APPS/LOGO"
-POWER_BMP     = "/SYSTEM32/RESOURCES/power.bmp"
+POWER_BMP     = "/SYSTEM32/RESOURCES/power.png"   # Supports .png (transparent) or .bmp/.jpg
 
 TASKBAR_H     = 35
-TASKBAR_RGB   = (125, 125, 125)
-POWER_SIZE    = 31                 # icon tile in the taskbar
-LOGO_SIZE     = 50                 # app logo; tile adds 4px inset each side
+TASKBAR_RGB   = (44, 0, 30)      # Deep Ubuntu dark aubergine taskbar
+POWER_SIZE    = 31               # icon tile in the taskbar
+LOGO_SIZE     = 50               # app logo; tile adds 4px inset each side
 TILE          = LOGO_SIZE + 8
 PADDING       = 10
-TOUCH_MARGIN  = PADDING // 2       # extra touch area, kept < half the gap so tiles never overlap
+TOUCH_MARGIN  = PADDING // 2        # extra touch area, kept < half the gap so tiles never overlap
+
+# ---------------------------------------------------------------------------
+# UBUNTU GRADIENT THEME WALLPAPER
+# ---------------------------------------------------------------------------
+ubuntu_gradient_wallpaper = gfx.UIGradientWallpaper(
+    lcd, 
+    [
+        G.color565(44, 0, 30),    # Deep Aubergine Purple
+        G.color565(89, 43, 76),   # Mid Violet-Aubergine
+        G.color565(227, 85, 27)   # Classic Ubuntu Warm Orange
+    ], 
+    angle=135                     # Diagonal gradient flow
+)
 
 # ---------------------------------------------------------------------------
 # GRAPHICS WIDGET & HELPERS
@@ -56,27 +69,6 @@ class AppIcon(UIIconButton):
     """Icon tile with a slightly larger touch area than its drawn size."""
     def contains(self, px, py, margin=2):
         return G.UIWidget.contains(self, px, py, TOUCH_MARGIN)
-
-    def draw(self):
-        if not self.visible:
-            return
-        c = G.DARK_GRAY if not self.enabled else (self.pressed_color if self.pressed else self.color)
-        tc = G.TEXT_MUTED if not self.enabled else self.text_color
-        r = G._clamp(self.radius, 0, min(self.w, self.h) // 2)
-        
-        G.draw_rounded_rect(self.x, self.y, self.w, self.h, r, c, filled=True)
-        if self.border_color is not None:
-            G.draw_rounded_rect(self.x, self.y, self.w, self.h, r, self.border_color, filled=False)
-            
-        if self.bmp_path:
-            inset = 4
-            iw = self.w - (inset * 2)
-            ih = self.h - (inset * 2)
-            try:
-                G.draw_logo(self.bmp_path, self.x + inset, self.y + inset, iw, ih,
-                            caption=None, caption_color=tc, bg=None, font=self.font)
-            except Exception as e:
-                log.error("AppIcon logo draw failed: {}".format(e), source="KERNEL")
 
 header = None
 btn_power = None
@@ -102,23 +94,40 @@ def _safe_draw(w):
 
 
 def draw_wallpaper():
-    wp = getattr(zeno, "wallpaper", None)
-    if wp:
-        try:
-            G.draw_bmp(wp, 0, 0, G.WIDTH, G.HEIGHT)
-            return
-        except Exception as e:
-            log.error("wallpaper failed: {}".format(e), source="KERNEL")
-    G.clear(G.BLACK)
+    """Renders the multi-stop Ubuntu gradient wallpaper."""
+    try:
+        ubuntu_gradient_wallpaper.draw()
+    except Exception as e:
+        log.error("gradient wallpaper draw failed: {}".format(e), source="KERNEL")
+        G.clear(G.color565(44, 0, 30))
 
 
 def scan_apps():
     try:
         apps = os.listdir(APP_PATH)
-        logos = set(os.listdir(LOGO_PATH))
+        logo_files = set(os.listdir(LOGO_PATH))
     except Exception:
         return []
-    return sorted(f[:-3] for f in apps if f.endswith(".py") and (f[:-3] + ".bmp") in logos)
+    
+    valid_apps = []
+    for f in apps:
+        if f.endswith(".py"):
+            base = f[:-3]
+            if (base + ".bmp") in logo_files or (base + ".png") in logo_files or (base + ".jpg") in logo_files:
+                valid_apps.append(base)
+    return sorted(valid_apps)
+
+
+def get_logo_path(name):
+    """Checks for .png first (for transparency), falls back to .jpg and .bmp."""
+    for ext in (".png", ".jpg", ".jpeg", ".bmp"):
+        p = LOGO_PATH + "/" + name + ext
+        try:
+            os.stat(p)
+            return p
+        except Exception:
+            continue
+    return LOGO_PATH + "/" + name + ".bmp"
 
 
 def build_icons(names):
@@ -135,12 +144,13 @@ def build_icons(names):
             y += TILE + PADDING
         if y + TILE > sh:
             break
+        
         _icons.append(AppIcon(
             lcd,
             x, y, TILE, TILE,
-            bmp_path=LOGO_PATH + "/" + name + ".bmp",
+            image_path=get_logo_path(name),
             action=lambda n=name: launch_app(n),
-            color=G.SURFACE_ALT, radius=0))
+            color=G.color565(60, 20, 50), radius=6))
         x += TILE + PADDING
     _app_names = names
 
@@ -156,6 +166,7 @@ def redraw_home():
     _safe_draw(btn_power)
     for b in _icons:
         _safe_draw(b)
+        
     home_widgets[:] = [btn_power] + _icons
 
 # ---------------------------------------------------------------------------
@@ -186,7 +197,6 @@ def show_error_dialog(title, err_message):
 def launch_app(name):
     path = APP_PATH + "/" + name + ".py"
     
-    # Expose AppExit globally so apps can access and raise it when closed
     globals()["APP_EXIT"] = AppExit
     
     print("[KERNEL] Launching app:", name)
@@ -196,7 +206,6 @@ def launch_app(name):
         with open(path) as f:
             code = f.read()
         
-        # Pass globals() so the app can see APP_EXIT, lcd/zeno.ui, and modules
         exec(code, globals())
         
     except AppExit:
@@ -215,8 +224,8 @@ def launch_app(name):
         show_error_dialog("Error: " + name, str(e))
         
     finally:
-        # Always return cleanly to the home screen grid
         redraw_home()
+
 # ---------------------------------------------------------------------------
 # POWER DIALOG
 # ---------------------------------------------------------------------------
@@ -244,14 +253,18 @@ def start_ui():
     global header, btn_power, dlg
     
     G.pin.on()
-    G.set_background(G.BLACK)
+    G.set_background(G.color565(44, 0, 30))
 
     bar = G.color565(*TASKBAR_RGB)
-    header = G.UIHeader(lcd, "Home", TASKBAR_H, bg=bar, fg=G.WHITE)
+    header = G.UIHeader(lcd, "Zeno OS", TASKBAR_H, bg=bar, fg=G.WHITE)
+    
+    power_x = G.WIDTH - POWER_SIZE - 4
+    power_y = (TASKBAR_H - POWER_SIZE) // 2
+    
     btn_power = UIIconButton(
         lcd,
-        G.WIDTH - POWER_SIZE - 4, (TASKBAR_H - POWER_SIZE) // 2, POWER_SIZE, POWER_SIZE,
-        bmp_path=POWER_BMP, action=show_power, color=bar, radius=6)
+        power_x, power_y, POWER_SIZE, POWER_SIZE,
+        image_path=POWER_BMP, action=show_power, color=bar, radius=6)
 
     dlg = G.UIModal(lcd, "Power", "Shutdown?", on_ok=_shutdown, on_cancel=redraw_home)
     dlg.btn_ok.set_text("Yes", redraw=False)
@@ -268,7 +281,9 @@ log.debug("kernel ready (standalone ui loop running)", source="KERNEL")
 
 while running:
     current_modal = active_modal if (active_modal and active_modal.visible) else None
+    
     G.poll([current_modal] if current_modal else home_widgets)
+        
     time.sleep_ms(15)
 
 log.debug("kernel exited cleanly to REPL", source="KERNEL")
