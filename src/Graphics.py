@@ -326,6 +326,7 @@ def init_display(rotation=1, lcd_obj=None):
         bind_lcd(lcd_obj)
     ROTATION = rotation & 3
     lcd.init(rotation=ROTATION)
+    time.sleep(0.2)
     pin.on()
     WIDTH, HEIGHT = lcd.width(), lcd.height()
     REF_WIDTH, REF_HEIGHT = WIDTH, HEIGHT
@@ -1321,6 +1322,9 @@ class UIButton(UIWidget):
                     try:
                         self.action()
                     except Exception as e:
+                        # Allow normal app exit signals to bubble up without error logging
+                        if type(e).__name__ == 'AppExit':
+                            raise e
                         log_error("UIButton action failed: {}".format(e))
                 return True
         return self.pressed
