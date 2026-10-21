@@ -1,4 +1,4 @@
-# kernel.py -- Zeno OS kernel (Standalone Graphics-API Edition with Clean Modern Gradient Theme).
+# kernel.py -- Zeno OS kernel (Standalone Graphics-API Edition with Authentic Ubuntu Theme).
 import os, sys, gc, uio, time
 import zeno
 import Services as S
@@ -42,7 +42,7 @@ LOGO_PATH     = "/SYSTEM32/APPS/LOGO"
 POWER_BMP     = "/SYSTEM32/RESOURCES/power.png"   # Supports .png (transparent) or .bmp/.jpg
 
 TASKBAR_H     = 35
-TASKBAR_RGB   = (22, 24, 35)      # Clean dark slate taskbar matching the gradient base
+TASKBAR_RGB   = (44, 0, 30)      # Authentic Ubuntu Dark Aubergine (RGB: 44, 0, 30)
 POWER_SIZE    = 31               # icon tile in the taskbar
 LOGO_SIZE     = 50               # app logo; tile adds 4px inset each side
 TILE          = LOGO_SIZE + 8
@@ -50,17 +50,17 @@ PADDING       = 10
 TOUCH_MARGIN  = PADDING // 2        # extra touch area, kept < half the gap so tiles never overlap
 
 # ---------------------------------------------------------------------------
-# PREMIUM CLEAN MODERN GRADIENT THEME WALLPAPER
+# AUTHENTIC UBUNTU MULTI-STOP GRADIENT THEME WALLPAPER
 # ---------------------------------------------------------------------------
-# A smooth, professional multi-stop dark mode palette (Deep Space -> Slate -> Soft Indigo)
+# Exact Ubuntu Palette: Deep Aubergine -> Mid Violet-Aubergine -> Iconic Ubuntu Orange
 ubuntu_gradient_wallpaper = gfx.UIGradientWallpaper(
     lcd, 
     [
-        G.color565(12, 14, 20),    # Deep Obsidian Base
-        G.color565(24, 28, 42),    # Midnight Slate
-        G.color565(42, 38, 70)     # Refined Soft Indigo Accent
+        G.color565(44, 0, 30),    # Deep Dark Aubergine (Core Ubuntu Base)
+        G.color565(92, 39, 73),   # Mid Violet-Aubergine Tone
+        G.color565(233, 84, 32)   # Authentic Ubuntu Orange (#E95420)
     ], 
-    angle=135                     # Clean diagonal light sweep
+    angle=135                     # Smooth diagonal light sweep
 )
 
 # ---------------------------------------------------------------------------
@@ -95,12 +95,12 @@ def _safe_draw(w):
 
 
 def draw_wallpaper():
-    """Renders the clean, high-fidelity gradient wallpaper."""
+    """Renders the authentic multi-stop Ubuntu gradient wallpaper."""
     try:
         ubuntu_gradient_wallpaper.draw()
     except Exception as e:
         log.error("gradient wallpaper draw failed: {}".format(e), source="KERNEL")
-        G.clear(G.color565(12, 14, 20))
+        G.clear(G.color565(44, 0, 30))
 
 
 def scan_apps():
@@ -146,13 +146,13 @@ def build_icons(names):
         if y + TILE > sh:
             break
         
-        # Sleek semi-transparent style tile container that blends nicely over the gradient
+        # Styled app tile containers matching the Ubuntu theme palette
         _icons.append(AppIcon(
             lcd,
             x, y, TILE, TILE,
             image_path=get_logo_path(name),
             action=lambda n=name: launch_app(n),
-            color=G.color565(32, 36, 54), radius=8))
+            color=G.color565(60, 20, 50), radius=8))
         x += TILE + PADDING
     _app_names = names
 
@@ -255,10 +255,12 @@ def start_ui():
     global header, btn_power, dlg
     
     G.pin.on()
-    G.set_background(G.color565(12, 14, 20))
+    G.set_background(G.color565(44, 0, 30))
 
     bar = G.color565(*TASKBAR_RGB)
-    header = G.UIHeader(lcd, "Zeno OS", TASKBAR_H, bg=bar, fg=G.WHITE)
+    
+    # Upgraded: Using FONT_SANS16 for a smooth, high-end desktop title font instead of 8x8
+    header = G.UIHeader(lcd, "Zeno OS", TASKBAR_H, bg=bar, fg=G.WHITE, font=G.FONT_SANS16)
     
     power_x = G.WIDTH - POWER_SIZE - 4
     power_y = (TASKBAR_H - POWER_SIZE) // 2
