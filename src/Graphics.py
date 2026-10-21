@@ -2953,7 +2953,7 @@ class UIIconButton(UIWidget):
                     except Exception as e:
                         log_error("UIIconButton action failed: {}".format(e))
                 return True
-        return self.pressedreen render
+        return self.pressed
 class UIWindow(UIScreen):
     """Window manager supporting title bar, wallpaper/backgrounds, and a red close button (X)."""
 
@@ -4003,17 +4003,6 @@ class UIIconButton(UIWidget):
                 return True
         return self.pressed
 class UIGradientWallpaper(UIWidget):
-    """Advanced gradient wallpaper widget supporting multi-color stops 
-    and arbitrary angles across screen rotations.
-    
-    Usage:
-        # Dual color vertical gradient
-        bg = gfx.UIGradientWallpaper(lcd, [gfx.color565(30, 35, 60), gfx.color565(10, 10, 15)], angle=0)
-        bg.draw()
-        
-        # Multi-stop sunset gradient
-        sunset = gfx.UIGradientWallpaper(lcd, [gfx.RED, gfx.ORANGE, gfx.PURPLE], angle=45)
-    """
     def __init__(self, lcd, colors, angle=0):
         super().__init__(lcd, 0, 0, WIDTH, HEIGHT)
         self.colors = list(colors) if colors else [BLACK, BLACK]
