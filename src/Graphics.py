@@ -92,7 +92,6 @@ def color565(r, g, b):
 def blend(c0, c1, alpha):
     """alpha 0..255: 0 -> c0, 255 -> c1."""
     return lcd.blend(c0, c1, alpha)
-
 def draw_transparent_image(path, x, y, w=None, h=None, max_w=None, max_h=None, transparent_color=0x0000):
     """Draws any image (BMP, PNG, JPEG) with a transparent color key (default black 0x0000).
     Skips matching pixels so backgrounds and UI gradients show through seamlessly."""
@@ -3649,3 +3648,181 @@ class HTML:
         self.y += 8 * self._scale() + 2
         if self.y + 8 > HEIGHT:
             self._full = True
+            
+class UIImage(UIWidget):
+    """Simple UI image component for Zeno OS.
+    Takes lcd as its first argument. Automatically enables transparency 
+    for PNG files by default, while drawing BMP and JPEG as solid.
+
+    Usage:
+        img = gfx.UIImage(lcd, "/powerbutton.png", 50, 50, max_w=64, max_h=64)
+        img.draw()
+    """
+    def __init__(self, lcd, path, x, y, w=None, h=None, max_w=None, max_h=None, transparent=None):
+        super().__init__(lcd, x, y, w if w else 1, h if h else 1)
+        self.path = str(path)
+        self.max_w = max_w
+        self.max_h = max_h
+        
+        # Auto-detect transparency: True for PNG by default, False for BMP/JPEG
+        ext = self.path.split(".")[-1].lower()
+        if transparent is not None:
+            self.transparent = bool(transparent)
+        else:
+            self.transparent = (ext == "png")
+            
+        self.transparent_color = 0x0000  # Pure black key
+        
+        # Preload dimensions so the widget knows its bounding box
+        try:
+            decoder = _get_image_decoder(self.path)
+            fit_w = max_w if max_w is not None else w
+            fit_h = max_h if max_h is not None else h
+            img = decoder.open(self.path, fit=(fit_w, fit_h) if (fit_w or fit_h) else None)
+            self.w = img.width
+            self.h = img.height
+        except Exception as e:
+            log_error("UIImage init failed to parse {}: {}".format(path, e))
+
+    def set_path(self, path, redraw=True):
+        self.path = str(path)
+        ext = self.path.split(".")[-1].lower()
+        self.transparent = (ext == "png")
+        try:
+            decoder = _get_image_decoder(self.path)
+            img = decoder.open(self.path, fit=(self.max_w, self.max_h) if (self.max_w or self.max_h) else None)
+            self.w = img.width
+            self.h = img.height
+        except Exception as e:
+            log_error("UIImage set_path failed: {}".format(e))
+        if redraw and self.visible:
+            self.draw()
+
+    def draw(self):
+        if not self.visible:
+            return
+        if self.transparent:
+            draw_transparent_image(self.path, self.x, self.y, w=None, h=None, 
+                                   max_w=self.max_w, max_h=self.max_h, 
+                                   transparent_color=self.transparent_color)
+        else:
+            draw_bmp(self.path, self.x, self.y, w=None, h=None, 
+                     max_w=self.max_w, max_h=self.max_h)
+            
+class UIIconButton(UIWidget):
+    """Universal button widget supporting native PNG transparency, JPEG, BMP,
+    1bpp monochrome icons, and text labels with a tactile pressed state.
+    
+    Usage:
+        btn = UIIconButton(lcd, x, y, w, h, image_path="/icon.png", text="Settings", action=my_action)
+    """
+    def __init__(self, lcd, x, y, w, h, icon_bits=None, icon_w=0, icon_h=0,
+                 image_path=None, bmp_path=None, text="", action=None, color=None,
+                 pressed_color=None, fg=None, radius=8, font=None, scale=1, label=None, bg=None):
+        if isinstance(icon_bits, str):          # backward compatibility for old positional form
+            label = icon_bits
+            icon_bits = None
+            if bg is None and icon_w:
+                bg = icon_w
+            if fg is None and icon_h:
+                fg = icon_h
+            if action is None and callable(bmp_path):
+                action = bmp_path
+            icon_w = 0
+            icon_h = 0
+            bmp_path = None
+
+        if label is not None:
+            text = label
+        if bg is not None:
+            color = bg
+        if color is None:
+            color = SURFACE_ALT
+        if fg is None:
+            fg = WHITE
+
+        super().__init__(lcd, x, y, w, h)
+        self.text = str(text)
+        self.action = action
+        self.color = color
+        self.pressed_color = pressed_color if pressed_color is not None else darken(color, 60)
+        self.text_color = fg
+        self.radius = radius
+        self.font = font
+        self.scale = max(1, int(scale))
+        
+        self.icon_bits = icon_bits
+        self.icon_w = icon_w
+        self.icon_h = icon_h
+        
+        # Support both image_path and legacy bmp_path arguments
+        self.image_path = image_path if image_path is not None else bmp_path
+        self.img_widget = None
+
+        # If an image path is provided, instantiate the UIImage wrapper inside the button bounds
+        if self.image_path:
+            inset = 4
+            iw = max(1, self.w - (inset * 2))
+            ih = max(1, self.h - (inset * 2) - (12 if self.text else 0))
+            self.img_widget = UIImage(lcd, self.image_path, self.x + inset, self.y + inset, max_w=iw, max_h=ih)
+
+    def set_text(self, text, redraw=True):
+        self.text = str(text)
+        if redraw and self.visible:
+            self.draw()
+
+    set_label = set_text
+
+    def draw(self):
+        if not self.visible:
+            return
+        c = DARK_GRAY if not self.enabled else (self.pressed_color if self.pressed else self.color)
+        tc = TEXT_MUTED if not self.enabled else self.text_color
+        r = _clamp(self.radius, 0, min(self.w, self.h) // 2)
+        
+        # 1. Draw button background box
+        draw_rounded_rect(self.x, self.y, self.w, self.h, r, c, filled=True)
+        
+        # 2. Render image (PNG with transparency or solid BMP/JPEG)
+        if self.img_widget:
+            try:
+                self.img_widget.draw()
+            except Exception as e:
+                log_error("UIIconButton image draw failed ({}): {}".format(self.image_path, e))
+        
+        # 3. Render 1bpp monochrome icon if provided
+        elif self.icon_bits and self.icon_w > 0 and self.icon_h > 0:
+            ix = self.x + (self.w - self.icon_w) // 2
+            iy = self.y + (self.h - self.icon_h) // 2 - (6 if self.text else 0)
+            draw_bitmap(ix, iy, self.icon_w, self.icon_h, self.icon_bits, tc, c, 1)
+
+        # 4. Render text label
+        if self.text:
+            if self.image_path or (self.icon_bits and self.icon_w > 0):
+                draw_text_centered(self.x + self.w // 2, self.y + self.h - 14, self.text, tc, c, 1, self.font)
+            else:
+                draw_text_in_rect(self.x, self.y, self.w, self.h, self.text, tc, c, self.font, self.scale)
+
+    def handle_touch(self, pt):
+        if not self.visible or not self.enabled:
+            return False
+        if pt is not None:
+            inside = self.contains(pt[0], pt[1])
+            if inside and not self.pressed:
+                self.pressed = True
+                self.draw()
+                return True
+            elif not inside and self.pressed:
+                self.pressed = False
+                self.draw()
+        else:
+            if self.pressed:
+                self.pressed = False
+                self.draw()
+                if self.action:
+                    try:
+                        self.action()
+                    except Exception as e:
+                        log_error("UIIconButton action failed: {}".format(e))
+                return True
+        return self.pressed
